@@ -33,6 +33,7 @@ extern "C" {
 #define SYS_SYNC_FIFO            0x1
 #define SYS_SYNC_PRIORITY        0x2
 #define SYS_SYNC_PRIORITY_INHERIT 0x3
+#define SYS_SYNC_RETRY           0x100   /* lwmutex-only; SDK / RPCS3 sys_sync.h */
 
 /* Mutex flags */
 #define SYS_SYNC_RECURSIVE       0x10
