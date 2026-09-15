@@ -65,6 +65,12 @@ extern "C" {
 #define CELL_FS_S_IRGRP   0000040
 #define CELL_FS_S_IROTH   0000004
 
+/* cellFsAccess / sys_fs_access mode (POSIX; same values as S_I*OTH) */
+#define CELL_FS_F_OK      0
+#define CELL_FS_X_OK      1
+#define CELL_FS_W_OK      2
+#define CELL_FS_R_OK      4
+
 /* Open flags */
 #define CELL_FS_O_RDONLY   0x000000
 #define CELL_FS_O_WRONLY   0x000001
@@ -127,7 +133,20 @@ int64_t sys_fs_mkdir(ppu_context* ctx);
 int64_t sys_fs_rename(ppu_context* ctx);
 int64_t sys_fs_unlink(ppu_context* ctx);
 int64_t sys_fs_rmdir(ppu_context* ctx);
-int64_t sys_fs_ftruncate(ppu_context* ctx);
+int64_t sys_fs_link(ppu_context* ctx);       /* 810 */
+int64_t sys_fs_utime(ppu_context* ctx);      /* 815 */
+int64_t sys_fs_access(ppu_context* ctx);     /* 816 */
+int64_t sys_fs_fcntl(ppu_context* ctx);      /* 817 */
+int64_t sys_fs_fsync(ppu_context* ctx);      /* 819/820 */
+int64_t sys_fs_truncate(ppu_context* ctx);   /* 831 */
+int64_t sys_fs_ftruncate(ppu_context* ctx);  /* 832 */
+int64_t sys_fs_symlink(ppu_context* ctx);    /* 833 */
+int64_t sys_fs_chmod(ppu_context* ctx);      /* 834 */
+int64_t sys_fs_chown(ppu_context* ctx);      /* 835 */
+int64_t sys_fs_fget_block_size(ppu_context* ctx); /* 840 */
+int64_t sys_fs_get_block_size(ppu_context* ctx);  /* 841 */
+int64_t sys_fs_mapped_allocate(ppu_context* ctx); /* 845 */
+int64_t sys_fs_mapped_free(ppu_context* ctx);     /* 846 */
 
 /* Registration */
 void sys_fs_init(lv2_syscall_table* tbl);

@@ -31,6 +31,7 @@
 
 #ifdef _WIN32
 #  include <windows.h>
+#  include <winioctl.h>
 #  include <io.h>
 #  include <direct.h>
 #  define HOST_MKDIR(p)   _mkdir(p)
@@ -41,6 +42,7 @@
 #  include <unistd.h>
 #  include <dirent.h>
 #  include <sys/types.h>
+#  include <sys/statvfs.h>
 #  define HOST_MKDIR(p)   mkdir(p, 0755)
 #  define HOST_STAT       stat
 #  define HOST_STAT_T     struct stat
@@ -61,6 +63,8 @@ typedef struct {
 
 static PathMapping s_path_mappings[MAX_PATH_MAPPINGS];
 static char s_root_path[CELL_FS_MAX_FS_PATH_LENGTH] = ".";
+
+static void cellfs_hdd1_host_root(char* out, size_t cap);
 
 static void init_default_mappings(void)
 {
@@ -125,6 +129,22 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 
     if (!ps3_path || !host_buf || buf_size == 0)
         return -1;
+
+    /* /dev_hdd1 is syscache (cellSysCacheMount), not the disc dump. Toolkit
+     * Rename/Unlink/Open used this translator; without the mapping they missed
+     * game/hdd0/syscache the same way GetFreeSize used to. */
+    if (strncmp(ps3_path, "/dev_hdd1/", 10) == 0 || strcmp(ps3_path, "/dev_hdd1") == 0) {
+        char root[CELL_FS_MAX_FS_PATH_LENGTH];
+        cellfs_hdd1_host_root(root, sizeof root);
+        const char* rest = (ps3_path[9] == '/') ? ps3_path + 10 : "";
+        if (*rest)
+            snprintf(host_buf, buf_size, "%s/%s", root, rest);
+        else
+            snprintf(host_buf, buf_size, "%s", root);
+        for (char* p = host_buf; *p; p++)
+            if (*p == '\\') *p = '/';
+        return 0;
+    }
 
     /* Find longest matching prefix */
     int best = -1;
@@ -213,6 +233,106 @@ static const char* gpath(const char* guest)
 int cellfs_translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 {
     return translate_path(ps3_path, host_buf, buf_size);
+}
+
+/* Host directory that /dev_hdd1 maps into. Matches ppu_fs.cpp so GetFreeSize
+ * on the syscache partition queries the same volume FIOS overlay files use. */
+static void cellfs_hdd1_host_root(char* out, size_t cap)
+{
+    const char* e1 = getenv("PS3_HDD1_ROOT");
+    if (e1 && *e1) {
+        snprintf(out, cap, "%s", e1);
+    } else {
+        const char* e0 = getenv("PS3_HDD0_ROOT");
+        if (e0 && *e0) {
+            snprintf(out, cap, "%s/syscache", e0);
+        } else {
+            HOST_STAT_T st;
+            if (HOST_STAT("game/hdd0", &st) == 0 && (st.st_mode & S_IFDIR))
+                snprintf(out, cap, "game/hdd0/syscache");
+            else {
+                const char* vfs = getenv("PS3_VFS_ROOT");
+                if (vfs && *vfs)
+                    snprintf(out, cap, "%s/hdd0/syscache", vfs);
+                else
+                    snprintf(out, cap, ".");
+            }
+        }
+    }
+    for (char* p = out; *p; p++)
+        if (*p == '\\') *p = '/';
+}
+
+u64 cellfs_host_free_bytes(const char* host_path)
+{
+    char path[CELL_FS_MAX_FS_PATH_LENGTH];
+    if (!host_path || !host_path[0])
+        host_path = ".";
+    strncpy(path, host_path, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+#ifdef _WIN32
+    for (char* p = path; *p; p++)
+        if (*p == '/') *p = '\\';
+#endif
+
+    for (;;) {
+#ifdef _WIN32
+        ULARGE_INTEGER available;
+        if (GetDiskFreeSpaceExA(path, &available, NULL, NULL))
+            return (u64)available.QuadPart;
+        {
+            DWORD error = GetLastError();
+            if (error != ERROR_PATH_NOT_FOUND && error != ERROR_FILE_NOT_FOUND &&
+                error != ERROR_INVALID_NAME && error != ERROR_BAD_PATHNAME &&
+                error != ERROR_DIRECTORY)
+                break;
+        }
+#else
+        struct statvfs info;
+        if (statvfs(path, &info) == 0) {
+            u64 fr = info.f_frsize ? (u64)info.f_frsize : (u64)info.f_bsize;
+            return fr * (u64)info.f_bavail;
+        }
+        if (errno != ENOENT && errno != ENOTDIR)
+            break;
+#endif
+        size_t len = strlen(path);
+#ifdef _WIN32
+        if (len == 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/'))
+            break;
+        if (len == 2 && path[1] == ':')
+            break;
+#endif
+        while (len > 1 && (path[len - 1] == '/' || path[len - 1] == '\\'))
+            path[--len] = '\0';
+        char* slash = strrchr(path, '/');
+#ifdef _WIN32
+        char* backslash = strrchr(path, '\\');
+        if (backslash && (!slash || backslash > slash))
+            slash = backslash;
+#endif
+        if (!slash) {
+            if (strcmp(path, ".") == 0)
+                break;
+            strncpy(path, ".", sizeof(path) - 1);
+            path[sizeof(path) - 1] = '\0';
+        } else if (slash == path) {
+            if (!slash[1])
+                break;
+            slash[1] = '\0';
+        } else {
+#ifdef _WIN32
+            if (slash == path + 2 && path[1] == ':') {
+                slash[1] = '\0';
+                continue;
+            }
+#endif
+            *slash = '\0';
+            if (!path[0])
+                break;
+        }
+    }
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -428,6 +548,13 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
     }
 
     const char* mode = flags_to_mode(flags);
+
+    if ((flags & CELL_FS_O_CREAT) && (flags & CELL_FS_O_EXCL)) {
+        HOST_STAT_T exists;
+        if (HOST_STAT(host_path, &exists) == 0)
+            return (s32)CELL_EEXIST;
+    }
+
     FILE* fp = fopen(host_path, mode);
 
     /* If open for read failed and CREAT is set, try creating */
@@ -533,12 +660,25 @@ s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
     u64 bytes_written = 0;
 
     if (s_files[fd].host_fp) {
-        bytes_written = (u64)fwrite(gptr((void*)buf), 1, (size_t)nbytes, s_files[fd].host_fp);
+        bytes_written = 0;
+        while (bytes_written < nbytes) {
+            size_t chunk = fwrite((const char*)gptr((void*)buf) + bytes_written, 1,
+                                  (size_t)(nbytes - bytes_written), s_files[fd].host_fp);
+            if (chunk == 0)
+                break;
+            bytes_written += (u64)chunk;
+        }
         fflush(s_files[fd].host_fp);
     }
 
     if (nwrite)
         *(u64*)gptr(nwrite) = ps3_bswap64(bytes_written);
+
+    if (bytes_written < nbytes) {
+        if (errno == ENOSPC)
+            return (s32)CELL_ENOSPC;
+        return (s32)CELL_EIO;
+    }
 
     return CELL_OK;
 }
@@ -642,7 +782,30 @@ s32 cellFsStat(const char* path, CellFsStat* sb)
     return CELL_OK;
 }
 
-/* NID: 0x6D3BB15B */
+#ifdef _WIN32
+/* Sparse SetEndOfFile so overlay grow does not zero-fill 1.75 GiB. */
+static s32 cellfs_win32_set_eof(HANDLE h, u64 size)
+{
+    LARGE_INTEGER cur;
+    if (!GetFileSizeEx(h, &cur))
+        return (s32)CELL_EIO;
+    if ((u64)cur.QuadPart < size) {
+        DWORD ign = 0;
+        DeviceIoControl(h, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &ign, NULL);
+    }
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)size;
+    if (!SetFilePointerEx(h, li, NULL, FILE_BEGIN) || !SetEndOfFile(h)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_DISK_FULL || err == ERROR_HANDLE_DISK_FULL)
+            return (s32)CELL_ENOSPC;
+        return (s32)CELL_EIO;
+    }
+    return CELL_OK;
+}
+#endif
+
+/* NID: 0xC9DC3AC5 */
 s32 cellFsTruncate(const char* path, u64 size)
 {
     printf("[cellFs] Truncate(path='%s', size=%llu)\n", gpath(path) ? gpath(path) : "<null>",
@@ -656,25 +819,26 @@ s32 cellFsTruncate(const char* path, u64 size)
         return (s32)CELL_ENOENT;
 
 #ifdef _WIN32
-    HANDLE hFile = CreateFileA(host_path, GENERIC_WRITE, 0, NULL,
+    HANDLE hFile = CreateFileA(host_path, GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE)
         return (s32)CELL_ENOENT;
 
-    LARGE_INTEGER li;
-    li.QuadPart = (LONGLONG)size;
-    SetFilePointerEx(hFile, li, NULL, FILE_BEGIN);
-    SetEndOfFile(hFile);
+    s32 rc = cellfs_win32_set_eof(hFile, size);
     CloseHandle(hFile);
+    return rc;
 #else
-    if (truncate(host_path, (off_t)size) != 0)
+    if (truncate(host_path, (off_t)size) != 0) {
+        if (errno == ENOSPC) return (s32)CELL_ENOSPC;
         return (s32)CELL_ENOENT;
+    }
 #endif
 
     return CELL_OK;
 }
 
-/* NID: 0x82D3AB53 */
+/* NID: 0x0E2939E5 */
 s32 cellFsFtruncate(CellFsFd fd, u64 size)
 {
     printf("[cellFs] Ftruncate(fd=%d, size=%llu)\n", fd, (unsigned long long)size);
@@ -686,17 +850,346 @@ s32 cellFsFtruncate(CellFsFd fd, u64 size)
         fflush(s_files[fd].host_fp);
 #ifdef _WIN32
         int file_no = _fileno(s_files[fd].host_fp);
-        _chsize_s(file_no, (long long)size);
+        HANDLE h = (HANDLE)_get_osfhandle(file_no);
+        if (h == INVALID_HANDLE_VALUE || !h)
+            return (s32)CELL_EIO;
+        return cellfs_win32_set_eof(h, size);
 #else
         int file_no = fileno(s_files[fd].host_fp);
-        ftruncate(file_no, (off_t)size);
+        if (ftruncate(file_no, (off_t)size) != 0) {
+            if (errno == ENOSPC) return (s32)CELL_ENOSPC;
+            return (s32)CELL_EIO;
+        }
 #endif
     }
 
     return CELL_OK;
 }
 
-/* NID: 0xC1C507E7 */
+/* NID: 0x7A0329A1. Does not create the file; does not shrink. */
+s32 cellFsAllocateFileAreaWithoutZeroFill(const char* path, u64 size)
+{
+    const char* gp = gpath(path);
+    printf("[cellFs] AllocateFileAreaWithoutZeroFill(path='%s', size=%llu)\n",
+           gp ? gp : "<null>", (unsigned long long)size);
+
+    if (!path)
+        return CELL_EFAULT;
+
+    char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
+    if (translate_path(gp, host_path, sizeof(host_path)) != 0)
+        return (s32)CELL_ENOENT;
+
+    HOST_STAT_T hst;
+    if (HOST_STAT(host_path, &hst) != 0)
+        return (s32)CELL_ENOENT;
+    if ((u64)hst.st_size >= size)
+        return CELL_OK;
+
+    u64 need = size - (u64)hst.st_size;
+    u64 freeb = cellfs_host_free_bytes(host_path);
+    if (freeb > 0 && freeb < need)
+        return (s32)CELL_ENOSPC;
+
+#ifdef _WIN32
+    HANDLE hFile = CreateFileA(host_path, GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return (s32)CELL_ENOENT;
+    s32 rc = cellfs_win32_set_eof(hFile, size);
+    CloseHandle(hFile);
+    return rc;
+#else
+    if (truncate(host_path, (off_t)size) != 0) {
+        if (errno == ENOSPC) return (s32)CELL_ENOSPC;
+        return (s32)CELL_EIO;
+    }
+    return CELL_OK;
+#endif
+}
+
+/* NID: 0x2CF1296B. Toolkit fd table; ppu_fs ctx handler is the ACIT path. */
+s32 cellFsAllocateFileAreaByFdWithoutZeroFill(CellFsFd fd, u64 size)
+{
+    printf("[cellFs] AllocateFileAreaByFdWithoutZeroFill(fd=%d, size=%llu)\n",
+           fd, (unsigned long long)size);
+
+    if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
+        return CELL_FS_ERROR_EBADF;
+    if (!s_files[fd].host_fp)
+        return (s32)CELL_EIO;
+
+    fflush(s_files[fd].host_fp);
+#ifdef _WIN32
+    int file_no = _fileno(s_files[fd].host_fp);
+    HANDLE h = (HANDLE)_get_osfhandle(file_no);
+    if (h == INVALID_HANDLE_VALUE || !h)
+        return (s32)CELL_EIO;
+    LARGE_INTEGER cur;
+    if (!GetFileSizeEx(h, &cur))
+        return (s32)CELL_EIO;
+    if ((u64)cur.QuadPart >= size)
+        return CELL_OK;
+    u64 need = size - (u64)cur.QuadPart;
+    u64 freeb = 0;
+    if (s_files[fd].path[0]) {
+        char hp[CELL_FS_MAX_FS_PATH_LENGTH];
+        if (translate_path(s_files[fd].path, hp, sizeof hp) == 0)
+            freeb = cellfs_host_free_bytes(hp);
+    }
+    if (freeb > 0 && freeb < need)
+        return (s32)CELL_ENOSPC;
+    return cellfs_win32_set_eof(h, size);
+#else
+    int file_no = fileno(s_files[fd].host_fp);
+    HOST_STAT_T hst;
+    if (HOST_FSTAT(file_no, &hst) != 0)
+        return (s32)CELL_EIO;
+    if ((u64)hst.st_size >= size)
+        return CELL_OK;
+    if (ftruncate(file_no, (off_t)size) != 0) {
+        if (errno == ENOSPC) return (s32)CELL_ENOSPC;
+        return (s32)CELL_EIO;
+    }
+    return CELL_OK;
+#endif
+}
+
+static s32 cellfs_enospc_if_grow(const char* host_path, u64 cur, u64 size)
+{
+    if (cur >= size)
+        return CELL_OK;
+    u64 freeb = cellfs_host_free_bytes(host_path);
+    if (freeb > 0 && freeb < size - cur)
+        return (s32)CELL_ENOSPC;
+    return CELL_OK;
+}
+
+static s32 cellfs_set_size_path(const char* host_path, u64 size, int create)
+{
+    HOST_STAT_T hst;
+    int exists = (HOST_STAT(host_path, &hst) == 0);
+    if (!exists && !create)
+        return (s32)CELL_ENOENT;
+    u64 cur = exists ? (u64)hst.st_size : 0;
+    s32 spc = cellfs_enospc_if_grow(host_path, cur, size);
+    if (spc != CELL_OK)
+        return spc;
+
+#ifdef _WIN32
+    HANDLE hFile = CreateFileA(host_path, GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               NULL, create ? OPEN_ALWAYS : OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND)
+            return (s32)CELL_ENOENT;
+        if (e == ERROR_DISK_FULL || e == ERROR_HANDLE_DISK_FULL)
+            return (s32)CELL_ENOSPC;
+        return (s32)CELL_EIO;
+    }
+    s32 rc = cellfs_win32_set_eof(hFile, size);
+    CloseHandle(hFile);
+    return rc;
+#else
+    if (!exists) {
+        FILE* fp = fopen(host_path, "wb+");
+        if (!fp)
+            return (s32)CELL_EIO;
+        fclose(fp);
+    }
+    if (truncate(host_path, (off_t)size) != 0) {
+        if (errno == ENOSPC) return (s32)CELL_ENOSPC;
+        return (s32)CELL_EIO;
+    }
+    return CELL_OK;
+#endif
+}
+
+static s32 cellfs_write_at_path(const char* host_path, const void* buf, u64 off, u64 len)
+{
+    if (!len)
+        return CELL_OK;
+    if (!buf)
+        return CELL_EFAULT;
+    FILE* fp = fopen(host_path, "rb+");
+    if (!fp)
+        return (s32)CELL_EIO;
+#ifdef _WIN32
+    if (_fseeki64(fp, (__int64)off, SEEK_SET) != 0) {
+#else
+    if (fseeko(fp, (off_t)off, SEEK_SET) != 0) {
+#endif
+        fclose(fp);
+        return (s32)CELL_EIO;
+    }
+    size_t n = fwrite(buf, 1, (size_t)len, fp);
+    fflush(fp);
+    fclose(fp);
+    if (n < (size_t)len) {
+        if (errno == ENOSPC) return (s32)CELL_ENOSPC;
+        return (s32)CELL_EIO;
+    }
+    return CELL_OK;
+}
+
+/* NID: 0x103B8632. Creates if missing; writes initial data; sparse-extends. */
+s32 cellFsAllocateFileAreaWithInitialData(const char* path, u64 initial_data_size,
+                                          const void* initial_data, u64 initial_data_file_offset,
+                                          u64 allocated_size)
+{
+    const char* gp = gpath(path);
+    printf("[cellFs] AllocateFileAreaWithInitialData(path='%s', off=%llu dlen=%llu size=%llu)\n",
+           gp ? gp : "<null>", (unsigned long long)initial_data_file_offset,
+           (unsigned long long)initial_data_size, (unsigned long long)allocated_size);
+
+    if (!path)
+        return CELL_EFAULT;
+    if (initial_data_file_offset > allocated_size ||
+        initial_data_size > allocated_size - initial_data_file_offset)
+        return (s32)CELL_EINVAL;
+
+    char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
+    if (translate_path(gp, host_path, sizeof(host_path)) != 0)
+        return (s32)CELL_ENOENT;
+
+    s32 rc = cellfs_set_size_path(host_path, allocated_size, 1);
+    if (rc != CELL_OK)
+        return rc;
+    return cellfs_write_at_path(host_path, gptr(initial_data),
+                                initial_data_file_offset, initial_data_size);
+}
+
+/* NID: 0x3394F037. Same on the toolkit fd table. */
+s32 cellFsAllocateFileAreaByFdWithInitialData(CellFsFd fd, u64 initial_data_size,
+                                              const void* initial_data, u64 initial_data_file_offset,
+                                              u64 allocated_size)
+{
+    printf("[cellFs] AllocateFileAreaByFdWithInitialData(fd=%d, off=%llu dlen=%llu size=%llu)\n",
+           fd, (unsigned long long)initial_data_file_offset,
+           (unsigned long long)initial_data_size, (unsigned long long)allocated_size);
+
+    if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
+        return CELL_FS_ERROR_EBADF;
+    if (!s_files[fd].host_fp)
+        return (s32)CELL_EIO;
+    if (initial_data_file_offset > allocated_size ||
+        initial_data_size > allocated_size - initial_data_file_offset)
+        return (s32)CELL_EINVAL;
+
+    fflush(s_files[fd].host_fp);
+#ifdef _WIN32
+    int file_no = _fileno(s_files[fd].host_fp);
+    HANDLE h = (HANDLE)_get_osfhandle(file_no);
+    if (h == INVALID_HANDLE_VALUE || !h)
+        return (s32)CELL_EIO;
+    LARGE_INTEGER cur;
+    if (!GetFileSizeEx(h, &cur))
+        return (s32)CELL_EIO;
+    if (s_files[fd].path[0]) {
+        char hp[CELL_FS_MAX_FS_PATH_LENGTH];
+        if (translate_path(s_files[fd].path, hp, sizeof hp) == 0) {
+            s32 spc = cellfs_enospc_if_grow(hp, (u64)cur.QuadPart, allocated_size);
+            if (spc != CELL_OK)
+                return spc;
+        }
+    }
+    s32 rc = cellfs_win32_set_eof(h, allocated_size);
+#else
+    int file_no = fileno(s_files[fd].host_fp);
+    HOST_STAT_T hst;
+    if (HOST_FSTAT(file_no, &hst) != 0)
+        return (s32)CELL_EIO;
+    s32 rc = CELL_OK;
+    if (ftruncate(file_no, (off_t)allocated_size) != 0) {
+        if (errno == ENOSPC) return (s32)CELL_ENOSPC;
+        return (s32)CELL_EIO;
+    }
+#endif
+    if (rc != CELL_OK)
+        return rc;
+    if (!initial_data_size)
+        return CELL_OK;
+    const void* buf = gptr(initial_data);
+    if (!buf)
+        return CELL_EFAULT;
+#ifdef _WIN32
+    if (_fseeki64(s_files[fd].host_fp, (__int64)initial_data_file_offset, SEEK_SET) != 0)
+#else
+    if (fseeko(s_files[fd].host_fp, (off_t)initial_data_file_offset, SEEK_SET) != 0)
+#endif
+        return (s32)CELL_EIO;
+    size_t n = fwrite(buf, 1, (size_t)initial_data_size, s_files[fd].host_fp);
+    fflush(s_files[fd].host_fp);
+    if (n < (size_t)initial_data_size) {
+        if (errno == ENOSPC) return (s32)CELL_ENOSPC;
+        return (s32)CELL_EIO;
+    }
+    return CELL_OK;
+}
+
+/* NID: 0x606F9F42. Sparse grow or shrink; does not create. */
+s32 cellFsChangeFileSizeWithoutAllocation(const char* path, u64 new_size)
+{
+    const char* gp = gpath(path);
+    printf("[cellFs] ChangeFileSizeWithoutAllocation(path='%s', size=%llu)\n",
+           gp ? gp : "<null>", (unsigned long long)new_size);
+
+    if (!path)
+        return CELL_EFAULT;
+
+    char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
+    if (translate_path(gp, host_path, sizeof(host_path)) != 0)
+        return (s32)CELL_ENOENT;
+
+    return cellfs_set_size_path(host_path, new_size, 0);
+}
+
+/* NID: 0xE15939C3. Toolkit fd table; ppu_fs ctx handler is the ACIT path. */
+s32 cellFsChangeFileSizeByFdWithoutAllocation(CellFsFd fd, u64 new_size)
+{
+    printf("[cellFs] ChangeFileSizeByFdWithoutAllocation(fd=%d, size=%llu)\n",
+           fd, (unsigned long long)new_size);
+
+    if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
+        return CELL_FS_ERROR_EBADF;
+    if (!s_files[fd].host_fp)
+        return (s32)CELL_EIO;
+
+    fflush(s_files[fd].host_fp);
+#ifdef _WIN32
+    int file_no = _fileno(s_files[fd].host_fp);
+    HANDLE h = (HANDLE)_get_osfhandle(file_no);
+    if (h == INVALID_HANDLE_VALUE || !h)
+        return (s32)CELL_EIO;
+    LARGE_INTEGER cur;
+    if (!GetFileSizeEx(h, &cur))
+        return (s32)CELL_EIO;
+    if (s_files[fd].path[0]) {
+        char hp[CELL_FS_MAX_FS_PATH_LENGTH];
+        if (translate_path(s_files[fd].path, hp, sizeof hp) == 0) {
+            s32 spc = cellfs_enospc_if_grow(hp, (u64)cur.QuadPart, new_size);
+            if (spc != CELL_OK)
+                return spc;
+        }
+    }
+    return cellfs_win32_set_eof(h, new_size);
+#else
+    int file_no = fileno(s_files[fd].host_fp);
+    HOST_STAT_T hst;
+    if (HOST_FSTAT(file_no, &hst) != 0)
+        return (s32)CELL_EIO;
+    if (ftruncate(file_no, (off_t)new_size) != 0) {
+        if (errno == ENOSPC) return (s32)CELL_ENOSPC;
+        return (s32)CELL_EIO;
+    }
+    return CELL_OK;
+#endif
+}
+
+/* NID: 0x1A108AB7 */
 s32 cellFsGetBlockSize(const char* path, u64* sector_size, u64* block_size)
 {
     printf("[cellFs] GetBlockSize(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
@@ -710,32 +1203,55 @@ s32 cellFsGetBlockSize(const char* path, u64* sector_size, u64* block_size)
     return CELL_OK;
 }
 
-/* NID: 0x2C2C5F71 */
+/* Path form of GetBlockSize; ppu_fs also registers a ctx handler. */
+s32 cellFsFGetBlockSize(CellFsFd fd, u64* sector_size, u64* block_size)
+{
+    (void)fd;
+    if (sector_size) vm_write64((u32)(uintptr_t)sector_size, 512);
+    if (block_size)  vm_write64((u32)(uintptr_t)block_size, 4096);
+    return CELL_OK;
+}
+
+/* NID: 0xAA3B4BCD */
 s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
 {
-    printf("[cellFs] GetFreeSize(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
+    const char* gp = gpath(path);
+    printf("[cellFs] GetFreeSize(path='%s')\n", gp ? gp : "<null>");
 
     if (!path)
         return CELL_EFAULT;
 
-    if (block_size) vm_write32((u32)(uintptr_t)block_size, 4096);
+    const u32 blk = 4096;
+    if (block_size) vm_write32((u32)(uintptr_t)block_size, blk);
 
-    /* Report ~1GB free by default */
-    u64 free_blocks = (u64)(1024ULL * 1024 * 1024 / 4096);
-
-#ifdef _WIN32
-    {
-        char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-        if (translate_path(gpath(path), host_path, sizeof(host_path)) == 0) {
-            ULARGE_INTEGER free_bytes;
-            if (GetDiskFreeSpaceExA(host_path, &free_bytes, NULL, NULL)) {
-                free_blocks = (u64)(free_bytes.QuadPart / 4096);
-            }
-        }
+    /* /dev_hdd1 is the syscache partition. cellFs mappings never included it,
+     * so GetDiskFreeSpaceEx was skipped and the old 1 GiB fake was smaller
+     * than FIOS overlay cache.dat (numBlocks) — "disk full", cache disabled. */
+    char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
+    if (gp && (strncmp(gp, "/dev_hdd1/", 10) == 0 || strcmp(gp, "/dev_hdd1") == 0)) {
+        char root[CELL_FS_MAX_FS_PATH_LENGTH];
+        cellfs_hdd1_host_root(root, sizeof root);
+        const char* rest = (gp[9] == '/') ? gp + 10 : "";
+        if (*rest)
+            snprintf(host_path, sizeof host_path, "%s/%s", root, rest);
+        else
+            snprintf(host_path, sizeof host_path, "%s", root);
+    } else if (!gp || translate_path(gp, host_path, sizeof host_path) != 0) {
+        snprintf(host_path, sizeof host_path, "%s", ".");
     }
-#endif
 
+    /* Several GiB if host statfs fails (awkward relative paths on Windows). */
+    u64 free_bytes = cellfs_host_free_bytes(host_path);
+    if (free_bytes == 0)
+        free_bytes = 8ull * 1024ull * 1024ull * 1024ull;
+
+    u64 free_blocks = free_bytes / blk;
     if (free_block_count) vm_write64((u32)(uintptr_t)free_block_count, free_blocks);
+
+    printf("[cellFs] GetFreeSize -> '%s' block=%u free_blocks=%llu (%llu MiB)\n",
+           host_path, blk,
+           (unsigned long long)free_blocks,
+           (unsigned long long)(free_bytes / (1024ull * 1024ull)));
 
     return CELL_OK;
 }
@@ -934,6 +1450,13 @@ s32 cellFsRename(const char* from, const char* to)
     ensure_parent_dirs(host_to);
 
     if (rename(host_from, host_to) != 0) {
+#ifdef _WIN32
+        /* POSIX replace semantics: Win32 rename fails when dest exists. */
+        if (remove(host_to) == 0 || errno == ENOENT) {
+            if (rename(host_from, host_to) == 0)
+                return CELL_OK;
+        }
+#endif
         printf("[cellFs] Rename: rename('%s', '%s') failed: %s\n",
                host_from, host_to, strerror(errno));
         return (s32)CELL_ENOENT;
@@ -955,6 +1478,8 @@ s32 cellFsUnlink(const char* path)
         return (s32)CELL_ENOENT;
 
     if (remove(host_path) != 0) {
+        if (errno == ENOENT)
+            return CELL_OK;
         printf("[cellFs] Unlink: remove('%s') failed: %s\n", host_path, strerror(errno));
         return (s32)CELL_ENOENT;
     }

@@ -2,7 +2,7 @@
  * ps3recomp - cellFs HLE
  *
  * PS3 filesystem operations: open/close/read/write, stat, directory listing,
- * truncate, block size, chmod.
+ * truncate, allocate-without-zero-fill, chmod, GetBlockSize.
  */
 
 #ifndef PS3RECOMP_CELL_FS_H
@@ -127,6 +127,10 @@ void cellfs_add_path_mapping(const char* ps3_prefix, const char* host_path);
  * Returns 0 on success, -1 if no mapping found. */
 int cellfs_translate_path(const char* ps3_path, char* host_buf, size_t buf_size);
 
+/* Free bytes on the host volume that contains host_path. Walks to a parent if
+ * the path does not exist yet. Returns 0 if the query fails. */
+u64 cellfs_host_free_bytes(const char* host_path);
+
 /* ---------------------------------------------------------------------------
  * File operations
  * -----------------------------------------------------------------------*/
@@ -134,59 +138,78 @@ int cellfs_translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 /* NID: 0x718BF5F8 */
 s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 size);
 
-/* NID: 0x4D5FF8E2 */
+/* NID: 0x2CB51F0D */
 s32 cellFsClose(CellFsFd fd);
 
-/* NID: 0xBABF9143 */
+/* NID: 0x4D5FF8E2 */
 s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread);
 
-/* NID: 0x1E9B6714 */
+/* NID: 0xECDCF2AB */
 s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite);
 
 /* NID: 0xA397D042 */
 s32 cellFsLseek(CellFsFd fd, s64 offset, s32 whence, u64* pos);
 
-/* NID: 0xEF3BBD5A */
+/* NID: 0xEF3EFA34 */
 s32 cellFsFstat(CellFsFd fd, CellFsStat* sb);
 
-/* NID: 0x2CB51F0D */
+/* NID: 0x7DE6DCED */
 s32 cellFsStat(const char* path, CellFsStat* sb);
 
-/* NID: 0x6D3BB15B */
+/* NID: 0xC9DC3AC5 */
 s32 cellFsTruncate(const char* path, u64 size);
 
-/* NID: 0x82D3AB53 */
+/* NID: 0x0E2939E5 */
 s32 cellFsFtruncate(CellFsFd fd, u64 size);
 
-/* NID: 0xC1C507E7 */
+/* NID: 0x7A0329A1  ABI: (const char *path, uint64_t size) — extend, no shrink, no zero-fill */
+s32 cellFsAllocateFileAreaWithoutZeroFill(const char* path, u64 size);
+/* NID: 0x2CF1296B  ABI: (CellFsFd fd, uint64_t size) — same grow on an open fd */
+s32 cellFsAllocateFileAreaByFdWithoutZeroFill(CellFsFd fd, u64 size);
+/* NID: 0x103B8632  ABI: (path, initialDataSize, initialData, initialDataFileOffset, allocatedSize) */
+s32 cellFsAllocateFileAreaWithInitialData(const char* path, u64 initial_data_size,
+                                          const void* initial_data, u64 initial_data_file_offset,
+                                          u64 allocated_size);
+/* NID: 0x3394F037  ABI: (fd, initialDataSize, initialData, initialDataFileOffset, allocatedSize) */
+s32 cellFsAllocateFileAreaByFdWithInitialData(CellFsFd fd, u64 initial_data_size,
+                                              const void* initial_data, u64 initial_data_file_offset,
+                                              u64 allocated_size);
+/* NID: 0x606F9F42  ABI: (path, uint64_t newSize) — sparse grow or shrink */
+s32 cellFsChangeFileSizeWithoutAllocation(const char* path, u64 new_size);
+/* NID: 0xE15939C3  ABI: (fd, uint64_t newSize) */
+s32 cellFsChangeFileSizeByFdWithoutAllocation(CellFsFd fd, u64 new_size);
+
+/* NID: 0x1A108AB7 */
 s32 cellFsGetBlockSize(const char* path, u64* sector_size, u64* block_size);
 
-/* NID: 0x2C2C5F71 */
+s32 cellFsFGetBlockSize(CellFsFd fd, u64* sector_size, u64* block_size);
+
+/* NID: 0xAA3B4BCD */
 s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count);
 
-/* NID: 0x3F61245C */
+/* NID: 0x99406D0B */
 s32 cellFsChmod(const char* path, s32 mode);
 
 /* ---------------------------------------------------------------------------
  * Directory operations
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x5C74903D */
+/* NID: 0x3F61245C */
 s32 cellFsOpendir(const char* path, CellFsDir* fd);
 
-/* NID: 0x9F951810 */
+/* NID: 0x5C74903D */
 s32 cellFsReaddir(CellFsDir fd, CellFsDirent* entry, u64* nread);
 
 /* NID: 0xFF42DCC3 */
 s32 cellFsClosedir(CellFsDir fd);
 
-/* NID: 0x7C1B2FCC */
+/* NID: 0xBA901FE6 */
 s32 cellFsMkdir(const char* path, s32 mode);
 
-/* NID: 0xE3F6F665 */
+/* NID: 0xF12EECC8 */
 s32 cellFsRename(const char* from, const char* to);
 
-/* NID: 0x196CE171 */
+/* NID: 0x7F4677A8 */
 s32 cellFsUnlink(const char* path);
 
 #ifdef __cplusplus

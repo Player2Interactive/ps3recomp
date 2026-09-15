@@ -15,6 +15,8 @@
 #ifdef _WIN32
   #include <direct.h>
   #include <io.h>
+  #include <sys/utime.h>
+  #include <time.h>
   #define stat _stat64
   #define S_ISDIR(m) (((m) & _S_IFDIR) != 0)
   #define S_ISREG(m) (((m) & _S_IFREG) != 0)
@@ -22,6 +24,8 @@
   #include <unistd.h>
   #include <dirent.h>
   #include <time.h>     /* nanosleep: the delay in the open-retry loop */
+  #include <sys/statvfs.h>
+  #include <utime.h>
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -56,6 +60,35 @@ static void write_be64(uint32_t addr, uint64_t val)
 #endif
     *p = val;
 }
+
+static uint32_t read_be32(uint32_t addr)
+{
+    uint32_t val = *(uint32_t*)vm_to_host(addr);
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+    val = ((val >> 24) & 0xFF) | ((val >> 8) & 0xFF00) |
+          ((val <<  8) & 0xFF0000) | ((val << 24) & 0xFF000000u);
+#endif
+    return val;
+}
+
+static uint64_t read_be64(uint32_t addr)
+{
+    uint64_t val = *(uint64_t*)vm_to_host(addr);
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+    val = ((val >> 56) & 0xFFULL) |
+          ((val >> 40) & 0xFF00ULL) |
+          ((val >> 24) & 0xFF0000ULL) |
+          ((val >>  8) & 0xFF000000ULL) |
+          ((val <<  8) & 0xFF00000000ULL) |
+          ((val << 24) & 0xFF0000000000ULL) |
+          ((val << 40) & 0xFF000000000000ULL) |
+          ((val << 56) & 0xFF00000000000000ULL);
+#endif
+    return val;
+}
+
+static void fill_cell_stat(uint32_t stat_addr, struct stat* st);
+static uint64_t sys_fs_host_total_bytes(const char* host_path);
 
 /* ---------------------------------------------------------------------------
  * Path translation
@@ -108,6 +141,96 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
     snprintf(path, cap, "%s", alt);
 }
 
+/* Host directory that /dev_hdd1 maps into (cellSysCacheMount / FIOS overlay).
+ * Same order as ppu_fs.cpp hdd1_host_root / cellFs.c cellfs_hdd1_host_root:
+ * $PS3_HDD1_ROOT, else $PS3_HDD0_ROOT/syscache, else game/hdd0/syscache when
+ * that tree exists, else <VFS>/hdd0/syscache. Stripping /dev_hdd1/ onto the
+ * disc dump looks for <VFS>/cache/<id>/cache.idx and FIOS logs err=-129. */
+static void sys_fs_hdd1_host_root(char* out, size_t cap)
+{
+    const char* e1 = getenv("PS3_HDD1_ROOT");
+    if (e1 && *e1) {
+        snprintf(out, cap, "%s", e1);
+    } else {
+        const char* e0 = getenv("PS3_HDD0_ROOT");
+        if (e0 && *e0) {
+            snprintf(out, cap, "%s/syscache", e0);
+        } else {
+            struct stat st;
+            if (stat("game/hdd0", &st) == 0 && S_ISDIR(st.st_mode))
+                snprintf(out, cap, "game/hdd0/syscache");
+            else
+                snprintf(out, cap, "%s/hdd0/syscache",
+                         g_sys_fs_root[0] ? g_sys_fs_root : ".");
+        }
+    }
+    for (char* p = out; *p; p++)
+        if (*p == '\\') *p = '/';
+}
+
+static int sys_fs_mkdir_p(const char* path)
+{
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s", path);
+    size_t len = strlen(tmp);
+    while (len > 1 && (tmp[len - 1] == '/' || tmp[len - 1] == '\\'))
+        tmp[--len] = 0;
+    for (char* p = tmp + 1; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            char c = *p;
+            *p = 0;
+#ifdef _WIN32
+            _mkdir(tmp);
+#else
+            mkdir(tmp, 0755);
+#endif
+            *p = c;
+        }
+    }
+#ifdef _WIN32
+    int r = _mkdir(tmp);
+#else
+    int r = mkdir(tmp, 0755);
+#endif
+    if (r != 0) {
+        struct stat st;
+        if (stat(tmp, &st) == 0 && S_ISDIR(st.st_mode))
+            r = 0;
+    }
+    return r;
+}
+
+static void sys_fs_hdd1_prepare(const char* guest, const char* hpath)
+{
+    char parent[1100];
+    snprintf(parent, sizeof parent, "%s", hpath);
+    char* slash = strrchr(parent, '/');
+#ifdef _WIN32
+    char* bslash = strrchr(parent, '\\');
+    if (!slash || (bslash && bslash > slash))
+        slash = bslash;
+#endif
+    if (slash && slash != parent) {
+        *slash = 0;
+        sys_fs_mkdir_p(parent);
+    }
+    const char* base = strrchr(guest, '/');
+    base = base ? base + 1 : guest;
+    /* FIOS 1.3 overlay: cache.idx is the index, cache.dat the payload. Seed
+     * empty files on a freshly formatted syscache so openCacheFile is not
+     * CELL_ENOENT (-129) when the guest hits this lv2 path instead of ppu_fs. */
+    if (strcmp(base, "cache.idx") != 0 && strcmp(base, "cache.dat") != 0)
+        return;
+    struct stat st;
+    if (stat(hpath, &st) == 0)
+        return;
+    FILE* sf = fopen(hpath, "wb");
+    if (sf) {
+        fclose(sf);
+        fprintf(stderr, "[sys_fs] seeded empty syscache '%s' -> '%s'\n", guest, hpath);
+    }
+}
+
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
 {
     /* Lazily adopt PS3_VFS_ROOT if the root is still the default ".", so this
@@ -115,6 +238,29 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
     if (g_sys_fs_root[0] == '.' && g_sys_fs_root[1] == '\0') {
         const char* env = getenv("PS3_VFS_ROOT");
         if (env && *env) { strncpy(g_sys_fs_root, env, sizeof(g_sys_fs_root) - 1); g_sys_fs_root[sizeof(g_sys_fs_root)-1] = 0; }
+    }
+
+    /* /dev_hdd1 is the title syscache, not disc data. ppu_fs / cellFs already
+     * special-case this; the lv2 translator used to strip the mount prefix
+     * onto <VFS>/cache/... like /dev_bdvd. */
+    if (strncmp(ps3_path, "/dev_hdd1/", 10) == 0 || strcmp(ps3_path, "/dev_hdd1") == 0) {
+        char root[1024];
+        sys_fs_hdd1_host_root(root, sizeof root);
+        const char* rest = (ps3_path[9] == '/') ? ps3_path + 10 : "";
+        if (*rest)
+            snprintf(host_path, (size_t)host_path_size, "%s/%s", root, rest);
+        else
+            snprintf(host_path, (size_t)host_path_size, "%s", root);
+        for (char* p = host_path; *p; p++)
+            if (*p == '\\') *p = '/';
+        static int logged = 0;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, "[sys_fs] /dev_hdd1 -> '%s'\n", root);
+        }
+        sys_fs_hdd1_prepare(ps3_path, host_path);
+        fs_normalize_sep(host_path);
+        return;
     }
 
     /* /dev_hdd0 overlays the installed game-update dir (patchN.farc live there
@@ -762,6 +908,31 @@ int64_t sys_fs_opendir(ppu_context* ctx)
     return CELL_OK;
 }
 
+/* Next directory entry. Returns 1 and fills name/is_dir, or 0 at EOF. */
+static int sys_fs_dir_next(sys_fs_dir_info* d, const char** name, int* is_dir)
+{
+#ifdef _WIN32
+    if (d->first_read) {
+        d->first_read = 0;
+        *name = d->find_data.cFileName;
+        *is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+        return 1;
+    }
+    if (!FindNextFileA(d->find_handle, &d->find_data))
+        return 0;
+    *name = d->find_data.cFileName;
+    *is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+    return 1;
+#else
+    struct dirent* entry = readdir(d->dp);
+    if (!entry)
+        return 0;
+    *name = entry->d_name;
+    *is_dir = (entry->d_type == DT_DIR) ? 1 : 0;
+    return 1;
+#endif
+}
+
 /* ---------------------------------------------------------------------------
  * sys_fs_readdir
  *
@@ -785,30 +956,10 @@ int64_t sys_fs_readdir(ppu_context* ctx)
 
     const char* name = NULL;
     int is_dir = 0;
-
-#ifdef _WIN32
-    if (d->first_read) {
-        d->first_read = 0;
-        name = d->find_data.cFileName;
-        is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
-    } else {
-        if (!FindNextFileA(d->find_handle, &d->find_data)) {
-            /* End of directory */
-            if (nread_addr != 0) write_be64(nread_addr, 0);
-            return CELL_OK;
-        }
-        name = d->find_data.cFileName;
-        is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
-    }
-#else
-    struct dirent* entry = readdir(d->dp);
-    if (!entry) {
+    if (!sys_fs_dir_next(d, &name, &is_dir)) {
         if (nread_addr != 0) write_be64(nread_addr, 0);
         return CELL_OK;
     }
-    name = entry->d_name;
-    is_dir = (entry->d_type == DT_DIR) ? 1 : 0;
-#endif
 
     if (dirent_addr != 0 && name != NULL) {
         uint8_t* out = (uint8_t*)vm_to_host(dirent_addr);
@@ -974,6 +1125,517 @@ int64_t sys_fs_rmdir(ppu_context* ctx)
     return CELL_OK;
 }
 
+static int64_t sys_fs_truncate_host(const char* host_path, uint64_t size)
+{
+#ifdef _WIN32
+    FILE* f = fopen(host_path, "rb+");
+    if (!f)
+        return (int64_t)(int32_t)CELL_ENOENT;
+    int fno = _fileno(f);
+    int rc = _chsize_s(fno, (long long)size);
+    fclose(f);
+    return rc == 0 ? CELL_OK : (int64_t)(int32_t)CELL_EINVAL;
+#else
+    if (truncate(host_path, (off_t)size) != 0)
+        return (int64_t)(int32_t)(errno == ENOENT ? CELL_ENOENT : CELL_EINVAL);
+    return CELL_OK;
+#endif
+}
+
+static sys_fs_fd_info* sys_fs_file_from_fd(int32_t fd)
+{
+    int slot = fd - 3;
+    if (slot < 0 || slot >= SYS_FS_FD_MAX)
+        return NULL;
+    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
+    if (!f->active || !f->fp)
+        return NULL;
+    return f;
+}
+
+static sys_fs_dir_info* sys_fs_dir_from_fd(int32_t dir_fd)
+{
+    if (dir_fd <= 0 || dir_fd > SYS_FS_DIR_MAX)
+        return NULL;
+    sys_fs_dir_info* d = &g_sys_fs_dirs[dir_fd - 1];
+    if (!d->active)
+        return NULL;
+    return d;
+}
+
+/* CellFsDirectoryEntry: CellFsStat (52) + CellFsDirent (258) = 310. */
+#define SYS_FS_DIRECTORY_ENTRY_SIZE  310u
+
+static int64_t sys_fs_fcntl_getdirents(int32_t fd, uint32_t arg, uint32_t size)
+{
+    /* dir_info: _code@0 _size@4 ptr@8 max@12 (RPCS3 lv2_file_op_dir::dir_info). */
+    if (size < 0x10 || arg == 0)
+        return (int64_t)(int32_t)CELL_EINVAL;
+
+    sys_fs_dir_info* d = sys_fs_dir_from_fd(fd);
+    if (!d)
+        return (int64_t)(int32_t)CELL_EBADF;
+
+    uint32_t max = read_be32(arg + 12);
+    uint32_t ptr = read_be32(arg + 8);
+    uint32_t wrote = 0;
+
+    if (max && ptr) {
+        const char* name = NULL;
+        int is_dir = 0;
+        if (sys_fs_dir_next(d, &name, &is_dir) && name) {
+            uint32_t ent = ptr;
+            char child[1024];
+            snprintf(child, sizeof child, "%s/%s", d->path, name);
+            struct stat st;
+            memset(&st, 0, sizeof st);
+#ifdef _WIN32
+            if (_stat64(child, (struct _stat64*)&st) != 0) {
+                st.st_mode = is_dir ? _S_IFDIR : _S_IFREG;
+            }
+#else
+            if (stat(child, &st) != 0) {
+                st.st_mode = is_dir ? S_IFDIR : S_IFREG;
+            }
+#endif
+            fill_cell_stat(ent, &st);
+            uint8_t* de = (uint8_t*)vm_to_host(ent + 52);
+            uint8_t namlen = (uint8_t)strlen(name);
+            if (namlen > 255) namlen = 255;
+            de[0] = is_dir ? 1 : 2;
+            de[1] = namlen;
+            memcpy(de + 2, name, namlen);
+            de[2 + namlen] = '\0';
+            wrote = 1;
+        }
+        if (max > wrote)
+            memset(vm_to_host(ptr + wrote * SYS_FS_DIRECTORY_ENTRY_SIZE), 0,
+                   (max - wrote) * SYS_FS_DIRECTORY_ENTRY_SIZE);
+    }
+
+    write_be32(arg + 0, CELL_OK);
+    write_be32(arg + 4, wrote);
+    return CELL_OK;
+}
+
+static int64_t sys_fs_fcntl_rw_offset(int32_t fd, uint32_t op, uint32_t arg, uint32_t size)
+{
+    /* lv2_file_op_rw 0x38: buf@0x14 offset@0x18 size@0x20 out_code@0x28 out_size@0x30 */
+    if (size < 0x38 || arg == 0)
+        return (int64_t)(int32_t)CELL_EINVAL;
+
+    sys_fs_fd_info* f = sys_fs_file_from_fd(fd);
+    if (!f)
+        return (int64_t)(int32_t)CELL_EBADF;
+
+    uint32_t buf_addr = read_be32(arg + 0x14);
+    uint64_t offset   = read_be64(arg + 0x18);
+    uint64_t nbytes   = read_be64(arg + 0x20);
+    void* buf = buf_addr ? vm_to_host(buf_addr) : NULL;
+    if (nbytes && !buf)
+        return (int64_t)(int32_t)CELL_EFAULT;
+
+#ifdef _WIN32
+    int64_t old_pos = _ftelli64(f->fp);
+    if (_fseeki64(f->fp, (int64_t)offset, SEEK_SET) != 0)
+        return (int64_t)(int32_t)CELL_EINVAL;
+#else
+    int64_t old_pos = (int64_t)ftello(f->fp);
+    if (fseeko(f->fp, (off_t)offset, SEEK_SET) != 0)
+        return (int64_t)(int32_t)CELL_EINVAL;
+#endif
+
+    size_t done = 0;
+    if (nbytes && buf) {
+        if (op == 0x8000000au)
+            done = fread(buf, 1, (size_t)nbytes, f->fp);
+        else
+            done = fwrite(buf, 1, (size_t)nbytes, f->fp);
+    }
+
+#ifdef _WIN32
+    _fseeki64(f->fp, old_pos, SEEK_SET);
+#else
+    fseeko(f->fp, (off_t)old_pos, SEEK_SET);
+#endif
+
+    write_be32(arg + 0x28, CELL_OK);
+    write_be64(arg + 0x30, (uint64_t)done);
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_link  (810)
+ * r3 = from, r4 = to
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_link(ppu_context* ctx)
+{
+    uint32_t from_addr = LV2_ARG_PTR(ctx, 0);
+    uint32_t to_addr   = LV2_ARG_PTR(ctx, 1);
+    if (!from_addr || !to_addr)
+        return (int64_t)(int32_t)CELL_EFAULT;
+
+    char from_host[1024], to_host[1024];
+    sys_fs_translate_path((const char*)vm_to_host(from_addr), from_host, sizeof from_host);
+    sys_fs_translate_path((const char*)vm_to_host(to_addr), to_host, sizeof to_host);
+
+#ifdef _WIN32
+    if (!CreateHardLinkA(to_host, from_host, NULL))
+        return (int64_t)(int32_t)CELL_ENOENT;
+#else
+    if (link(from_host, to_host) != 0)
+        return (int64_t)(int32_t)CELL_ENOENT;
+#endif
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_utime  (815)
+ * r3 = path, r4 = CellFsUtimbuf* { s64 actime; s64 modtime; } packed 16 bytes
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_utime(ppu_context* ctx)
+{
+    uint32_t path_addr = LV2_ARG_PTR(ctx, 0);
+    uint32_t tbuf_addr = LV2_ARG_PTR(ctx, 1);
+    if (!path_addr)
+        return (int64_t)(int32_t)CELL_EFAULT;
+
+    char host_path[1024];
+    sys_fs_translate_path((const char*)vm_to_host(path_addr), host_path, sizeof host_path);
+
+#ifdef _WIN32
+    struct __utimbuf64 ut;
+    if (tbuf_addr) {
+        ut.actime  = (time_t)read_be64(tbuf_addr);
+        ut.modtime = (time_t)read_be64(tbuf_addr + 8);
+    } else {
+        time_t now = time(NULL);
+        ut.actime = ut.modtime = now;
+    }
+    if (_utime64(host_path, tbuf_addr ? &ut : NULL) != 0)
+        return (int64_t)(int32_t)CELL_ENOENT;
+#else
+    struct utimbuf ut;
+    if (tbuf_addr) {
+        ut.actime  = (time_t)read_be64(tbuf_addr);
+        ut.modtime = (time_t)read_be64(tbuf_addr + 8);
+    } else {
+        time_t now = time(NULL);
+        ut.actime = ut.modtime = now;
+    }
+    if (utime(host_path, tbuf_addr ? &ut : NULL) != 0)
+        return (int64_t)(int32_t)CELL_ENOENT;
+#endif
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_access  (816)
+ *
+ * r3 = path, r4 = mode
+ * ABI: CellFsErrno sys_fs_access(const char *path, s32 mode)
+ *   mode is POSIX F_OK=0 / X_OK=1 / W_OK=2 / R_OK=4 (cellFsAccess), and
+ *   also accepts CELL_FS_S_I{R,W,X}USR. No ByFd form — 816 is path-only.
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_access(ppu_context* ctx)
+{
+    uint32_t path_addr = LV2_ARG_PTR(ctx, 0);
+    int32_t  mode      = LV2_ARG_S32(ctx, 1);
+    if (!path_addr)
+        return (int64_t)(int32_t)CELL_EFAULT;
+
+    const char* ps3_path = (const char*)vm_to_host(path_addr);
+    if (!ps3_path || !ps3_path[0])
+        return (int64_t)(int32_t)CELL_EINVAL;
+
+    char host_path[1024];
+    sys_fs_translate_path(ps3_path, host_path, sizeof host_path);
+
+    int host_mode = 0; /* F_OK */
+    if (mode & (CELL_FS_R_OK | CELL_FS_S_IRUSR | CELL_FS_S_IRGRP))
+        host_mode |= 4;
+    if (mode & (CELL_FS_W_OK | CELL_FS_S_IWUSR))
+        host_mode |= 2;
+
+#ifdef _WIN32
+    if (_access(host_path, host_mode) != 0)
+        return (int64_t)(int32_t)(errno == ENOENT ? CELL_ENOENT : CELL_EACCES);
+#else
+    int posix_mode = F_OK;
+    if (host_mode & 4)
+        posix_mode |= R_OK;
+    if (host_mode & 2)
+        posix_mode |= W_OK;
+    if (mode & (CELL_FS_X_OK | CELL_FS_S_IXUSR))
+        posix_mode |= X_OK;
+    if (access(host_path, posix_mode) != 0) {
+        if (errno == ENOENT) return (int64_t)(int32_t)CELL_ENOENT;
+        if (errno == EACCES) return (int64_t)(int32_t)CELL_EACCES;
+        return (int64_t)(int32_t)CELL_EINVAL;
+    }
+#endif
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_fcntl  (817)
+ *
+ * r3 = fd, r4 = op, r5 = arg, r6 = size
+ * GetDirectoryEntries is 0xe0000012; Read/WriteWithOffset 0x8000000a/0b.
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_fcntl(ppu_context* ctx)
+{
+    int32_t  fd   = LV2_ARG_S32(ctx, 0);
+    uint32_t op   = LV2_ARG_U32(ctx, 1);
+    uint32_t arg  = LV2_ARG_PTR(ctx, 2);
+    uint32_t size = LV2_ARG_U32(ctx, 3);
+
+    switch (op) {
+    case 0x8000000au: /* cellFsReadWithOffset */
+    case 0x8000000bu: /* cellFsWriteWithOffset */
+        return sys_fs_fcntl_rw_offset(fd, op, arg, size);
+
+    case 0xe0000012u: /* cellFsGetDirectoryEntries */
+        return sys_fs_fcntl_getdirents(fd, arg, size);
+
+    case 0xe0000017u: { /* cellFsAllocateFileAreaWithoutZeroFill */
+        /* size@0 _x4@4=0x10 _x8@8=0x20 path@0x10 filesize@0x18 out_code@0x20 */
+        if (size < 0x28 || arg == 0)
+            return (int64_t)(int32_t)CELL_EINVAL;
+        if (read_be32(arg + 4) != 0x10u || read_be32(arg + 8) != 0x20u)
+            return (int64_t)(int32_t)CELL_EINVAL;
+        uint32_t path_addr = read_be32(arg + 0x10);
+        uint64_t file_size = read_be64(arg + 0x18);
+        if (!path_addr)
+            return (int64_t)(int32_t)CELL_EFAULT;
+        char host_path[1024];
+        sys_fs_translate_path((const char*)vm_to_host(path_addr), host_path, sizeof host_path);
+        int64_t rc = sys_fs_truncate_host(host_path, file_size);
+        write_be32(arg + 0x20, (uint32_t)rc);
+        return CELL_OK;
+    }
+
+    case 0xc0000002u: { /* cellFsGetFreeSize (hdd0 fcntl form) */
+        if (size < 0x28 || arg == 0)
+            return (int64_t)(int32_t)CELL_EINVAL;
+        uint32_t path_addr = read_be32(arg + 0x0C);
+        char host_path[1024];
+        host_path[0] = 0;
+        if (path_addr) {
+            const char* p = (const char*)vm_to_host(path_addr);
+            if (p && p[0])
+                sys_fs_translate_path(p, host_path, sizeof host_path);
+        }
+        uint64_t freeb = sys_fs_host_total_bytes(host_path[0] ? host_path : NULL);
+        /* Prefer actual free space when the volume query succeeded. */
+#ifdef _WIN32
+        {
+            ULARGE_INTEGER avail, total;
+            const char* q = host_path[0] ? host_path : (g_sys_fs_root[0] ? g_sys_fs_root : ".");
+            if (GetDiskFreeSpaceExA(q, &avail, &total, NULL) && avail.QuadPart)
+                freeb = (uint64_t)avail.QuadPart;
+        }
+#endif
+        if (freeb < 8ull * 1024ull * 1024ull * 1024ull)
+            freeb = 8ull * 1024ull * 1024ull * 1024ull;
+        write_be32(arg + 0x18, CELL_OK);
+        write_be32(arg + 0x1C, 4096u);
+        write_be64(arg + 0x20, freeb / 4096ull);
+        return CELL_OK;
+    }
+
+    case 0x80000004u: /* unknown: write 0 */
+        if (size > 4)
+            return (int64_t)(int32_t)CELL_EINVAL;
+        if (arg && size >= 4)
+            write_be32(arg, 0);
+        return CELL_OK;
+
+    case 0xc0000006u: /* mount probe: out_code@0x18 = ENOTSUP, out_id@0x1c = 0 */
+        if (arg && size >= 0x20) {
+            write_be32(arg + 0x18, (uint32_t)CELL_ENOSYS);
+            write_be32(arg + 0x1C, 0);
+        }
+        return CELL_OK;
+
+    case 0xc0000008u: /* SetIoBuffer / SetDefaultContainer */
+        if (arg && size >= 0x28)
+            write_be32(arg + 0x20, CELL_OK);
+        return CELL_OK;
+
+    default:
+        fprintf(stderr, "[sys_fs] fcntl fd=%d op=0x%X size=%u (ok stub)\n",
+                fd, op, size);
+        return CELL_OK;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_fsync  (819 fdatasync / 820 fsync)
+ * r3 = fd
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_fsync(ppu_context* ctx)
+{
+    int32_t fd = LV2_ARG_S32(ctx, 0);
+    sys_fs_fd_info* f = sys_fs_file_from_fd(fd);
+    if (!f)
+        return (int64_t)(int32_t)CELL_EBADF;
+
+    fflush(f->fp);
+#ifdef _WIN32
+    int hfd = _fileno(f->fp);
+    if (hfd >= 0)
+        _commit(hfd);
+#else
+    int hfd = fileno(f->fp);
+    if (hfd >= 0)
+        fsync(hfd);
+#endif
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_truncate  (831)
+ * r3 = path, r4 = size
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_truncate(ppu_context* ctx)
+{
+    uint32_t path_addr = LV2_ARG_PTR(ctx, 0);
+    uint64_t size      = LV2_ARG_U64(ctx, 1);
+    if (!path_addr)
+        return (int64_t)(int32_t)CELL_EFAULT;
+
+    const char* ps3_path = (const char*)vm_to_host(path_addr);
+    if (!ps3_path || !ps3_path[0])
+        return (int64_t)(int32_t)CELL_EINVAL;
+
+    char host_path[1024];
+    sys_fs_translate_path(ps3_path, host_path, sizeof host_path);
+    return sys_fs_truncate_host(host_path, size);
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_symlink  (833)
+ *
+ * r3 = target, r4 = linkpath
+ * ABI: CellFsErrno sys_fs_symbolic_link(const char *target, const char *linkpath)
+ *   POSIX order (same as symlink(2) / cellFsSymbolicLink). No ByFd form.
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_symlink(ppu_context* ctx)
+{
+    uint32_t target_addr = LV2_ARG_PTR(ctx, 0);
+    uint32_t link_addr   = LV2_ARG_PTR(ctx, 1);
+    if (!target_addr || !link_addr)
+        return (int64_t)(int32_t)CELL_EFAULT;
+
+    const char* target_ps3 = (const char*)vm_to_host(target_addr);
+    const char* link_ps3   = (const char*)vm_to_host(link_addr);
+    if (!target_ps3 || !target_ps3[0] || !link_ps3 || !link_ps3[0])
+        return (int64_t)(int32_t)CELL_EINVAL;
+
+    char target_host[1024], link_host[1024];
+    sys_fs_translate_path(target_ps3, target_host, sizeof target_host);
+    sys_fs_translate_path(link_ps3, link_host, sizeof link_host);
+
+#ifdef _WIN32
+#ifndef SYMBOLIC_LINK_FLAG_DIRECTORY
+#define SYMBOLIC_LINK_FLAG_DIRECTORY 0x1
+#endif
+#ifndef SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+#define SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE 0x2
+#endif
+    DWORD flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+    DWORD attr = GetFileAttributesA(target_host);
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+        flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
+    if (!CreateSymbolicLinkA(link_host, target_host, flags)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_ALREADY_EXISTS)
+            return (int64_t)(int32_t)CELL_EEXIST;
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+            return (int64_t)(int32_t)CELL_ENOENT;
+        if (err == ERROR_PRIVILEGE_NOT_HELD || err == ERROR_ACCESS_DENIED)
+            return (int64_t)(int32_t)CELL_EPERM;
+        return (int64_t)(int32_t)CELL_EACCES;
+    }
+#else
+    if (symlink(target_host, link_host) != 0) {
+        if (errno == EEXIST) return (int64_t)(int32_t)CELL_EEXIST;
+        if (errno == ENOENT) return (int64_t)(int32_t)CELL_ENOENT;
+        if (errno == EACCES || errno == EPERM) return (int64_t)(int32_t)CELL_EPERM;
+        return (int64_t)(int32_t)CELL_EACCES;
+    }
+#endif
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_chmod  (834)
+ * r3 = path, r4 = mode
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_chmod(ppu_context* ctx)
+{
+    uint32_t path_addr = LV2_ARG_PTR(ctx, 0);
+    int32_t  mode      = LV2_ARG_S32(ctx, 1);
+    if (!path_addr)
+        return (int64_t)(int32_t)CELL_EFAULT;
+
+    char host_path[1024];
+    sys_fs_translate_path((const char*)vm_to_host(path_addr), host_path, sizeof host_path);
+
+    struct stat st;
+#ifdef _WIN32
+    if (_stat64(host_path, (struct _stat64*)&st) != 0)
+        return (int64_t)(int32_t)CELL_ENOENT;
+    (void)mode;
+    _chmod(host_path, _S_IREAD | _S_IWRITE);
+#else
+    if (stat(host_path, &st) != 0)
+        return (int64_t)(int32_t)CELL_ENOENT;
+    if (chmod(host_path, (mode_t)mode) != 0)
+        return (int64_t)(int32_t)CELL_EACCES;
+#endif
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_chown  (835)
+ *
+ * r3 = path, r4 = uid, r5 = gid
+ * ABI: CellFsErrno sys_fs_chown(const char *path, s32 uid, s32 gid)
+ *   cellFsChown; no ByFd. Host NTFS has no POSIX uid/gid — exist-check only.
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_chown(ppu_context* ctx)
+{
+    uint32_t path_addr = LV2_ARG_PTR(ctx, 0);
+    int32_t  uid       = LV2_ARG_S32(ctx, 1);
+    int32_t  gid       = LV2_ARG_S32(ctx, 2);
+    if (!path_addr)
+        return (int64_t)(int32_t)CELL_EFAULT;
+
+    const char* ps3_path = (const char*)vm_to_host(path_addr);
+    if (!ps3_path || !ps3_path[0])
+        return (int64_t)(int32_t)CELL_EINVAL;
+
+    char host_path[1024];
+    sys_fs_translate_path(ps3_path, host_path, sizeof host_path);
+
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_stat64(host_path, &st) != 0)
+        return (int64_t)(int32_t)CELL_ENOENT;
+    (void)uid;
+    (void)gid;
+#else
+    if (chown(host_path, (uid_t)uid, (gid_t)gid) != 0) {
+        if (errno == ENOENT) return (int64_t)(int32_t)CELL_ENOENT;
+        if (errno == EACCES || errno == EPERM) return (int64_t)(int32_t)CELL_EPERM;
+        return (int64_t)(int32_t)CELL_EACCES;
+    }
+#endif
+    return CELL_OK;
+}
+
 /* ---------------------------------------------------------------------------
  * sys_fs_ftruncate
  *
@@ -1009,12 +1671,285 @@ int64_t sys_fs_ftruncate(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
+ * Block / sector size (lv2 840 / 841)
+ *
+ * RPCS3 / SDK layout (cellFsGetBlockSize, cellFsFGetBlockSize, *2 variants):
+ *   sys_fs_fget_block_size(fd, u64* sector_size, u64* block_size,
+ *                          u64* arg4, s32* out_flags)
+ *   sys_fs_get_block_size(path, u64* sector_size, u64* block_size, u64* arg4)
+ *
+ * Hardware writes sector_size, block_size, and arg4 (RPCS3 copies sector_size
+ * into arg4). Returning CELL_OK with zeros makes FIOS treat the volume as
+ * empty / 512-byte I/O. st_blksize and GetFreeSize in this port are 4096.
+ * -----------------------------------------------------------------------*/
+#define SYS_FS_SECTOR_SIZE  512ull
+#define SYS_FS_BLOCK_SIZE   4096ull
+
+static uint64_t sys_fs_host_total_bytes(const char* host_path)
+{
+    char path[1024];
+    if (!host_path || !host_path[0])
+        host_path = g_sys_fs_root[0] ? g_sys_fs_root : ".";
+    snprintf(path, sizeof path, "%s", host_path);
+#ifdef _WIN32
+    for (char* p = path; *p; p++)
+        if (*p == '/') *p = '\\';
+#endif
+    for (;;) {
+#ifdef _WIN32
+        ULARGE_INTEGER avail, total;
+        if (GetDiskFreeSpaceExA(path, &avail, &total, NULL) && total.QuadPart)
+            return (uint64_t)total.QuadPart;
+#else
+        struct statvfs info;
+        if (statvfs(path, &info) == 0) {
+            uint64_t fr = info.f_frsize ? (uint64_t)info.f_frsize : (uint64_t)info.f_bsize;
+            uint64_t n = fr * (uint64_t)info.f_blocks;
+            if (n)
+                return n;
+        }
+#endif
+        size_t len = strlen(path);
+        while (len > 1 && (path[len - 1] == '/' || path[len - 1] == '\\'))
+            path[--len] = '\0';
+        char* slash = strrchr(path, '/');
+#ifdef _WIN32
+        char* bslash = strrchr(path, '\\');
+        if (bslash && (!slash || bslash > slash))
+            slash = bslash;
+        if (len == 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/'))
+            break;
+        if (len == 2 && path[1] == ':')
+            break;
+#endif
+        if (!slash)
+            break;
+        if (slash == path) {
+            slash[1] = '\0';
+            continue;
+        }
+#ifdef _WIN32
+        if (slash == path + 2 && path[1] == ':') {
+            slash[1] = '\0';
+            continue;
+        }
+#endif
+        *slash = '\0';
+    }
+    return 8ull * 1024ull * 1024ull * 1024ull;
+}
+
+static void sys_fs_write_block_outs(uint32_t sector_addr, uint32_t block_addr,
+                                    uint32_t arg4_addr, const char* host_path)
+{
+    const uint64_t sector_size = SYS_FS_SECTOR_SIZE;
+    const uint64_t block_size  = SYS_FS_BLOCK_SIZE;
+    uint64_t total = sys_fs_host_total_bytes(host_path);
+    if (total < 8ull * 1024ull * 1024ull * 1024ull)
+        total = 8ull * 1024ull * 1024ull * 1024ull;
+    /* arg4 is unnamed in the SDK; RPCS3 writes sector_size. Also expose a
+     * non-zero sector count so callers that treat the 4th word as a count
+     * (not CELL_OK + zeros) see a volume that can hold a FIOS overlay. */
+    uint64_t sector_count = total / sector_size;
+    if (sector_count < (8ull * 1024ull * 1024ull * 1024ull) / sector_size)
+        sector_count = (8ull * 1024ull * 1024ull * 1024ull) / sector_size;
+
+    if (sector_addr)
+        write_be64(sector_addr, sector_size);
+    if (block_addr)
+        write_be64(block_addr, block_size);
+    if (arg4_addr)
+        write_be64(arg4_addr, sector_count);
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_fget_block_size  (840)
+ *
+ * r3 = fd
+ * r4 = u64* sector_size
+ * r5 = u64* block_size
+ * r6 = u64* arg4          (sector count; RPCS3 copies sector_size)
+ * r7 = s32* out_flags     (open flags)
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_fget_block_size(ppu_context* ctx)
+{
+    int32_t  fd          = LV2_ARG_S32(ctx, 0);
+    uint32_t sector_addr = LV2_ARG_PTR(ctx, 1);
+    uint32_t block_addr  = LV2_ARG_PTR(ctx, 2);
+    uint32_t arg4_addr   = LV2_ARG_PTR(ctx, 3);
+    uint32_t flags_addr  = LV2_ARG_PTR(ctx, 4);
+
+    int slot = fd - 3;
+    if (slot < 0 || slot >= SYS_FS_FD_MAX)
+        return (int64_t)(int32_t)CELL_EBADF;
+
+    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
+    if (!f->active || !f->fp)
+        return (int64_t)(int32_t)CELL_EBADF;
+
+    sys_fs_write_block_outs(sector_addr, block_addr, arg4_addr, f->path);
+    if (flags_addr)
+        write_be32(flags_addr, (uint32_t)f->flags);
+
+    fprintf(stderr, "[sys_fs] fget_block_size fd=%d '%s' sector=%llu block=%llu flags=%d\n",
+            fd, f->path[0] ? f->path : "?",
+            (unsigned long long)SYS_FS_SECTOR_SIZE,
+            (unsigned long long)SYS_FS_BLOCK_SIZE,
+            f->flags);
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_get_block_size  (841)
+ *
+ * r3 = path (guest pointer)
+ * r4 = u64* sector_size
+ * r5 = u64* block_size
+ * r6 = u64* arg4
+ * -----------------------------------------------------------------------*/
+int64_t sys_fs_get_block_size(ppu_context* ctx)
+{
+    uint32_t path_addr   = LV2_ARG_PTR(ctx, 0);
+    uint32_t sector_addr = LV2_ARG_PTR(ctx, 1);
+    uint32_t block_addr  = LV2_ARG_PTR(ctx, 2);
+    uint32_t arg4_addr   = LV2_ARG_PTR(ctx, 3);
+
+    if (path_addr == 0)
+        return (int64_t)(int32_t)CELL_EFAULT;
+
+    const char* ps3_path = (const char*)vm_to_host(path_addr);
+    if (!ps3_path || !ps3_path[0])
+        return (int64_t)(int32_t)CELL_EINVAL;
+
+    char host_path[1024];
+    sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+
+    /* /dev_hdd1 is the syscache mount. Ensure the host dir exists so volume
+     * stats walk a real tree; do not mkdir a file path (cache.idx). */
+    if (strcmp(ps3_path, "/dev_hdd1") == 0 || strcmp(ps3_path, "/dev_hdd1/") == 0)
+        sys_fs_mkdir_p(host_path);
+
+    sys_fs_write_block_outs(sector_addr, block_addr, arg4_addr, host_path);
+
+    fprintf(stderr, "[sys_fs] get_block_size '%s' -> '%s' sector=%llu block=%llu\n",
+            ps3_path, host_path,
+            (unsigned long long)SYS_FS_SECTOR_SIZE,
+            (unsigned long long)SYS_FS_BLOCK_SIZE);
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_fs_mapped_allocate  (845) / sys_fs_mapped_free  (846)
+ *
+ * ABI (SDK / RPCS3 0x34D / 0x34E — not remapped; 840/841 stay GetBlockSize):
+ *   CellFsErrno sys_fs_mapped_allocate(s32 fd, u64 size, void **out_ptr)
+ *   CellFsErrno sys_fs_mapped_free(s32 fd, void *ptr)
+ * Copies `size` bytes from the current file position into a guest window
+ * (does not move the fd offset). ACIT libfs does not import these.
+ * -----------------------------------------------------------------------*/
+#define SYS_FS_MAP_MAX        16
+#define SYS_FS_MAP_BASE       0x51000000u
+#define SYS_FS_MAP_END        0x53000000u
+#define SYS_FS_MAP_SIZE_MAX   (64u * 1024u * 1024u)
+
+typedef struct sys_fs_map_info {
+    int      active;
+    int32_t  fd;
+    uint32_t addr;
+    uint32_t size;
+} sys_fs_map_info;
+
+static sys_fs_map_info g_sys_fs_maps[SYS_FS_MAP_MAX];
+static uint32_t        g_sys_fs_map_bump = SYS_FS_MAP_BASE;
+
+int64_t sys_fs_mapped_allocate(ppu_context* ctx)
+{
+    int32_t  fd      = LV2_ARG_S32(ctx, 0);
+    uint64_t size64  = LV2_ARG_U64(ctx, 1);
+    uint32_t out_ptr = LV2_ARG_PTR(ctx, 2); /* void ** */
+
+    if (!out_ptr)
+        return (int64_t)(int32_t)CELL_EFAULT;
+    if (size64 == 0 || size64 > SYS_FS_MAP_SIZE_MAX)
+        return (int64_t)(int32_t)CELL_EINVAL;
+
+    sys_fs_fd_info* f = sys_fs_file_from_fd(fd);
+    if (!f)
+        return (int64_t)(int32_t)CELL_EBADF;
+
+    uint32_t size = (uint32_t)size64;
+    uint32_t commit = VM_ALIGN_UP(size, VM_PAGE_SIZE);
+
+    int slot = -1;
+    for (int i = 0; i < SYS_FS_MAP_MAX; i++) {
+        if (!g_sys_fs_maps[i].active) { slot = i; break; }
+    }
+    if (slot < 0)
+        return (int64_t)(int32_t)CELL_ENOMEM;
+
+    if (g_sys_fs_map_bump + commit > SYS_FS_MAP_END)
+        return (int64_t)(int32_t)CELL_ENOMEM;
+
+    uint32_t addr = g_sys_fs_map_bump;
+    if (vm_commit(addr, commit) != CELL_OK)
+        return (int64_t)(int32_t)CELL_ENOMEM;
+
+    void* host = vm_to_host(addr);
+    if (!host)
+        return (int64_t)(int32_t)CELL_EFAULT;
+    memset(host, 0, commit);
+
+#ifdef _WIN32
+    __int64 saved = _ftelli64(f->fp);
+#else
+    off_t saved = ftello(f->fp);
+#endif
+    fflush(f->fp);
+    size_t got = fread(host, 1, (size_t)size, f->fp);
+    (void)got;
+#ifdef _WIN32
+    if (saved >= 0)
+        _fseeki64(f->fp, saved, SEEK_SET);
+#else
+    if (saved >= 0)
+        fseeko(f->fp, saved, SEEK_SET);
+#endif
+
+    g_sys_fs_map_bump += commit;
+    g_sys_fs_maps[slot].active = 1;
+    g_sys_fs_maps[slot].fd     = fd;
+    g_sys_fs_maps[slot].addr   = addr;
+    g_sys_fs_maps[slot].size   = size;
+    write_be32(out_ptr, addr);
+    return CELL_OK;
+}
+
+int64_t sys_fs_mapped_free(ppu_context* ctx)
+{
+    int32_t  fd  = LV2_ARG_S32(ctx, 0);
+    uint32_t ptr = LV2_ARG_PTR(ctx, 1);
+    if (!ptr)
+        return (int64_t)(int32_t)CELL_EFAULT;
+
+    for (int i = 0; i < SYS_FS_MAP_MAX; i++) {
+        sys_fs_map_info* m = &g_sys_fs_maps[i];
+        if (m->active && m->addr == ptr && m->fd == fd) {
+            m->active = 0;
+            return CELL_OK;
+        }
+    }
+    return (int64_t)(int32_t)CELL_EINVAL;
+}
+
+/* ---------------------------------------------------------------------------
  * Registration
  * -----------------------------------------------------------------------*/
 void sys_fs_init(lv2_syscall_table* tbl)
 {
     memset(g_sys_fs_fds,  0, sizeof(g_sys_fs_fds));
     memset(g_sys_fs_dirs, 0, sizeof(g_sys_fs_dirs));
+    memset(g_sys_fs_maps, 0, sizeof(g_sys_fs_maps));
+    g_sys_fs_map_bump = SYS_FS_MAP_BASE;
 
     lv2_syscall_register(tbl, SYS_FS_OPEN,      sys_fs_open);
     lv2_syscall_register(tbl, SYS_FS_READ,       sys_fs_read);
@@ -1029,6 +1964,20 @@ void sys_fs_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_FS_RENAME,     sys_fs_rename);
     lv2_syscall_register(tbl, SYS_FS_RMDIR,      sys_fs_rmdir);
     lv2_syscall_register(tbl, SYS_FS_UNLINK,     sys_fs_unlink);
+    lv2_syscall_register(tbl, SYS_FS_LINK,       sys_fs_link);
+    lv2_syscall_register(tbl, SYS_FS_UTIME,      sys_fs_utime);
+    lv2_syscall_register(tbl, SYS_FS_ACCESS,     sys_fs_access);
+    lv2_syscall_register(tbl, SYS_FS_FCNTL,      sys_fs_fcntl);
     lv2_syscall_register(tbl, SYS_FS_LSEEK,      sys_fs_lseek);
+    lv2_syscall_register(tbl, SYS_FS_FDATASYNC,  sys_fs_fsync);
+    lv2_syscall_register(tbl, SYS_FS_FSYNC,      sys_fs_fsync);
+    lv2_syscall_register(tbl, SYS_FS_TRUNCATE,   sys_fs_truncate);
     lv2_syscall_register(tbl, SYS_FS_FTRUNCATE,  sys_fs_ftruncate);
+    lv2_syscall_register(tbl, SYS_FS_SYMLINK,    sys_fs_symlink);
+    lv2_syscall_register(tbl, SYS_FS_CHMOD,      sys_fs_chmod);
+    lv2_syscall_register(tbl, SYS_FS_CHOWN,      sys_fs_chown);
+    lv2_syscall_register(tbl, SYS_FS_FGET_BLOCK_SIZE, sys_fs_fget_block_size);
+    lv2_syscall_register(tbl, SYS_FS_GET_BLOCK_SIZE,  sys_fs_get_block_size);
+    lv2_syscall_register(tbl, SYS_FS_MAPPED_ALLOCATE, sys_fs_mapped_allocate);
+    lv2_syscall_register(tbl, SYS_FS_MAPPED_FREE,     sys_fs_mapped_free);
 }
