@@ -383,6 +383,13 @@ s32 cellGcmSetDefaultFifoSize(u32 size);
 s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId);
 s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId, u32 labelIndex, u32 labelValue);
 
+/* RSX semaphore -> guest label window (GetLabelAddress = base + index*0x10).
+ * NV406E OFFSET/RELEASE and NV4097 SET_SEMAPHORE_OFFSET / *_RELEASE share this. */
+void gcm_sema_set_offset(u32 offset);
+void gcm_sema_release(u32 value);
+void gcm_sema_release_backend(u32 value);
+int  gcm_sema_apply(u32 method, u32 data);
+
 /* NID: 0x3A33C1FD — libgcm flush: publish context->current as PUT and kick. */
 s32 _cellGcmFunc15(u32 ctx);
 
