@@ -11,6 +11,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#define SYSCACHE_MKDIR(p) _mkdir(p)
+#else
+#include <unistd.h>
+#define SYSCACHE_MKDIR(p) mkdir((p), 0777)
+#endif
 
 /* Guest-memory stores — out-params from the recompiled title are guest VM
  * addresses, not host pointers. */
@@ -384,6 +392,60 @@ s32 cellSysutilDisableBgmPlaybackEx(void)
  * System cache
  * -----------------------------------------------------------------------*/
 
+/* Create `path` and any missing parents. Returns 0 on success or if it exists. */
+static int syscache_mkdir_p(const char* path)
+{
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s", path);
+    size_t len = strlen(tmp);
+    while (len > 1 && (tmp[len-1] == '/' || tmp[len-1] == '\\')) tmp[--len] = 0;
+    for (char* p = tmp + 1; *p; p++) {
+        if (*p == '/' || *p == '\\') { char c = *p; *p = 0; SYSCACHE_MKDIR(tmp); *p = c; }
+    }
+    if (SYSCACHE_MKDIR(tmp) != 0) {
+        struct stat st;
+        if (stat(tmp, &st) != 0 || (st.st_mode & S_IFDIR) == 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* Mirror ppu_fs.cpp /dev_hdd1 mapping so the mount creates the host tree
+ * firmware would format, including an empty FIOS cache.idx. */
+static void syscache_prepare_host(const char* cache_id)
+{
+    char host[1100];
+    const char* h1 = getenv("PS3_HDD1_ROOT");
+    const char* h0 = getenv("PS3_HDD0_ROOT");
+    if (h1 && *h1)
+        snprintf(host, sizeof host, "%s/cache/%s", h1, cache_id);
+    else if (h0 && *h0)
+        snprintf(host, sizeof host, "%s/syscache/cache/%s", h0, cache_id);
+    else {
+        struct stat st;
+        if (stat("game/hdd0", &st) == 0 && (st.st_mode & S_IFDIR))
+            snprintf(host, sizeof host, "game/hdd0/syscache/cache/%s", cache_id);
+        else
+            return; /* ppu_fs seeds via $PS3_VFS_ROOT/hdd0/syscache on first open */
+    }
+    for (char* q = host; *q; q++) if (*q == '\\') *q = '/';
+    if (syscache_mkdir_p(host) != 0)
+        return;
+    const char* names[] = { "cache.idx", "cache.dat" };
+    for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+        char path[1200];
+        struct stat st;
+        snprintf(path, sizeof path, "%s/%s", host, names[i]);
+        if (stat(path, &st) == 0)
+            continue;
+        FILE* f = fopen(path, "wb");
+        if (f) {
+            fclose(f);
+            printf("[cellSysutil] seeded empty %s at '%s'\n", names[i], path);
+        }
+    }
+}
+
 s32 cellSysCacheMount(char* param)
 {
     /* The argument is a GUEST EA of CellSysCacheParam:
@@ -399,7 +461,6 @@ s32 cellSysCacheMount(char* param)
     char cache_id[33];
     memcpy(cache_id, vm_base + ea, 32);
     cache_id[32] = '\0';
-    printf("[cellSysutil] SysCacheMount(id='%s')\n", cache_id);
 
     snprintf(s_cache_path, CELL_SYSCACHE_PATH_MAX, "/dev_hdd1/cache/%s", cache_id);
     size_t n = strlen(s_cache_path);
@@ -407,6 +468,9 @@ s32 cellSysCacheMount(char* param)
     memcpy(vm_base + ea + 0x20, s_cache_path, n);
     vm_base[ea + 0x20 + n] = '\0';
     s_cache_mounted = 1;
+
+    syscache_prepare_host(cache_id);
+    printf("[cellSysutil] SysCacheMount(id='%s') path='%s'\n", cache_id, s_cache_path);
 
     return CELL_OK;   /* CELL_SYSCACHE_RET_OK_CLEARED */
 }
