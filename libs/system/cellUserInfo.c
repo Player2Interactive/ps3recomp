@@ -34,11 +34,14 @@ static u32 s_selected_user = EMU_USER_ID;
 
 s32 cellUserInfoGetStat(u32 id, CellUserInfoUserStat* stat)
 {
+    u32 resolved = (id == CELL_SYSUTIL_USERID_CURRENT) ? EMU_USER_ID : id;
+    printf("[cellUserInfo] GetStat(id=%u -> %u)%c", id, resolved, 10);
+
     if (!stat)
         return CELL_USERINFO_ERROR_PARAM;
     stat = GUEST_PTR(stat, CellUserInfoUserStat*);
 
-    if (id != EMU_USER_ID)
+    if (resolved != EMU_USER_ID)
         return CELL_USERINFO_ERROR_NOUSER;
 
     /* NOTE: write ONLY the real 68-byte struct (id+name). Anything more
@@ -111,13 +114,14 @@ s32 cellUserInfoEnableOverlay(s32 enable)
 
 s32 cellUserInfoGetHomeDir(u32 id, char* homePath, u32 homePathSize)
 {
-    printf("[cellUserInfo] GetHomeDir(id=%u)\n", id);
+    u32 resolved = (id == CELL_SYSUTIL_USERID_CURRENT) ? EMU_USER_ID : id;
+    printf("[cellUserInfo] GetHomeDir(id=%u -> %u)\n", id, resolved);
 
     if (!homePath || homePathSize == 0)
         return CELL_USERINFO_ERROR_PARAM;
     homePath = GUEST_PTR(homePath, char*);
 
-    if (id != EMU_USER_ID)
+    if (resolved != EMU_USER_ID)
         return CELL_USERINFO_ERROR_NOUSER;
 
     strncpy(homePath, EMU_HOME_DIR, homePathSize - 1);
