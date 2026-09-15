@@ -15,6 +15,7 @@
  */
 
 #include "rsx_commands.h"
+#include "cellGcmSys.h"
 #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
@@ -352,27 +353,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * for the frequency divisor (instancing). Captured for read_vp_vertex. */
     if (method == 0x00001FC0) { state->frequency_divider_op = data; return 0; }
 
-    { static u32 s_sem_off = 0;
-      if (method == 0x1D6C) { s_sem_off = data; return 0; }
-      if (method == 0x1D70) {
-        extern void vm_write32(uint32_t a, uint32_t v);
-        /* The RSX back-end semaphore write swaps bytes 0<->2 of the value (hw
-         * quirk); libgcm's cellGcmSetWriteBackEndLabel PRE-swaps to compensate
-         * (SDK gcm_implementation_sub.h: "// swap byte 0 and 2"). Writing the
-         * FIFO value verbatim left the label byte-swapped, so gcmutil's
-         * cellGcmUtilFinish poll (label 255 == sLabelVal, starts at 1) compared
-         * 0x00010000 != 1 and spun forever (gcm/cube sample hang after init).
-         * Apply the same swap the hardware does so the pre-swap cancels out. */
-        u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
-        vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
-        { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
+    /* NV4097 / NV406E semaphore → guest label window (GetLabelAddress). */
+    if (gcm_sema_apply(method, data))
         return 0;
-      }
-      if (method == 0x1D74) {
-        extern void vm_write32(uint32_t a, uint32_t v);
-        vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
-        return 0;
-      } }
     if ((method >= 0x200 && method <= 0x23C) ||
         (method >= 0x280 && method <= 0x28C))
         return process_surface_method(state, method, data);
