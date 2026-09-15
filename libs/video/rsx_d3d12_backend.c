@@ -348,6 +348,29 @@ typedef struct {
 } D3D12State;
 
 static D3D12State s_d3d;
+static CRITICAL_SECTION s_d3d_record_cs;
+static volatile LONG s_d3d_record_cs_ready = 0;
+
+void rsx_d3d12_record_lock(void)
+{
+    if (!s_d3d_record_cs_ready) {
+        static LONG once = 0;
+        if (InterlockedCompareExchange(&once, 1, 0) == 0) {
+            InitializeCriticalSection(&s_d3d_record_cs);
+            InterlockedExchange(&s_d3d_record_cs_ready, 1);
+        } else {
+            while (!s_d3d_record_cs_ready)
+                SwitchToThread();
+        }
+    }
+    EnterCriticalSection(&s_d3d_record_cs);
+}
+
+void rsx_d3d12_record_unlock(void)
+{
+    if (s_d3d_record_cs_ready)
+        LeaveCriticalSection(&s_d3d_record_cs);
+}
 char g_rsx_title_base[128] = "ps3recomp";
 static u32 s_dbg_last_draws = 0;
 static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
@@ -6696,6 +6719,7 @@ int rsx_d3d12_backend_pump_messages(void)
 
 void rsx_d3d12_backend_present(void)
 {
+    rsx_d3d12_record_lock();
     if (blink_dbg())
         printf("[PRESENT] draws=%u clears_since_last=%u clear_presents=%u\n",
                s_d3d.draw_count, s_dbg_clears_since_present, s_clear_presents);
@@ -6707,8 +6731,10 @@ void rsx_d3d12_backend_present(void)
      * that partial present right after the FIFO ring recycle was the visible
      * blink. Keep the ticker present solely as the boot-time fallback (before
      * the first framed clear arrives). */
-    if (s_clear_presents > 0)
+    if (s_clear_presents > 0) {
+        rsx_d3d12_record_unlock();
         return;
+    }
 
     /* Same display gate as d3d12_present: a batch of offscreen pass work only
      * (render-to-texture) keeps accumulating until its composite arrives.
@@ -6782,6 +6808,7 @@ void rsx_d3d12_backend_present(void)
         render_frame();
         s_present_this_frame = 1;
     }
+    rsx_d3d12_record_unlock();
 }
 
 #else /* !_WIN32 */
@@ -6799,5 +6826,7 @@ int rsx_d3d12_backend_init(u32 w, u32 h, const char* t)
 void rsx_d3d12_backend_shutdown(void) {}
 int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
+void rsx_d3d12_record_lock(void) {}
+void rsx_d3d12_record_unlock(void) {}
 
 #endif /* _WIN32 */

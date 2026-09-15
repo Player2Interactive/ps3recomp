@@ -49,6 +49,10 @@ int rsx_d3d12_backend_pump_messages(void);
 /* Force a present (useful for debugging). */
 void rsx_d3d12_backend_present(void);
 
+/* Serialize FIFO-recorded draws against present (drain thread vs ticker). */
+void rsx_d3d12_record_lock(void);
+void rsx_d3d12_record_unlock(void);
+
 #ifdef __cplusplus
 }
 #endif
