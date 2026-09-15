@@ -254,6 +254,8 @@ void cellGcm_fifo_kick(void);
 void cellGcm_on_put_write(u32 put);
 void cellGcm_on_control_poll(u32 addr);
 void cellGcm_rsx_process_fifo(void);
+/* One-shot hang dump: context begin/end/current/callback + FIFO around PUT. */
+void cellGcm_dump_hang(u32 put, u32 get);
 
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height);

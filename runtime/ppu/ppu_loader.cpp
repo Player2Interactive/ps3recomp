@@ -1246,7 +1246,29 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
                   rf = ((uint32_t)c[8]<<24)|((uint32_t)c[9]<<16)|((uint32_t)c[10]<<8)|c[11];
               }
               fprintf(stderr, "[HOTREAD] GCM control spin: put=0x%08X get=0x%08X "
-                      "ref=0x%08X (addr 0x%08X)\n", pu, ge, rf, (uint32_t)a);
+                      "ref=0x%08X (addr 0x%08X) cia=0x%08X lr=0x%08X\n",
+                      pu, ge, rf, (uint32_t)a,
+                      g_active_ctx ? (uint32_t)g_active_ctx->cia : 0,
+                      g_active_ctx ? (uint32_t)g_active_ctx->lr : 0);
+              if (g_active_ctx) {
+                  static int gpr_once = 0;
+                  if (!gpr_once) {
+                      gpr_once = 1;
+                      fprintf(stderr, "[HOTREAD] gpr r3=%08X r5=%08X r9=%08X r11=%08X "
+                              "r26=%08X r28=%08X r29=%08X r30=%08X r31=%08X\n",
+                              (uint32_t)g_active_ctx->gpr[3],
+                              (uint32_t)g_active_ctx->gpr[5],
+                              (uint32_t)g_active_ctx->gpr[9],
+                              (uint32_t)g_active_ctx->gpr[11],
+                              (uint32_t)g_active_ctx->gpr[26],
+                              (uint32_t)g_active_ctx->gpr[28],
+                              (uint32_t)g_active_ctx->gpr[29],
+                              (uint32_t)g_active_ctx->gpr[30],
+                              (uint32_t)g_active_ctx->gpr[31]);
+                  }
+              }
+              { extern void cellGcm_dump_hang(uint32_t, uint32_t);
+                cellGcm_dump_hang(pu, ge); }
               /* Dump the FIFO word at put/get so a put==get spin shows whether
                * GET is parked on a JUMP (Insomniac write-head) or a method. */
               if (vm_base && pu == ge) {
