@@ -386,6 +386,28 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + (uint32_t)ea; /* PS3 uses 32-bit effective addresses for SPU DMA */
 
+    /* ACIT image-1: 32-byte LFQueue slot GET (0x00F7A900) and GCM IO inflate src. */
+    if (spu->image_id == 1 && mfc_is_get(cmd)) {
+        uint32_t e32 = (uint32_t)ea;
+        int slot32 = (size == 32u);
+        int gcmio  = (e32 >= 0x20000000u && e32 < 0x2C000000u);
+        if (slot32 || gcmio) {
+            static int _g = 0;
+            if (_g++ < 4) {
+                uint32_t nz = 0, n = size < 0x4000u ? size : 0x4000u;
+                for (uint32_t i = 0; i < n; i++) if (ea_ptr[i]) nz++;
+                fprintf(stderr, "[efset-get] #%d pc=0x%05X lsa=0x%05X ea=0x%08X size=%u "
+                                "nz=%u head=%08X %08X %08X %08X\n",
+                        _g, (uint32_t)spu->pc & SPU_LS_MASK, lsa, e32, size, nz,
+                        (ea_ptr[0]<<24)|(ea_ptr[1]<<16)|(ea_ptr[2]<<8)|ea_ptr[3],
+                        (ea_ptr[4]<<24)|(ea_ptr[5]<<16)|(ea_ptr[6]<<8)|ea_ptr[7],
+                        (ea_ptr[8]<<24)|(ea_ptr[9]<<16)|(ea_ptr[10]<<8)|ea_ptr[11],
+                        (ea_ptr[12]<<24)|(ea_ptr[13]<<16)|(ea_ptr[14]<<8)|ea_ptr[15]);
+                fflush(stderr);
+            }
+        }
+    }
+
     /* SPU_STACKEA_WATCH=1: the LBP JobManagerWorker completion protocol hands the
      * SPU job a completion-word EA (param[4]) that lives on the PPU stack
      * (0xD00Cxxxx = VM_STACK_BASE region); the job must DMA a nonzero word there

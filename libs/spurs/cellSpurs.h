@@ -208,6 +208,10 @@ s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
                                  s32 isDynamic);
 s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port);
 
+/* NID 0x7517724A. Pointer args are guest EAs (generic HLE adapter). */
+s32 cellSpursSetGlobalExceptionEventHandler(u64 spurs_ea, u64 handler_ea,
+                                            u64 arg_ea);
+
 /* ---------------------------------------------------------------------------
  * Taskset functions
  * -----------------------------------------------------------------------*/
@@ -288,11 +292,13 @@ s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32
 s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea);
 s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
                                 u32 size, u32 depth, u32 direction);
+s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking);
 s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea);
+s32 cellSpursLFQueueDetachLv2EventQueue(u64 queue_ea);
 
 s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits);
 s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
-                           u32 mode);
+                           u32 mode);  /* guest EAs; bits is in/out BE u16 */
 s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
                               u32 mode);
 s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits);

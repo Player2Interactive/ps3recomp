@@ -353,6 +353,32 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     uint8_t* ls  = &ctx->ls[lsa];
     uint8_t* mem = vm_base + ea;
 
+    /* ACIT image 1: 0xA7F8 GETLLAR-decrements 0x00F7AAAC; 0x8FF0 locks the flag.
+     * First few atomics name the EA/mask/old word so we can see why Set is skipped. */
+    if (ctx->image_id == 1) {
+        static int _ef = 0;
+        if (_ef++ < 4) {
+            uint32_t wctr = 0, mask0 = 0, mask1 = 0;
+            if (vm_base) {
+                const uint8_t* c = vm_base + 0x00F7AAACu;
+                wctr = ((uint32_t)c[0] << 24) | ((uint32_t)c[1] << 16) |
+                       ((uint32_t)c[2] << 8) | (uint32_t)c[3];
+            }
+            if (ctx->ls) {
+                const uint8_t* m = ctx->ls + 0xBB00;
+                mask0 = ((uint32_t)m[0] << 24) | ((uint32_t)m[1] << 16) |
+                        ((uint32_t)m[2] << 8) | (uint32_t)m[3];
+                mask1 = ((uint32_t)m[4] << 24) | ((uint32_t)m[5] << 16) |
+                        ((uint32_t)m[6] << 8) | (uint32_t)m[7];
+            }
+            fprintf(stderr, "[efset-atom] #%d cmd=0x%02X img=1 pc=0x%05X lr=0x%05X "
+                            "eal=0x%08X line=0x%08X ctr@F7AAAC=%08X LS[BB00]=%08X %08X\n",
+                    _ef, cmd, (uint32_t)ctx->pc & SPU_LS_MASK,
+                    ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                    ctx->mfc_eal, ea, wctr, mask0, mask1);
+            fflush(stderr);
+        }
+    }
     { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
       if (s_t) { static uint64_t s_n = 0; static uint32_t s_lastea = 0;
         if ((++s_n % 2000000) == 0 || ea != s_lastea) {
@@ -1306,9 +1332,10 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
  * marks that overlay resident in the streaming context; dispatch retries a
  * primary-image miss against the resident overlay's registry. */
 typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span; } spu_ovl_src;
-/* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
- * the same job code buffer at LS 0x4000, dispatched by content signature). */
-#define SPU_OVL_SRC_MAX 128
+/* 6 FMOD codec/DSP overlays + WWS/igPm job-code modules (LS 0x4000 / 0x480).
+ * ACIT registers 111 wrap-0x480 bodies plus leftover C0DEC0DE/FFFFEF jobmods;
+ * 128 filled up, so this is 256 rather than dropping overlay hashes. */
+#define SPU_OVL_SRC_MAX 256
 static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
 static int s_ovl_src_count = 0;
 
@@ -1558,16 +1585,21 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * woken). Honour the first call, halt on the rest. Each task runs on its own
      * host thread, so a thread-local count is per task. */
     static _Thread_local int s_exit_seen = 0;
-    if (num == 0 && ctx->image_id == 22 && !getenv("YDKJ_CRI_EXIT_HALT")) {
+    /* Image 1 (ACIT LFQueue worker): CRT at 0x8F60 issues EXIT(0) then YIELD(1)
+     * before the drain loop. Halting on the first EXIT made dispatch HIT and
+     * immediately synthesise-stop at 0xA70, so EventFlagSet never ran. */
+    if (num == 0 && (ctx->image_id == 22 || ctx->image_id == 1) &&
+        !getenv("YDKJ_CRI_EXIT_HALT")) {
         if (s_exit_seen++ == 0) { ctx->gpr[3]._u32[0] = 0; return; }   /* bootstrap */
         { static int _n = 0; if (_n++ < 8)
-            fprintf(stderr, "[spu] cri task EXIT #%d -- halting (was spinning)\n",
-                    s_exit_seen); }
+            fprintf(stderr, "[spu] img=%d task EXIT #%d -- halting (was spinning)\n",
+                    ctx->image_id, s_exit_seen); }
         ctx->status = SPU_STATUS_STOPPED_BY_STOP;
         spu_halt(ctx);
         return;
     }
-    if (num == 0 && (ctx->image_id != 22 || getenv("YDKJ_CRI_EXIT_HALT"))) {
+    if (num == 0 && ((ctx->image_id != 22 && ctx->image_id != 1) ||
+                     getenv("YDKJ_CRI_EXIT_HALT"))) {
         ctx->status = SPU_STATUS_STOPPED_BY_STOP;
         spu_halt(ctx);          /* longjmp out to spu_run_with_halt; post-run writes exit code */
         return;
@@ -1863,11 +1895,14 @@ void spu_indirect_branch(spu_context* ctx)
      * tasksets use the SAME syscall address, so the API table alone is not
      * evidence that this is an HLE context. LLE tasks must enter Sony's policy
      * to yield/select workloads instead of parking an entire SPU host thread.
-     * Image 22 is the legacy standalone HLE CRI task runner. */
+     * Image 22 is the legacy standalone HLE CRI task runner. Image 1 is ACIT's
+     * CreateTask LFQueue worker (EBOOT VA 0x00BF3C80): dispatched directly,
+     * CRT's first cellSpursTask syscall is EXIT(0) at 0x8F60 via syscallAddr. */
     if (ctx->pc == YDKJ_TASKSET_PM_SYSCALL_ADDR) {
         uint32_t sc = ((uint32_t)ctx->ls[0x27C4] << 24) | ((uint32_t)ctx->ls[0x27C5] << 16)
                     | ((uint32_t)ctx->ls[0x27C6] << 8)  | ctx->ls[0x27C7];
-        if (ctx->image_id == 22 || (ctx->policy_mode && sc == YDKJ_TASKSET_PM_SYSCALL_ADDR)) {
+        if (ctx->image_id == 22 || ctx->image_id == 1 ||
+            (ctx->policy_mode && sc == YDKJ_TASKSET_PM_SYSCALL_ADDR)) {
             spu_spurs_taskset_syscall(ctx);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;
