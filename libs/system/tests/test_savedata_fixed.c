@@ -99,6 +99,14 @@ int main(void)
     assert(ctx.gpr[3] == CELL_OK && fixed_calls == 7 && stat_calls == 2);
     assert(cellSaveDataListAutoLoad(0, 3, (void*)0x100, (void*)0x200,
            (void*)0x800, (void*)0x900, NULL, 0, (void*)0xCAFE) == CELL_SAVEDATA_ERROR_PARAM);
+    mode = 1;
+    ps3_savedata_list_auto_save(&ctx);
+    assert(ctx.gpr[3] == CELL_OK && fixed_calls == 8 && stat_calls == 2);
+    mode = 0;
+    ps3_savedata_list_auto_save(&ctx);
+    assert(ctx.gpr[3] == CELL_OK && fixed_calls == 9 && stat_calls == 3);
+    assert(cellSaveDataListAutoSave(0, 3, (void*)0x100, (void*)0x200,
+           (void*)0x800, (void*)0x900, NULL, 0, (void*)0xCAFE) == CELL_SAVEDATA_ERROR_PARAM);
     snprintf(path, sizeof(path), "%s/TEST00001", root); assert(rmdir(path) == 0);
     snprintf(path, sizeof(path), "%s/TEST00002", root); assert(rmdir(path) == 0);
     assert(rmdir(root) == 0); free(vm_base);

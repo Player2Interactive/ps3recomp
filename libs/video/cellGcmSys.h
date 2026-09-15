@@ -248,6 +248,13 @@ void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size);
 void cellGcm_syscall_iounmap(u32 io, u32 size);
 void cellGcm_syscall_set_fifo(u32 put, u32 get);
 
+/* Guest PUT store / GET poll: kick the FIFO walker so `get` chases `put`
+ * without waiting for the 16 ms present tick. Safe to call from vm_read/write. */
+void cellGcm_fifo_kick(void);
+void cellGcm_on_put_write(u32 put);
+void cellGcm_on_control_poll(u32 addr);
+void cellGcm_rsx_process_fifo(void);
+
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height);
 
@@ -373,6 +380,9 @@ s32 cellGcmSetDefaultFifoSize(u32 size);
 /* Internal flip commands (called by game code directly) */
 s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId);
 s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId, u32 labelIndex, u32 labelValue);
+
+/* NID: 0x3A33C1FD — libgcm flush: publish context->current as PUT and kick. */
+s32 _cellGcmFunc15(u32 ctx);
 
 /* --- Additional functions (RPCS3 parity) --- */
 

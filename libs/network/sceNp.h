@@ -133,6 +133,59 @@ s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId);
 s32 sceNpManagerGetOnlineName(SceNpOnlineName* onlineName);
 s32 sceNpManagerGetAccountAge(s32* age);
 
+/* Ticket: no live PSN, so GetTicket reports size 0 and GetTicketParam zeros
+ * the 256-byte union. Out-params are guest EAs and must be written. */
+#define SCE_NP_TICKET_PARAM_DATA_LEN            256
+#define SCE_NP_TICKET_PARAM_SERIAL_ID           0
+#define SCE_NP_TICKET_PARAM_ISSUER_ID           1
+#define SCE_NP_TICKET_PARAM_ISSUED_DATE         2
+#define SCE_NP_TICKET_PARAM_EXPIRE_DATE         3
+#define SCE_NP_TICKET_PARAM_SUBJECT_ACCOUNT_ID  4
+#define SCE_NP_TICKET_PARAM_SUBJECT_ONLINE_ID   5
+#define SCE_NP_TICKET_PARAM_SUBJECT_REGION      6
+#define SCE_NP_TICKET_PARAM_SUBJECT_DOMAIN      7
+#define SCE_NP_TICKET_PARAM_SERVICE_ID          8
+#define SCE_NP_TICKET_PARAM_SUBJECT_STATUS      9
+#define SCE_NP_TICKET_PARAM_STATUS_DURATION     10
+#define SCE_NP_TICKET_PARAM_SUBJECT_DOB         11
+
+typedef u32 SceNpTicketSize;
+
+typedef union SceNpTicketParam {
+    s32 i32;
+    s64 i64;
+    u32 ui32;
+    u64 ui64;
+    u8  data[SCE_NP_TICKET_PARAM_DATA_LEN];
+} SceNpTicketParam;
+
+s32 sceNpManagerGetTicket(void* buffer, SceNpTicketSize* bufferSize);
+s32 sceNpManagerGetTicketParam(s32 paramId, SceNpTicketParam* param);
+
+/* Avatar URL: 128-byte SceNpAvatarUrl. Offline: write empty string. */
+s32 sceNpManagerGetAvatarUrl(SceNpAvatarUrl* avatarUrl);
+
+/* RequestTicket is async on hardware; we accept and produce the empty ticket
+ * GetTicket already reports. cookieSize max is 1024. */
+#define SCE_NP_COOKIE_MAX_SIZE                  1024
+#define SCE_NP_AUTH_EINVALID_ARGUMENT           0x8002a015
+s32 sceNpManagerRequestTicket(const SceNpId* npId, const char* serviceId,
+                              const void* cookie, u32 cookieSize,
+                              const void* entitlementId, u32 consumedCount);
+
+/* NP Basic lives in the sceNp PRX. Offline: no friends, do not invent one. */
+#ifndef SCE_NP_BASIC_ERROR_NOT_INITIALIZED
+#define SCE_NP_BASIC_ERROR_NOT_INITIALIZED      0x8002a662
+#endif
+#ifndef SCE_NP_BASIC_ERROR_INVALID_ARGUMENT
+#define SCE_NP_BASIC_ERROR_INVALID_ARGUMENT     0x8002a665
+#endif
+#ifndef SCE_NP_BASIC_ERROR_NOT_CONNECTED
+#define SCE_NP_BASIC_ERROR_NOT_CONNECTED        0x8002a678
+#endif
+s32 sceNpBasicGetFriendPresenceByIndex(u32 index, SceNpUserInfo* user,
+                                       void* pres, u32 options);
+
 /* Set the fake PSN username (call before sceNpInit if desired) */
 void sceNpSetFakeUsername(const char* username);
 

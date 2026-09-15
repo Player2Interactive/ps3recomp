@@ -129,15 +129,28 @@ def main():
         for _nid, name in regs:
             f.write(f"    void {name}(void);\n")
         f.write("}\n")
-        if any(name == 'cellSaveDataListAutoLoad' for _, name in regs):
+        # userdata/container sit past r10; ctx handlers read the param save area.
+        SAVEDATA_CTX = [
+            ("cellSaveDataListAutoLoad", "ps3_savedata_list_auto_load"),
+            ("cellSaveDataListAutoSave", "ps3_savedata_list_auto_save"),
+            ("cellSaveDataUserListAutoLoad", "ps3_savedata_user_list_auto_load"),
+            ("cellSaveDataUserListAutoSave", "ps3_savedata_user_list_auto_save"),
+            ("cellSaveDataUserListLoad", "ps3_savedata_user_list_load"),
+            ("cellSaveDataUserListSave", "ps3_savedata_user_list_save"),
+        ]
+        savedata_ctx = [(n, h) for n, h in SAVEDATA_CTX
+                        if any(name == n for _, name in regs)]
+        if savedata_ctx:
             f.write('struct ppu_context;\n')
-            f.write('extern "C" void ps3_savedata_list_auto_load(ppu_context*);\n')
             f.write('extern "C" void ps3_hle_register_ctx(unsigned, const char*, void (*)(ppu_context*));\n')
+            for _name, handler in savedata_ctx:
+                f.write(f'extern "C" void {handler}(ppu_context*);\n')
         f.write('extern "C" void ppu_hle_register_all(void) {\n')
         for nid, name in regs:
             f.write(f'    ps3_hle_register(0x{nid:08X}u, "{name}", (void*){name});\n')
-        if any(name == 'cellSaveDataListAutoLoad' for _, name in regs):
-            f.write('    ps3_hle_register_ctx(0x21425307u, "cellSaveDataListAutoLoad", ps3_savedata_list_auto_load);\n')
+        for name, handler in savedata_ctx:
+            nid = compute_nid(name)
+            f.write(f'    ps3_hle_register_ctx(0x{nid:08X}u, "{name}", {handler});\n')
         f.write("}\n")
     print(f"wrote {args.out}: {len(regs)} NID handlers from {nlibs} module(s)")
 

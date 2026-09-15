@@ -814,3 +814,20 @@ s32 cellGameContentErrorDialog(s32 type, s32 errNeedSizeKB, const char* dirName)
 
     return CELL_OK;
 }
+
+/* cellGameDataExitBroken / cellHddGameExitBroken (sysutil NIDs 0x9949BF82 /
+ * 0xAFD605B3). No out-params. ACIT polls until CELL_OK then continues teardown,
+ * same shape as ContentErrorDialog's EXIT types. */
+s32 cellGameDataExitBroken(void)
+{
+    printf("[cellGame] *** GameDataExitBroken (title would quit after the dialog)\n");
+    fflush(stdout);
+    return CELL_OK;
+}
+
+s32 cellHddGameExitBroken(void)
+{
+    printf("[cellGame] *** HddGameExitBroken (title would quit after the dialog)\n");
+    fflush(stdout);
+    return CELL_OK;
+}

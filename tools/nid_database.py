@@ -165,7 +165,9 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellKb", "cellKbEnd"),
     ("cellKb", "cellKbClearBuf"),
     ("cellKb", "cellKbRead"),
+    ("cellKb", "cellKbGetData"),
     ("cellKb", "cellKbGetInfo"),
+    ("cellKb", "cellKbSetReadMode"),
     ("cellKb", "cellKbSetCodeType"),
 
     # ---- cellMouse ----
@@ -173,7 +175,9 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellMouse", "cellMouseEnd"),
     ("cellMouse", "cellMouseClearBuf"),
     ("cellMouse", "cellMouseGetData"),
+    ("cellMouse", "cellMouseGetDataList"),
     ("cellMouse", "cellMouseGetInfo"),
+    ("cellMouse", "cellMouseSetTabletMode"),
 
     # ---- cellAudio ----
     ("cellAudio", "cellAudioInit"),
@@ -197,6 +201,7 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellSpurs", "cellSpursFinalize"),
     ("cellSpurs", "cellSpursAttachLv2EventQueue"),
     ("cellSpurs", "cellSpursDetachLv2EventQueue"),
+    ("cellSpurs", "cellSpursSetGlobalExceptionEventHandler"),
     ("cellSpurs", "cellSpursGetNumSpuThread"),
     ("cellSpurs", "cellSpursGetSpuThreadGroupId"),
     ("cellSpurs", "cellSpursGetSpuThreadId"),
@@ -260,7 +265,7 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellSpurs", "cellSpursEventFlagInitializeIWL"),
     ("cellSpurs", "cellSpursEventFlagAttachLv2EventQueue"),
     ("cellSpurs", "cellSpursEventFlagDetachLv2EventQueue"),
-    ("cellSpurs", "cellSpursEventFlagWait"),
+    ("cellSpurs", "cellSpursEventFlagWait"),  # 0x373523D4 r3=flag r4=u16* bits r5=mode
     ("cellSpurs", "cellSpursEventFlagClear"),
     ("cellSpurs", "cellSpursEventFlagSet"),
     ("cellSpurs", "cellSpursEventFlagTryWait"),
@@ -286,6 +291,7 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellSpurs", "cellSpursQueueTryPopBody"),
     # SPURS LFQueue
     ("cellSpurs", "_cellSpursLFQueueInitialize"),
+    ("cellSpurs", "_cellSpursLFQueuePushBody"),  # 0x8A85674D (public Push/TryPush inline here)
     ("cellSpurs", "cellSpursLFQueuePush"),
     ("cellSpurs", "cellSpursLFQueuePop"),
     ("cellSpurs", "cellSpursLFQueueAttachLv2EventQueue"),
@@ -323,7 +329,7 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("sysPrxForUser", "_sys_malloc"),
     ("sysPrxForUser", "_sys_free"),
     ("sysPrxForUser", "_sys_memalign"),
-    ("sysPrxForUser", "sys_prx_exitspawn_with_level"),
+    ("sysPrxForUser", "sys_prx_exitspawn_with_level"),  # 0xA2C7BA64; r3=PRX stop level, not a path
     ("sysPrxForUser", "sys_spu_printf_initialize"),
     ("sysPrxForUser", "sys_spu_printf_finalize"),
     ("sysPrxForUser", "sys_prx_load_module"),
@@ -421,6 +427,17 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellGcmSys", "_cellGcmFunc15"),                         # 0x3a33c1fd x6
     ("cellNetCtl", "cellNetCtlNetStartDialogLoadAsync"),      # 0x04459230 x6
     ("cellNetCtl", "cellNetCtlNetStartDialogUnloadAsync"),    # 0x0f1f13d3 x6
+    ("cellNetCtl", "cellGameUpdateInit"),                     # 0x99ab1a26 ACIT
+    ("cellNetCtl", "cellGameUpdateTerm"),                     # 0x10dae56d ACIT
+    ("cellNetCtl", "cellGameUpdateCheckStartAsync"),          # 0xd0a5d727 ACIT
+    ("cellNetCtl", "cellGameUpdateCheckStartWithoutDialogAsync"),  # 0xa5e1fa60 ACIT
+    ("cellNetCtl", "cellGameUpdateCheckFinishAsync"),         # 0xffa3d791 ACIT
+    ("cellSysutil", "cellSaveDataUserListAutoSave"),          # 0x0e091c36 ACIT
+    ("cellSysutil", "cellSaveDataUserListSave"),              # 0x0f03cfb0 ACIT
+    ("cellSysutil", "cellSaveDataUserListAutoLoad"),          # 0x248bd1d8 ACIT
+    ("cellSysutil", "cellSaveDataUserListLoad"),              # 0x39dd8425 ACIT
+    ("cellSysutil", "cellGameDataExitBroken"),                # 0x9949bf82 ACIT
+    ("cellSysutil", "cellHddGameExitBroken"),                 # 0xafd605b3 ACIT
     ("sysPrxForUser", "sys_initialize_tls"),                  # 0x744680a2 x6
     ("sys_net", "socket"),                                    # 0x9c056962 x5
     ("sys_net", "bind"),                                      # 0xb0a59804 x5
@@ -460,9 +477,22 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("sceNp", "sceNpManagerGetOnlineName"),                  # 0xf42c0df8 x2
     ("sceNp", "sceNpManagerGetAccountAge"),                  # 0x168fcece x1
     ("sceNp", "sceNpManagerGetTicket"),                      # 0x0968aa36 x2
+    ("sceNp", "sceNpManagerGetTicketParam"),                 # 0x58fa4fcd
+    ("sceNp", "sceNpManagerGetAvatarUrl"),                   # 0x36d0c2c5
+    ("sceNp", "sceNpManagerRequestTicket"),                  # 0x7e2fef28
+    ("sceNp", "sceNpBasicGetFriendPresenceByIndex"),         # 0x32c78a6a
+    ("cellSsl", "cellSslCertGetNameEntryInfo"),              # 0x006c4900
+    ("cellSsl", "cellSslCertGetRsaPublicKeyExponent"),       # 0x033c4905
+    ("cellSsl", "cellSslCertGetSubjectName"),                # 0x32c61bdf
+    ("cellSsl", "cellSslCertGetNameEntryCount"),             # 0x766d3ca1
+    ("cellSsl", "cellSslCertGetRsaPublicKeyModulus"),        # 0x8e505175
+    ("cellSsl", "cellSslCertGetIssuerName"),                 # 0xae6eb491
     ("sceNp", "sceNpBasicGetEvent"),                         # 0xe035f7d6 x4
     ("sceNp", "sceNpBasicRegisterContextSensitiveHandler"),  # 0x4026eac5 x3
     ("sceNp", "sceNpDrmIsAvailable"),                        # 0xad218faf x4
+    ("sceNp", "sceNpDrmIsAvailable2"),                       # 0xf042b14f
+    ("cellHttp", "cellHttpResponseGetStatusCode"),           # 0x10d0d7fc
+    ("cellHttp", "cellHttpResponseGetContentLength"),        # 0x464ff889
 ]
 
 # ---------------------------------------------------------------------------

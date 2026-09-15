@@ -343,6 +343,143 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
+ * _sys_lwmutex_unlock2 (lv2 117)
+ *
+ * r3 = lwmutex_id  (sys_lwmutex_t.sleep_queue; SDK / RPCS3 sys_lwmutex.cpp)
+ * Returns CELL_OK, or CELL_ESRCH if the id is not a guest control EA.
+ *
+ * liblv2 SYS_SYNC_RETRY unlocks by freeing owner then this syscall. A CELL_OK
+ * stub never posted the host semaphore, so HLE waiters parked forever. The
+ * wake lives in ppu_sysprx (same slot as sys_lwmutex_unlock); g_ps3_lwm_unlock2
+ * is set from ppu_sysprx_register. Tests without that TU still get a registered
+ * syscall (CELL_OK), not the unimplemented stub.
+ * -----------------------------------------------------------------------*/
+int64_t (*g_ps3_lwm_unlock2)(uint32_t lwmutex_id);
+int64_t (*g_ps3_lwm_create)(uint32_t id_out, uint32_t protocol, uint32_t control);
+int64_t (*g_ps3_lwm_destroy)(uint32_t lwmutex_id);
+int64_t (*g_ps3_lwm_lock)(uint32_t lwmutex_id, uint64_t timeout_us);
+int64_t (*g_ps3_lwm_unlock)(uint32_t lwmutex_id);
+int64_t (*g_ps3_lwm_trylock)(uint32_t lwmutex_id);
+int64_t (*g_ps3_lwc_create)(uint32_t id_out, uint32_t lwmutex_id, uint32_t control);
+int64_t (*g_ps3_lwc_destroy)(uint32_t lwcond_id);
+int64_t (*g_ps3_lwc_wait)(uint32_t lwcond_id, uint32_t lwmutex_id, uint64_t timeout_us);
+int64_t (*g_ps3_lwc_signal)(uint32_t lwcond_id);
+int64_t (*g_ps3_lwc_signal_all)(uint32_t lwcond_id);
+
+/* SDK/RPCS3: r3=*lwmutex_id, r4=protocol, r5=*sys_lwmutex_t, r6=has_name, r7=name.
+ * Id is the control EA so lock/unlock/unlock2 share the HLE sleep-queue slot. */
+static int64_t _sys_lwmutex_create(ppu_context* ctx)
+{
+    uint32_t id_out   = LV2_ARG_PTR(ctx, 0);
+    uint32_t protocol = LV2_ARG_U32(ctx, 1);
+    uint32_t control  = LV2_ARG_PTR(ctx, 2);
+
+    if (protocol != SYS_SYNC_FIFO && protocol != SYS_SYNC_PRIORITY &&
+        protocol != SYS_SYNC_RETRY)
+        return (int64_t)(int32_t)CELL_EINVAL;
+    if (control == 0)
+        return (int64_t)(int32_t)CELL_EFAULT;
+    if (g_ps3_lwm_create)
+        return g_ps3_lwm_create(id_out, protocol, control);
+    if (id_out)
+        write_be32(id_out, control);
+    return CELL_OK;
+}
+
+static int64_t _sys_lwmutex_destroy(ppu_context* ctx)
+{
+    uint32_t lwmutex_id = LV2_ARG_U32(ctx, 0);
+    if (g_ps3_lwm_destroy)
+        return g_ps3_lwm_destroy(lwmutex_id);
+    return CELL_OK;
+}
+
+static int64_t _sys_lwmutex_lock(ppu_context* ctx)
+{
+    uint32_t lwmutex_id = LV2_ARG_U32(ctx, 0);
+    uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
+    if (g_ps3_lwm_lock)
+        return g_ps3_lwm_lock(lwmutex_id, timeout_us);
+    return CELL_OK;
+}
+
+static int64_t _sys_lwmutex_unlock(ppu_context* ctx)
+{
+    uint32_t lwmutex_id = LV2_ARG_U32(ctx, 0);
+    if (g_ps3_lwm_unlock)
+        return g_ps3_lwm_unlock(lwmutex_id);
+    return CELL_OK;
+}
+
+static int64_t _sys_lwmutex_trylock(ppu_context* ctx)
+{
+    uint32_t lwmutex_id = LV2_ARG_U32(ctx, 0);
+    if (g_ps3_lwm_trylock)
+        return g_ps3_lwm_trylock(lwmutex_id);
+    return CELL_OK;
+}
+
+int64_t sys_lwmutex_unlock2(ppu_context* ctx)
+{
+    uint32_t lwmutex_id = LV2_ARG_U32(ctx, 0);
+    if (g_ps3_lwm_unlock2)
+        return g_ps3_lwm_unlock2(lwmutex_id);
+    return CELL_OK;
+}
+
+/* SDK/RPCS3: r3=*lwcond_id, r4=lwmutex_id, r5=*sys_lwcond_t, r6=name.
+ * Id is the control EA (8-byte sys_lwcond_t: mutex + queue). Kernel does not
+ * write the guest struct. */
+static int64_t _sys_lwcond_create(ppu_context* ctx)
+{
+    uint32_t id_out     = LV2_ARG_PTR(ctx, 0);
+    uint32_t lwmutex_id = LV2_ARG_U32(ctx, 1);
+    uint32_t control    = LV2_ARG_PTR(ctx, 2);
+
+    if (control == 0)
+        return (int64_t)(int32_t)CELL_EFAULT;
+    if (g_ps3_lwc_create)
+        return g_ps3_lwc_create(id_out, lwmutex_id, control);
+    if (id_out)
+        write_be32(id_out, control);
+    return CELL_OK;
+}
+
+static int64_t _sys_lwcond_destroy(ppu_context* ctx)
+{
+    uint32_t lwcond_id = LV2_ARG_U32(ctx, 0);
+    if (g_ps3_lwc_destroy)
+        return g_ps3_lwc_destroy(lwcond_id);
+    return CELL_OK;
+}
+
+static int64_t _sys_lwcond_queue_wait(ppu_context* ctx)
+{
+    uint32_t lwcond_id  = LV2_ARG_U32(ctx, 0);
+    uint32_t lwmutex_id = LV2_ARG_U32(ctx, 1);
+    uint64_t timeout_us = LV2_ARG_U64(ctx, 2);
+    if (g_ps3_lwc_wait)
+        return g_ps3_lwc_wait(lwcond_id, lwmutex_id, timeout_us);
+    return CELL_OK;
+}
+
+static int64_t _sys_lwcond_signal(ppu_context* ctx)
+{
+    uint32_t lwcond_id = LV2_ARG_U32(ctx, 0);
+    if (g_ps3_lwc_signal)
+        return g_ps3_lwc_signal(lwcond_id);
+    return CELL_OK;
+}
+
+static int64_t _sys_lwcond_signal_all(ppu_context* ctx)
+{
+    uint32_t lwcond_id = LV2_ARG_U32(ctx, 0);
+    if (g_ps3_lwc_signal_all)
+        return g_ps3_lwc_signal_all(lwcond_id);
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * Registration
  * -----------------------------------------------------------------------*/
 void sys_mutex_init(lv2_syscall_table* tbl)
@@ -361,4 +498,16 @@ void sys_mutex_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_MUTEX_LOCK,    sys_mutex_lock);
     lv2_syscall_register(tbl, SYS_MUTEX_TRYLOCK, sys_mutex_trylock);
     lv2_syscall_register(tbl, SYS_MUTEX_UNLOCK,  sys_mutex_unlock);
+
+    lv2_syscall_register(tbl, SYS_LWMUTEX_CREATE,   _sys_lwmutex_create);
+    lv2_syscall_register(tbl, SYS_LWMUTEX_DESTROY,  _sys_lwmutex_destroy);
+    lv2_syscall_register(tbl, SYS_LWMUTEX_LOCK,     _sys_lwmutex_lock);
+    lv2_syscall_register(tbl, SYS_LWMUTEX_UNLOCK,   _sys_lwmutex_unlock);
+    lv2_syscall_register(tbl, SYS_LWMUTEX_TRYLOCK,  _sys_lwmutex_trylock);
+    lv2_syscall_register(tbl, SYS_LWCOND_CREATE,    _sys_lwcond_create);
+    lv2_syscall_register(tbl, SYS_LWCOND_DESTROY,   _sys_lwcond_destroy);
+    lv2_syscall_register(tbl, SYS_LWCOND_WAIT,      _sys_lwcond_queue_wait);
+    lv2_syscall_register(tbl, SYS_LWCOND_SIGNAL,    _sys_lwcond_signal);
+    lv2_syscall_register(tbl, SYS_LWCOND_SIGNAL_ALL,_sys_lwcond_signal_all);
+    lv2_syscall_register(tbl, SYS_LWMUTEX_UNLOCK2,  sys_lwmutex_unlock2);
 }

@@ -929,6 +929,35 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
                 taskId, taskset_ea); fflush(stderr); }
 }
 
+/* Occupancy of the CellSync LFQueue named by TaskInfo.arg0 (image-1 TryPop:
+ * m_h5 at +0x08 minus m_h4 at +0x06, depth at +0x14). 0 if arg0 is not a
+ * queue. A non-zero value at WAIT_SIGNAL means a Push published a slot
+ * without a host wake (inlined PUTLLC, or our signal raced consume_wake). */
+static uint32_t spu_task_lfqueue_occ(uint32_t taskset_ea, uint32_t taskId,
+                                     uint32_t* q_out, uint32_t* h4_out, uint32_t* h5_out)
+{
+    if (q_out) *q_out = 0;
+    if (h4_out) *h4_out = 0;
+    if (h5_out) *h5_out = 0;
+    static uint32_t s_last_q;
+    uint32_t q = vm_read32(spurs_taskset_taskinfo_ea(taskset_ea, taskId) + TI_ARGS);
+    if (!q || (q & 0x7Fu)) q = s_last_q;
+    if (!q || (q & 0x7Fu)) return 0;
+    uint32_t sz  = vm_read32(q + 0x10);
+    uint32_t dep = vm_read32(q + 0x14);
+    if (!sz || !dep || sz > 0x1000u || dep > 0x10000u) return 0;
+    uint32_t h4 = vm_read16(q + 0x06);
+    uint32_t h5 = vm_read16(q + 0x08);
+    if (q_out) *q_out = q;
+    if (h4_out) *h4_out = h4;
+    if (h5_out) *h5_out = h5;
+    s_last_q = q;
+    int32_t occ = (int32_t)h5 - (int32_t)h4;
+    if (occ < 0) occ += 2 * (int32_t)dep;
+    if (occ < 0 || occ > (int32_t)dep) return 0;
+    return (uint32_t)occ;
+}
+
 /* WAIT_SIGNAL from the task side (runs ON the task's host thread, called by
  * the 0xA70 taskset-syscall intercept). Consumes a pending signal or blocks
  * until one is delivered. Returns 0 (the syscall's success rc). */
@@ -945,6 +974,25 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
         fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%d enter task=%u taskset=0x%08X ran=%llums\n",
                 _n, taskId, taskset_ea,
                 s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull); }
+    /* If the LFQueue already has a slot, do not park: that is a lost host
+     * wake, not "waiting for the next PPU/GCM poke". An empty queue stays
+     * parked until PushBody / SendSignal. Do not set the bitset here without
+     * occupancy -- that would fake a signal. */
+    {
+        uint32_t qea = 0, h4 = 0, h5 = 0;
+        uint32_t occ = spu_task_lfqueue_occ(taskset_ea, taskId, &qea, &h4, &h5);
+        if (occ) {
+            spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
+            static int _d = 0; if (_d++ < 16)
+                fprintf(stderr, "[spu_workload] WAIT_SIGNAL drain occ=%u q=0x%08X "
+                        "h4=%u h5=%u (lost wake)\n", occ, qea, h4, h5);
+        } else {
+            static int _i = 0; if (_i++ < 8)
+                fprintf(stderr, "[spu_workload] WAIT_SIGNAL idle q=0x%08X h4=%u h5=%u "
+                        "(waiting for PPU push)\n", qea, h4, h5);
+        }
+        fflush(stderr);
+    }
     /* LBP_SYNC_ACK: taskset sync-lane bookkeeping. On real SPURS the taskset
      * POLICY MODULE advances the per-SPU progress lanes (sync+0x40+16*row:
      * ticket u16 @+0, consumer lanes @+2..) as tasks are processed; our HLE
@@ -996,6 +1044,18 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (++secs && _n < 16) { _n++;
                 fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
                         "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
+            /* Inlined PPU PUTLLC can publish a slot without signal_task.
+             * Wake only when occupancy is real. */
+            {
+                uint32_t tq = 0, th4 = 0, th5 = 0;
+                if (spu_task_lfqueue_occ(taskset_ea, taskId, &tq, &th4, &th5)) {
+                    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
+                    static int _t = 0; if (_t++ < 8)
+                        fprintf(stderr, "[spu_workload] WAIT_SIGNAL timeout drain "
+                                "q=0x%08X h4=%u h5=%u\n", tq, th4, th5);
+                    continue;
+                }
+            }
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
@@ -1010,6 +1070,16 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (++secs && _n < 16) { _n++;
                 fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
                         "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
+            {
+                uint32_t tq = 0, th4 = 0, th5 = 0;
+                if (spu_task_lfqueue_occ(taskset_ea, taskId, &tq, &th4, &th5)) {
+                    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
+                    static int _t = 0; if (_t++ < 8)
+                        fprintf(stderr, "[spu_workload] WAIT_SIGNAL timeout drain "
+                                "q=0x%08X h4=%u h5=%u\n", tq, th4, th5);
+                    continue;
+                }
+            }
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
