@@ -39,6 +39,18 @@ int main(void)
     assert(sceNpTrophyDestroyContext(SCE_NP_TROPHY_MAX_CONTEXTS) == CELL_OK);
     assert(sceNpTrophyDestroyHandle(SCE_NP_TROPHY_MAX_HANDLES) == CELL_OK);
     assert(s_contexts[1].in_use && s_handles[1].in_use);
+    s_contexts[1].registered = 1;
+    assert(sceNpTrophyGetGameInfo(1, 1, (void*)0x300, (void*)0x800) == CELL_OK);
+    assert(vm_read32(0x300) == 32);
+    assert(vm_read32(0x304) == 1);
+    assert(vm_read32(0x308) == 2);
+    assert(vm_read32(0x30C) == 8);
+    assert(vm_read32(0x310) == 21);
+    assert(vm_read32(0x800) == 0);
+    assert(sceNpTrophyGetTrophyInfo(1, 1, 0, (void*)0x900, (void*)0xB00) == CELL_OK);
+    assert(vm_read32(0x900) == 0);
+    assert(vm_read32(0x904) == SCE_NP_TROPHY_GRADE_BRONZE);
+    assert(vm_read32(0xB00 + 8) == 0); /* trophyId after BE u64 timestamp */
     assert(sceNpTrophyTerm() == CELL_OK);
     free(vm_base);
     puts("Trophy initialization and guest-endian checks passed");

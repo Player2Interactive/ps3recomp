@@ -19,6 +19,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "ps3emu/endian.h"                   /* ps3_bswap64 -- guest is big-endian */
 #include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
+#include <stddef.h>            /* offsetof */
 /* HLE args arrive as guest effective addresses; translate before deref. */
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
@@ -388,31 +389,35 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
 
     if (!s_contexts[context].registered)
         return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
-    details = GUEST_PTR(details, SceNpTrophyGameDetails*);
-    data = GUEST_PTR(data, SceNpTrophyGameData*);
+    {
+        uint32_t details_ea = GUEST_EA(details);
+        uint32_t data_ea = GUEST_EA(data);
+        details = GUEST_PTR(details, SceNpTrophyGameDetails*);
+        data = GUEST_PTR(data, SceNpTrophyGameData*);
 
-    if (details) {
-        memset(details, 0, sizeof(SceNpTrophyGameDetails));
-        details->numTrophies = 32; /* default trophy set */
-        details->numPlatinum = 1;
-        details->numGold     = 2;
-        details->numSilver   = 8;
-        details->numBronze   = 21;
-        strncpy(details->title, "PS3 Game",
-                SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE - 1);
-        strncpy(details->description, "Trophy set",
-                SCE_NP_TROPHY_GAME_DESC_MAX_SIZE - 1);
-    }
+        if (details) {
+            memset(details, 0, sizeof(SceNpTrophyGameDetails));
+            /* Guest BE u32 counts. Host stores here were LE (32 -> 0x20000000). */
+            vm_write32(details_ea + (uint32_t)offsetof(SceNpTrophyGameDetails, numTrophies), 32);
+            vm_write32(details_ea + (uint32_t)offsetof(SceNpTrophyGameDetails, numPlatinum), 1);
+            vm_write32(details_ea + (uint32_t)offsetof(SceNpTrophyGameDetails, numGold), 2);
+            vm_write32(details_ea + (uint32_t)offsetof(SceNpTrophyGameDetails, numSilver), 8);
+            vm_write32(details_ea + (uint32_t)offsetof(SceNpTrophyGameDetails, numBronze), 21);
+            strncpy(details->title, "PS3 Game",
+                    SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE - 1);
+            strncpy(details->description, "Trophy set",
+                    SCE_NP_TROPHY_GAME_DESC_MAX_SIZE - 1);
+        }
 
-    if (data) {
-        memset(data, 0, sizeof(SceNpTrophyGameData));
-        data->unlockedTrophies = trophy_count_unlocked(&s_contexts[context]);
-        /* Count by grade would require per-trophy grade data;
-         * return conservative estimates */
-        data->unlockedPlatinum = 0;
-        data->unlockedGold     = 0;
-        data->unlockedSilver   = 0;
-        data->unlockedBronze   = data->unlockedTrophies;
+        if (data) {
+            u32 unlocked = trophy_count_unlocked(&s_contexts[context]);
+            memset(data, 0, sizeof(SceNpTrophyGameData));
+            vm_write32(data_ea + (uint32_t)offsetof(SceNpTrophyGameData, unlockedTrophies), unlocked);
+            vm_write32(data_ea + (uint32_t)offsetof(SceNpTrophyGameData, unlockedPlatinum), 0);
+            vm_write32(data_ea + (uint32_t)offsetof(SceNpTrophyGameData, unlockedGold), 0);
+            vm_write32(data_ea + (uint32_t)offsetof(SceNpTrophyGameData, unlockedSilver), 0);
+            vm_write32(data_ea + (uint32_t)offsetof(SceNpTrophyGameData, unlockedBronze), unlocked);
+        }
     }
 
     printf("[sceNpTrophy] GetGameInfo(ctx=%d)\n", context);
@@ -439,25 +444,31 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
 
     if (trophyId < 0 || (u32)trophyId >= s_contexts[context].total_trophies)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
-    details = GUEST_PTR(details, SceNpTrophyDetails*);
-    data = GUEST_PTR(data, SceNpTrophyData*);
+    {
+        uint32_t details_ea = GUEST_EA(details);
+        uint32_t data_ea = GUEST_EA(data);
+        details = GUEST_PTR(details, SceNpTrophyDetails*);
+        data = GUEST_PTR(data, SceNpTrophyData*);
 
-    if (details) {
-        memset(details, 0, sizeof(SceNpTrophyDetails));
-        details->trophyId = (u32)trophyId;
-        details->trophyGrade = SCE_NP_TROPHY_GRADE_BRONZE;
-        snprintf(details->name, SCE_NP_TROPHY_NAME_MAX_SIZE,
-                 "Trophy %d", trophyId);
-        snprintf(details->description, SCE_NP_TROPHY_DESC_MAX_SIZE,
-                 "Trophy #%d description", trophyId);
-        details->hidden = 0;
-    }
+        if (details) {
+            memset(details, 0, sizeof(SceNpTrophyDetails));
+            vm_write32(details_ea + (uint32_t)offsetof(SceNpTrophyDetails, trophyId), (u32)trophyId);
+            vm_write32(details_ea + (uint32_t)offsetof(SceNpTrophyDetails, trophyGrade),
+                       SCE_NP_TROPHY_GRADE_BRONZE);
+            snprintf(details->name, SCE_NP_TROPHY_NAME_MAX_SIZE,
+                     "Trophy %d", trophyId);
+            snprintf(details->description, SCE_NP_TROPHY_DESC_MAX_SIZE,
+                     "Trophy #%d description", trophyId);
+            details->hidden = 0;
+        }
 
-    if (data) {
-        memset(data, 0, sizeof(SceNpTrophyData));
-        data->trophyId = (u32)trophyId;
-        data->unlocked = s_contexts[context].unlocked[trophyId];
-        data->timestamp = s_contexts[context].unlock_time[trophyId];
+        if (data) {
+            memset(data, 0, sizeof(SceNpTrophyData));
+            vm_write32(data_ea + (uint32_t)offsetof(SceNpTrophyData, trophyId), (u32)trophyId);
+            data->unlocked = s_contexts[context].unlocked[trophyId];
+            vm_write64(data_ea + (uint32_t)offsetof(SceNpTrophyData, timestamp),
+                       s_contexts[context].unlock_time[trophyId]);
+        }
     }
 
     return CELL_OK;
