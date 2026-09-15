@@ -1171,6 +1171,13 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
     if ((uint32_t)a == (VM_HLE_INJECT_BASE + 0x2008u)) { static int _rp=-1;
         if(_rp<0){ const char* e=getenv("GCM_REFPOLL"); _rp=(e&&*e=='0')?0:1; }
         if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
+    /* PUT/GET poll: if the FIFO has work, kick the drain thread so GET can
+     * chase PUT without waiting for the 16 ms present tick. */
+    if ((uint32_t)a == (VM_HLE_INJECT_BASE + 0x2000u) ||
+        (uint32_t)a == (VM_HLE_INJECT_BASE + 0x2004u)) {
+        extern void cellGcm_on_control_poll(uint32_t);
+        cellGcm_on_control_poll((uint32_t)a);
+    }
     uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
     g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
 #ifdef _WIN32
@@ -1240,6 +1247,22 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
               }
               fprintf(stderr, "[HOTREAD] GCM control spin: put=0x%08X get=0x%08X "
                       "ref=0x%08X (addr 0x%08X)\n", pu, ge, rf, (uint32_t)a);
+              /* Dump the FIFO word at put/get so a put==get spin shows whether
+               * GET is parked on a JUMP (Insomniac write-head) or a method. */
+              if (vm_base && pu == ge) {
+                  static uint32_t last_dump_io = 0xFFFFFFFFu;
+                  uint32_t fea = 0x20000000u + pu;
+                  if (pu != last_dump_io && fea >= 0x20000000u && !vm_oob(fea, 16)) {
+                      last_dump_io = pu;
+                      const uint8_t* f = vm_base + fea;
+                      uint32_t w0 = ((uint32_t)f[0]<<24)|((uint32_t)f[1]<<16)|((uint32_t)f[2]<<8)|f[3];
+                      uint32_t w1 = ((uint32_t)f[4]<<24)|((uint32_t)f[5]<<16)|((uint32_t)f[6]<<8)|f[7];
+                      uint32_t w2 = ((uint32_t)f[8]<<24)|((uint32_t)f[9]<<16)|((uint32_t)f[10]<<8)|f[11];
+                      uint32_t w3 = ((uint32_t)f[12]<<24)|((uint32_t)f[13]<<16)|((uint32_t)f[14]<<8)|f[15];
+                      fprintf(stderr, "[HOTREAD] FIFO@io=0x%08X ea=0x%08X  %08X %08X %08X %08X\n",
+                              pu, fea, w0, w1, w2, w3);
+                  }
+              }
           } else fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X) guest cia=0x%08X lr=0x%08X\n", (uint32_t)a, __builtin_bswap32(v),
           g_active_ctx?(uint32_t)g_active_ctx->cia:0, g_active_ctx?(uint32_t)g_active_ctx->lr:0); n=0;
 #ifdef _WIN32
@@ -1442,7 +1465,11 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
       /* Raw SPU problem state: run control, mailboxes and signal notification
        * have side effects. The plain store above still happens -- the registers
        * are guest memory and the PPU reads most of them straight back. */
-      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4); } }
+      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4);
+      if ((uint32_t)a == (VM_HLE_INJECT_BASE + 0x2000u)) {
+          extern void cellGcm_on_put_write(uint32_t);
+          cellGcm_on_put_write(_v);
+      } } }
 void vm_write64(uint64_t a, uint64_t v) {
     /* PPU_WWATCH covers the 64-bit store too. It did not, which made the watch
      * blind to exactly the code that matters most for it: every bignum and

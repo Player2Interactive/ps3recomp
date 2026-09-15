@@ -71,8 +71,10 @@ extern "C" {
  *
  * So it is a variable, not a constant: a port that knows its title's memory map
  * assigns ppu_hle_inject_base before it runs any guest code, and everything
- * derived from VM_HLE_INJECT_BASE follows. The default is the historical value.
- * The window needs 0x8000 bytes and the title only ever learns these addresses
+ * derived from VM_HLE_INJECT_BASE follows. The default lives in cellGcmSys.c
+ * (0x3E000000: after raw-SPU LS, before sys_memory) because 0x20000000 is the
+ * GCM IO window ACIT / GT5P hand cellGcmInit. The window is 16 MB (24-bit
+ * RSX semaphore offsets) and the title only ever learns these addresses
  * through cellGcmGetLabelAddress / cellGcmGetControlRegister /
  * cellGcmGetOffsetTable, so it is free to move. */
 #ifdef __cplusplus

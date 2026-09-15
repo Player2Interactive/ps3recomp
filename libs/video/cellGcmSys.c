@@ -127,8 +127,20 @@ static CellGcmControl s_control;
  * address space at 1 MiB granularity, 8 KiB a side, and this is not a hot path.
  * 0xFFFF means "not mapped", as it does in the host tables. */
 /* Default home for the HLE-visible GCM window; a port overrides it before
- * running guest code when its title claims this address range. */
-uint32_t ppu_hle_inject_base = 0x20000000u;
+ * running guest code when its title claims this address range.
+ *
+ * Used to be 0x20000000. That address is also the IO window ACIT (and GT5
+ * Prologue) pass to cellGcmInit -- labels, put/get/ref and the offset tables
+ * then sat inside the command buffer, and SPU DMA of IO EAs such as
+ * 0x209BB5B8 either hit uncommitted pages or the HLE overlay. 0x3E000000
+ * is after the raw-SPU LS windows (0x30000000) and before the sys_memory
+ * bump (0x40000000). The FIFO callback sentinel is VM_HLE_INJECT_BASE+0x2F00
+ * and is registered from that value at HLE init, so the default must be
+ * correct before any guest code runs -- do not relocate it from cellGcmInit. */
+uint32_t ppu_hle_inject_base = 0x3E000000u;
+
+/* rsx_commands.c indexes the label window with a 24-bit semaphore offset. */
+#define GCM_HLE_INJECT_WINDOW  0x01000000u
 
 static u16 s_io_address_table[65536];
 static u16 s_ea_address_table[65536];
@@ -371,6 +383,26 @@ static IoMapping* find_free_mapping(void)
     return NULL;
 }
 
+/* Back a guest range so PPU stores and SPU MFC GETs share the same pages.
+ * ACIT's runner MEM_RESERVEs 4 GB and demand-commits on PPU faults; SPU DMA
+ * (mfc_ea_range_committed) VirtualQuery-then-commits, but a GET of an
+ * uncommitted IO EA is still a failed transfer (LS stays zero) if that
+ * commit is skipped. Pre-commit the windows cellGcmInit / MapEaIoAddress
+ * publish. Harmless on already-committed pages. */
+static void gcm_commit_guest_range(u32 addr, u32 size, const char* what)
+{
+    int32_t rc;
+    if (!addr || !size)
+        return;
+    rc = vm_commit(addr, size);
+    if (rc != CELL_OK)
+        fprintf(stderr, "[cellGcmSys] WARNING: vm_commit %s ea=0x%08X size=0x%X -> %d\n",
+                what, addr, size, (int)rc);
+    else
+        fprintf(stderr, "[cellGcmSys] committed %s ea=0x%08X size=0x%X\n",
+                what, addr, size);
+}
+
 /* Valid tiled pitch sizes (power-of-two aligned, common RSX values) */
 static const u32 s_valid_pitches[] = {
     0x0200, 0x0300, 0x0400, 0x0500, 0x0600, 0x0700, 0x0800,
@@ -419,6 +451,21 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_config.memoryFrequency = 650000000;   /* 650 MHz */
     s_config.coreFrequency   = 500000000;   /* 500 MHz */
 
+    /* IO / local / inject must be real guest RAM: SPU MFC GET of 0x209BB5B8
+     * (ACIT CreateTask command, ioAddr+0x9BB5B8) is a memcpy from vm_base. */
+    {
+        u32 inj = ppu_hle_inject_base;
+        u32 inj_end = inj + GCM_HLE_INJECT_WINDOW;
+        u32 io_end = ioAddress + ioSize;
+        if (ioAddress && ioSize && !(io_end <= inj || ioAddress >= inj_end))
+            fprintf(stderr, "[cellGcmSys] WARNING: HLE inject 0x%08X..0x%08X overlaps "
+                    "IO 0x%08X..0x%08X -- SPU DMA/FIFO will see clobbered bytes\n",
+                    inj, inj_end, ioAddress, io_end);
+        gcm_commit_guest_range(inj, GCM_HLE_INJECT_WINDOW, "HLE inject");
+        gcm_commit_guest_range(ioAddress, ioSize, "IO");
+        gcm_commit_guest_range(s_config.localAddress, s_config.localSize, "local");
+    }
+
     s_local_mem_allocated = 0;
     s_io_mapping_count = 0;
     /* Unmapped = 0xFFFF. The tables are static (zero-initialized), so without
@@ -462,6 +509,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     vm_write32(GCM_CONTROL_GUEST_ADDR + 8, 0);
 
     s_gcm_initialized = 1;
+    cellGcm_fifo_kick();
     return CELL_OK;
 }
 
@@ -1218,6 +1266,7 @@ static void gcm_ref_publish_one(void)
  * itself performs guest reads) and never blocks a spinning game thread. */
 static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
 static void gcm_rsx_process_fifo_unlocked(void);
+void cellGcm_rsx_process_fifo(void);
 
 /* Kick event: a game thread whose fence wait finds the queue DRY signals the
  * present thread to run the FIFO walker NOW instead of on its next 16 ms
@@ -1226,10 +1275,77 @@ static void gcm_rsx_process_fifo_unlocked(void);
  * the D3D12 backend it feeds) stays on the present thread -- running it from
  * the polling game thread killed the process silently. */
 static HANDLE s_gcm_kick_ev = NULL;
+static volatile LONG s_gcm_drain_started = 0;
+static DWORD WINAPI gcm_fifo_drain_thread(LPVOID);
+
 void* cellGcm_fifo_kick_event(void)
 {
     if (!s_gcm_kick_ev) s_gcm_kick_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
     return (void*)s_gcm_kick_ev;
+}
+
+static void gcm_fifo_kick_start(void)
+{
+    HANDLE ev = (HANDLE)cellGcm_fifo_kick_event();
+    if (!ev) return;
+    if (InterlockedCompareExchange(&s_gcm_drain_started, 1, 0) != 0)
+        return;
+    HANDLE t = CreateThread(NULL, 0, gcm_fifo_drain_thread, ev, 0, NULL);
+    if (t) {
+        CloseHandle(t);
+        fprintf(stderr, "[cellGcmSys] FIFO drain thread live (PUT kick / GET poll)\n");
+    } else {
+        InterlockedExchange(&s_gcm_drain_started, 0);
+    }
+}
+
+void cellGcm_fifo_kick(void)
+{
+    gcm_fifo_kick_start();
+    if (s_gcm_kick_ev)
+        SetEvent(s_gcm_kick_ev);
+}
+
+static DWORD WINAPI gcm_fifo_drain_thread(LPVOID ev)
+{
+    HANDLE kick = (HANDLE)ev;
+    for (;;) {
+        WaitForSingleObject(kick, 8);
+        cellGcm_rsx_process_fifo();
+    }
+    return 0;
+}
+
+/* Guest store to ctrl->put: hardware kicks RSX the moment PUT is written.
+ * Do not walk the FIFO on this thread -- D3D12 record is not free-threaded
+ * (doing so from a polling PPU thread killed the process). Wake the drain
+ * thread instead. */
+void cellGcm_on_put_write(u32 put)
+{
+    (void)put;
+    cellGcm_fifo_kick();
+}
+
+/* Guest load of put/get: if the FIFO has work, wake the drain thread and
+ * yield so the present thread can run. Do not vm_read32 — this is called
+ * from inside vm_read32. */
+void cellGcm_on_control_poll(u32 addr)
+{
+    extern uint8_t* vm_base;
+    const uint8_t* c;
+    u32 put, get;
+    u32 ctrl = GCM_CONTROL_GUEST_ADDR;
+    if (addr != ctrl && addr != ctrl + 4u)
+        return;
+    if (!vm_base)
+        return;
+    c = vm_base + ctrl;
+    put = ((u32)c[0] << 24) | ((u32)c[1] << 16) | ((u32)c[2] << 8) | c[3];
+    get = ((u32)c[4] << 24) | ((u32)c[5] << 16) | ((u32)c[6] << 8) | c[7];
+    if (put == get)
+        return;
+    cellGcm_fifo_kick();
+    SwitchToThread();
 }
 
 /* Serializes fence publication between the present ticker and every guest
@@ -1294,6 +1410,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * by s_gcm_ctx_out_ea, which stays 0 on that path. */
     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
+#ifdef _WIN32
+    { extern void rsx_d3d12_record_lock(void); rsx_d3d12_record_lock(); }
+#endif
 
     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
      * offset in the control register), decoding method headers and following
@@ -1327,6 +1446,26 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     ptr ? vm_read32(ptr + 0x0) : 0, ptr ? vm_read32(ptr + 0x4) : 0,
                     cur, ptr ? vm_read32(ptr + 0xC) : 0, s_gcm_context_ea);
             fflush(stderr);
+        }
+    }
+
+    /* Hardware RSX keeps fetching at GET while put==get. A JUMP patched to a
+     * mapped non-self target must be followed; methods past PUT are the write
+     * head and must not be decoded. */
+    if (s_fifo_getoff == put) {
+        u32 pea = gcm_io2ea(s_fifo_getoff);
+        if (pea) {
+            u32 pw = vm_read32(pea);
+            if ((pw >> 29) == 1) {
+                u32 tgt = pw & 0x1FFFFFFCu;
+                if (tgt != s_fifo_getoff && gcm_io2ea(tgt)) {
+                    static int n = 0;
+                    if (n++ < 8)
+                        fprintf(stderr, "[cellGcmSys] idle JUMP %08X -> %08X "
+                                "(put=get; patched park)\n", s_fifo_getoff, tgt);
+                    s_fifo_getoff = tgt;
+                }
+            }
         }
     }
 
@@ -1468,13 +1607,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
                * CPU the guest needs. Stop this pass instead; the next one
                * re-reads the word, so a patched jump is still followed. */
               if (tgt == s_fifo_getoff) {
-                  /* Parked. If the title has meanwhile moved `put` somewhere
-                   * else, it has switched to its other segment and left this
-                   * park standing -- it only patches a park when it reuses that
-                   * block. Waiting for a patch that will not come freezes the
-                   * FIFO for the rest of the run, so follow the write head. */
-                  if (put != s_fifo_getoff) { gcm_fifo_dump_around(s_fifo_getoff);
-                                              gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
+                  /* Parked. Insomniac leaves JUMP-to-self at the write head,
+                   * kicks PUT ahead, then patches the park. Resyncing GET to
+                   * PUT here drops the batch (including SetFlip). Stop this
+                   * pass; the next drain re-reads the word. stuck-get still
+                   * resyncs if the park is abandoned. */
+                  if (put != s_fifo_getoff) {
+                      static int n = 0;
+                      if (n++ < 8)
+                          fprintf(stderr, "[cellGcmSys] JUMP-park at get=0x%08X "
+                                  "put=0x%08X -- waiting for patch\n",
+                                  s_fifo_getoff, put);
+                  }
                   break;
               }
               s_fifo_getoff = tgt; }
@@ -1808,6 +1952,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
     gcm_ref_publish_one();
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
+#ifdef _WIN32
+    { extern void rsx_d3d12_record_unlock(void); rsx_d3d12_record_unlock(); }
+#endif
 }
 
 /* FIFO command-buffer-full callback body. The title's inline gcmReserve calls
@@ -2268,6 +2415,8 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
 
     populate_offset_table(ea, io_offset, size);
 
+    gcm_commit_guest_range(ea, size, "MapMainMemory");
+
     vm_write32((uint32_t)(uintptr_t)offset, io_offset);   /* guest out-param */
     return CELL_OK;
 }
@@ -2299,6 +2448,8 @@ s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
     s_io_mapping_count++;
 
     populate_offset_table(ea, io, size);
+
+    gcm_commit_guest_range(ea, size, "MapEaIoAddress");
 
     return CELL_OK;
 }
@@ -2665,6 +2816,35 @@ s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId,
     return cellGcmSetFlipCommandWithWaitLabel(bufferId, labelIndex, labelValue);
 }
 
+/* NID: 0x3A33C1FD — libgcm flush. Publish context->current as PUT and kick
+ * the RSX. ACIT's func_006E5630 passes gCellGcmCurrentContext. An unregistered
+ * import fakes CELL_OK and never advances PUT, so a waiter spinning on PUT
+ * (HOTREAD at inject+0x2000) never observes a kick. */
+s32 _cellGcmFunc15(u32 ctx)
+{
+    u32 current, io;
+    if (!ctx) {
+        if (s_gcm_ctx_out_ea)
+            ctx = vm_read32(s_gcm_ctx_out_ea);
+        else
+            ctx = s_gcm_context_ea;
+    }
+    if (!ctx)
+        return CELL_OK;
+    current = vm_read32(ctx + 0x8);
+    io = gcm_ea2io(current);
+    if (io == 0xFFFFFFFFu)
+        return CELL_OK;
+    atomic_thread_fence(memory_order_release);
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io);
+    cellGcm_fifo_kick();
+    { static int n = 0;
+      if (n++ < 8)
+          fprintf(stderr, "[cellGcmSys] _cellGcmFunc15 flush put=0x%08X "
+                  "ctx=0x%08X current=0x%08X\n", io, ctx, current); }
+    return CELL_OK;
+}
+
 /* ---------------------------------------------------------------------------
  * Additional functions (RPCS3 parity)
  * -----------------------------------------------------------------------*/
@@ -3026,6 +3206,7 @@ u32 cellGcm_syscall_bringup(u32 local_size)
     if (local_size)
         s_config.localSize = local_size;
     s_gcm_syscall_mode = 1;
+    gcm_commit_guest_range(s_config.localAddress, s_config.localSize, "local");
     return s_config.localAddress;
 }
 
@@ -3049,6 +3230,7 @@ void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size)
         s_io_mapping_count++;
     }
     if (!s_config.ioSize) { s_config.ioAddress = ea; s_config.ioSize = size; }
+    gcm_commit_guest_range(ea, size, "sys_rsx iomap");
 }
 
 void cellGcm_syscall_iounmap(u32 io, u32 size)
