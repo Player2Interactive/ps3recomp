@@ -179,6 +179,11 @@ s32 cellGameGetLocalWebContentPath(char* path);
  * to, so the implementation logs them. */
 s32 cellGameContentErrorDialog(s32 type, s32 errNeedSizeKB, const char* dirName);
 
+/* cellSysutil: broken-content exit dialogs. Firmware shows a message and the
+ * title quits; HLE logs and returns CELL_OK (same as ContentErrorDialog). */
+s32 cellGameDataExitBroken(void);
+s32 cellHddGameExitBroken(void);
+
 #ifdef __cplusplus
 }
 #endif

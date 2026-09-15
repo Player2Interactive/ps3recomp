@@ -315,6 +315,13 @@ s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
                             CellSaveDataFileCallback funcFile,
                             u32 container, void* userdata);
 
+s32 cellSaveDataListAutoSave(u32 version, u32 errDialog,
+                            CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                            CellSaveDataFixedCallback funcFixed,
+                            CellSaveDataStatCallback funcStat,
+                            CellSaveDataFileCallback funcFile,
+                            u32 container, void* userdata);
+
 s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
                            u32 errDialog,
                            CellSaveDataSetBuf* setBuf,
@@ -353,6 +360,29 @@ s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,
                              u32 errDialog, CellSaveDataSetBuf* setBuf,
                              CellSaveDataStatCallback funcStat,
                              CellSaveDataFileCallback funcFile, u32 container);
+
+/* User-list variants (cellSysutil). Generic 8-reg HLE omits stack userdata;
+ * ctx handlers in cellSaveData.c read arg9/arg10. */
+s32 cellSaveDataUserListSave(u32 version, u32 userId,
+                             CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                             CellSaveDataListCallback funcList,
+                             CellSaveDataStatCallback funcStat,
+                             CellSaveDataFileCallback funcFile, u32 container);
+s32 cellSaveDataUserListLoad(u32 version, u32 userId,
+                             CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                             CellSaveDataListCallback funcList,
+                             CellSaveDataStatCallback funcStat,
+                             CellSaveDataFileCallback funcFile, u32 container);
+s32 cellSaveDataUserListAutoSave(u32 version, u32 userId, u32 errDialog,
+                                 CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                                 CellSaveDataFixedCallback funcFixed,
+                                 CellSaveDataStatCallback funcStat,
+                                 CellSaveDataFileCallback funcFile);
+s32 cellSaveDataUserListAutoLoad(u32 version, u32 userId, u32 errDialog,
+                                 CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                                 CellSaveDataFixedCallback funcFixed,
+                                 CellSaveDataStatCallback funcStat,
+                                 CellSaveDataFileCallback funcFile);
 
 #ifdef __cplusplus
 }
