@@ -1326,6 +1326,45 @@ void cellGcm_on_put_write(u32 put)
     cellGcm_fifo_kick();
 }
 
+void cellGcm_dump_hang(u32 put, u32 get)
+{
+    static int once = 0;
+    if (once) return;
+    once = 1;
+    fprintf(stderr, "[cellGcmSys] hang dump put=0x%08X get=0x%08X ctx_out=0x%08X "
+            "hle_ctx=0x%08X drained=0x%08X\n",
+            put, get, s_gcm_ctx_out_ea, s_gcm_context_ea, g_gcm_fifo_drained_ea);
+    if (s_gcm_ctx_out_ea) {
+        u32 ctx = vm_read32(s_gcm_ctx_out_ea);
+        fprintf(stderr, "[cellGcmSys] hang gCellGcmCurrentContext -> 0x%08X "
+                "begin=0x%08X end=0x%08X current=0x%08X callback=0x%08X\n",
+                ctx,
+                ctx ? vm_read32(ctx + 0x0) : 0,
+                ctx ? vm_read32(ctx + 0x4) : 0,
+                ctx ? vm_read32(ctx + 0x8) : 0,
+                ctx ? vm_read32(ctx + 0xC) : 0);
+        if (ctx && vm_read32(ctx + 0xC)) {
+            u32 opd = vm_read32(ctx + 0xC);
+            fprintf(stderr, "[cellGcmSys] hang callback OPD func=0x%08X toc=0x%08X\n",
+                    vm_read32(opd + 0x0), vm_read32(opd + 0x4));
+        }
+    }
+    if (s_gcm_context_ea)
+        fprintf(stderr, "[cellGcmSys] hang hle ctx begin=0x%08X end=0x%08X "
+                "current=0x%08X callback=0x%08X\n",
+                vm_read32(s_gcm_context_ea + 0x0),
+                vm_read32(s_gcm_context_ea + 0x4),
+                vm_read32(s_gcm_context_ea + 0x8),
+                vm_read32(s_gcm_context_ea + 0xC));
+    for (int k = -8; k < 8; k++) {
+        u32 io = put + (u32)(k * 4);
+        u32 ea = gcm_io2ea(io);
+        fprintf(stderr, "[cellGcmSys] hang fifo put%+d io=0x%08X ea=0x%08X w=0x%08X\n",
+                k * 4, io, ea, ea ? vm_read32(ea) : 0xDEADDEADu);
+    }
+    fflush(stderr);
+}
+
 /* Guest load of put/get: if the FIFO has work, wake the drain thread and
  * yield so the present thread can run. Do not vm_read32 — this is called
  * from inside vm_read32. */
@@ -1697,6 +1736,30 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
+            /* NV4097_GET_REPORT (0x1800): RSX writes CellGcmReportData
+             * {timer, value, pad} to local+offset. ACIT's wrap path
+             * (func_005CB084) emits this then waits; without the write the
+             * waiter can only see leftover FIFO methods at PUT. */
+            if (subch == 0 && method == 0x1800u) {
+                for (u32 i = 0; i < count; i++) {
+                    u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                    if (!dea) break;
+                    u32 v = vm_read32(dea);
+                    u32 off = v & 0x00FFFFFCu;
+                    u32 ea = s_config.localAddress + off;
+                    u64 ts = get_timestamp_ns();
+                    vm_write32(ea + 0, (u32)(ts >> 32));
+                    vm_write32(ea + 4, (u32)ts);
+                    vm_write32(ea + 8, 1u);   /* completed */
+                    vm_write32(ea + 12, 0);
+                    { static int n = 0;
+                      if (n++ < 8)
+                          fprintf(stderr, "[cellGcmSys] GET_REPORT type=%u off=0x%08X "
+                                  "ea=0x%08X\n", (v >> 24) & 0xFFu, off, ea); }
+                }
+                s_fifo_getoff += 4 + count * 4;
+                continue;
+            }
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
@@ -1924,16 +1987,38 @@ static void gcm_rsx_process_fifo_unlocked(void)
             u32 io_begin = gcm_ea2io(begin);
             if (io_begin != 0xFFFFFFFFu) {
                 u32 jmp_at = (cur + 4 <= end) ? cur : end - 4;
+                u32 io_jmp = gcm_ea2io(jmp_at);
                 vm_write32(jmp_at, 0x20000000u | io_begin);   /* JUMP -> begin */
                 vm_write32(ctx + 0x8, begin);                 /* current = begin */
-                vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
-                s_fifo_getoff = io_begin;                          /* get */
-                put = io_begin;
+                /* PUT past the JUMP, not at begin. PUT=begin equalizes put/get
+                 * at the write head; a title waiting for space (GET off current)
+                 * or for PUT to stay at the JUMP then spins forever. Hardware
+                 * leaves PUT on the JUMP until the next real flush. Do not
+                 * teleport GET -- the walker consumes the tail and follows. */
+                if (io_jmp != 0xFFFFFFFFu) {
+                    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_jmp + 4u);
+                    put = io_jmp + 4u;
+                }
                 static int n = 0;
                 if (n++ < 8)
                     fprintf(stderr, "[cellGcmSys] recycled the title's own ring "
-                            "(ctx=0x%08X begin=0x%08X end=0x%08X) -- its callback "
-                            "does not%c", ctx, begin, end, 10);
+                            "(ctx=0x%08X begin=0x%08X end=0x%08X put=0x%08X) -- its callback "
+                            "does not%c", ctx, begin, end, put, 10);
+            }
+        } else if (s_fifo_getoff == put) {
+            u32 io_begin = begin ? gcm_ea2io(begin) : 0xFFFFFFFFu;
+            u32 io_end = end ? gcm_ea2io(end) : 0xFFFFFFFFu;
+            /* PUT must actually live in this context's ring. ACIT's
+             * gCellGcmCurrentContext stays on the 132 KB default (io_end
+             * 0x21000) while PUT walks a 5 MB ring at 0x0161AF20; treating
+             * any large PUT as "this ring's end" was a false wrap-miss. */
+            if (io_begin != 0xFFFFFFFFu && io_end != 0xFFFFFFFFu &&
+                put >= io_begin && put + 0x1000u >= io_end) {
+                static int miss = 0;
+                if (miss++ < 4)
+                    fprintf(stderr, "[cellGcmSys] wrap miss put=get=0x%08X ctx=0x%08X "
+                            "begin=0x%08X end=0x%08X cur=0x%08X head=%d io_end=0x%08X\n",
+                            put, ctx, begin, end, cur, head_consumed, io_end);
             }
         }
     }
@@ -1994,11 +2079,14 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
                 g_gcm_fifo_drained_ea);
 
-    /* Do what the SDK's default command-buffer-full callback does: append a
-     * JUMP-to-begin at the write head and move `put` to begin. The FIFO walker
-     * consumes the tail, follows the jump, and idles at begin; then it's safe
-     * for the guest to write from begin (that region was consumed long ago). */
+    /* SDK default callback: JUMP at `current`, flush PUT *past* that JUMP, wait
+     * for GET to leave the [begin, begin+reserve) window (GET is still in the
+     * tail while the buffer is full), then set current=begin. Publishing
+     * PUT=begin here was wrong: the walker equalizes get to put at the write
+     * head, and ACIT then HOTREADs PUT forever (put=get=0x0161AF20, method
+     * 00041FCC = NV4097_SET_ATTRIB_TEX_COORD_EX sitting unsubmitted). */
     u32 io_begin = gcm_ea2io(begin);
+    u32 io_cur   = gcm_ea2io(current);
     if (io_begin != 0xFFFFFFFFu) {
         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
         /* The jump has to be in guest memory before `put` moves behind the
@@ -2006,13 +2094,30 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
          * may observe the new `put`, find `get` != `put`, and read the old
          * word at `current` before the jump lands there. */
         atomic_thread_fence(memory_order_release);
-        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
+        if (io_cur != 0xFFFFFFFFu)
+            vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_cur + 4u); /* put = after JUMP */
+        { static int n = 0;
+          if (n++ < 8)
+              fprintf(stderr, "[cellGcmSys] fifo recycle JUMP put=0x%08X "
+                      "begin=0x%08X cur=0x%08X\n",
+                      io_cur != 0xFFFFFFFFu ? io_cur + 4u : io_begin,
+                      begin, current); }
     }
 
-    /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
-     * no commands are lost; a stalled ticker degrades to dropped commands. */
+    /* SDK waits until GET is *not* in the destination window -- while the
+     * buffer is full GET is still in the tail, so writing at `begin` is safe.
+     * Waiting for drained_ea==begin was the opposite: instant drain parked GET
+     * on the write head (put=get=begin) and the producer spun on PUT. */
     int spins = 0;
-    while (g_gcm_fifo_drained_ea != begin && spins < 2000) { Sleep(1); spins++; }
+    for (;;) {
+        u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
+        u32 putv = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+        if (get == putv) break;                         /* empty */
+        if (io_cur != 0xFFFFFFFFu && get >= io_cur) break; /* still in tail */
+        if (get > io_begin + 0x2000u) break;            /* past reserved head */
+        if (++spins >= 2000) break;
+        Sleep(1);
+    }
     if (spins >= 2000) {
         static int warned = 0;
         if (warned++ < 4)
