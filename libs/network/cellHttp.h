@@ -99,6 +99,9 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
 
 s32 cellHttpGetResponseContentLength(CellHttpTransId transId, u64* length);
 s32 cellHttpGetStatusCode(CellHttpTransId transId, s32* code);
+/* SDK names ACIT imports (distinct NIDs from the Get* aliases above). */
+s32 cellHttpResponseGetContentLength(CellHttpTransId transId, u64* length);
+s32 cellHttpResponseGetStatusCode(CellHttpTransId transId, s32* code);
 
 s32 cellHttpSetResolveTimeOut(CellHttpTransId transId, u32 usec);
 s32 cellHttpSetConnectTimeOut(CellHttpTransId transId, u32 usec);

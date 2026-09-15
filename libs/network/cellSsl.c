@@ -94,6 +94,28 @@ s32 cellSslCertGetPublicKey(CellSslCertId certId, u8* key, u32* keySize)
     return CELL_OK;
 }
 
+s32 cellSslCertGetRsaPublicKeyModulus(CellSslCertId certId, u32* sboData, u32* sboLength)
+{
+    (void)certId;
+    printf("[cellSsl] CertGetRsaPublicKeyModulus()\n");
+    if (!sboData || !sboLength)
+        return (s32)CELL_SSL_ERROR_INVALID_ARG;
+    vm_write32((u32)(uintptr_t)sboData, 0);
+    vm_write32((u32)(uintptr_t)sboLength, 0);
+    return CELL_OK;
+}
+
+s32 cellSslCertGetRsaPublicKeyExponent(CellSslCertId certId, u32* sboData, u32* sboLength)
+{
+    (void)certId;
+    printf("[cellSsl] CertGetRsaPublicKeyExponent()\n");
+    if (!sboData || !sboLength)
+        return (s32)CELL_SSL_ERROR_INVALID_ARG;
+    vm_write32((u32)(uintptr_t)sboData, 0);
+    vm_write32((u32)(uintptr_t)sboLength, 0);
+    return CELL_OK;
+}
+
 s32 cellSslCertGetNotBefore(CellSslCertId certId, u64* time)
 {
     (void)certId;
@@ -107,6 +129,53 @@ s32 cellSslCertGetNotAfter(CellSslCertId certId, u64* time)
     (void)certId;
     if (!time) return (s32)CELL_SSL_ERROR_INVALID_ARG;
     vm_write64((u32)(uintptr_t)time, (u64)0xFFFFFFFFFFFFFFFFULL);
+    return CELL_OK;
+}
+
+s32 cellSslCertGetSubjectName(CellSslCertId certId, u32* certName)
+{
+    (void)certId;
+    printf("[cellSsl] CertGetSubjectName()\n");
+    if (!certName)
+        return (s32)CELL_SSL_ERROR_INVALID_ARG;
+    vm_write32((u32)(uintptr_t)certName, 0);
+    return CELL_OK;
+}
+
+s32 cellSslCertGetIssuerName(CellSslCertId certId, u32* certName)
+{
+    (void)certId;
+    printf("[cellSsl] CertGetIssuerName()\n");
+    if (!certName)
+        return (s32)CELL_SSL_ERROR_INVALID_ARG;
+    vm_write32((u32)(uintptr_t)certName, 0);
+    return CELL_OK;
+}
+
+s32 cellSslCertGetNameEntryCount(u32 certName, u32* entryCount)
+{
+    printf("[cellSsl] CertGetNameEntryCount()\n");
+    if (!entryCount)
+        return (s32)CELL_SSL_ERROR_INVALID_ARG;
+    vm_write32((u32)(uintptr_t)entryCount, 0);
+    if (!certName)
+        return (s32)CELL_SSL_ERROR_INVALID_ARG;
+    return CELL_OK;
+}
+
+s32 cellSslCertGetNameEntryInfo(u32 certName, u32 entryNum,
+                                u32* oidName, u32* value, u32* valueLength, s32 flag)
+{
+    (void)entryNum;
+    (void)flag;
+    printf("[cellSsl] CertGetNameEntryInfo()\n");
+    if (!oidName || !value || !valueLength)
+        return (s32)CELL_SSL_ERROR_INVALID_ARG;
+    vm_write32((u32)(uintptr_t)oidName, 0);
+    vm_write32((u32)(uintptr_t)value, 0);
+    vm_write32((u32)(uintptr_t)valueLength, 0);
+    if (!certName)
+        return (s32)CELL_SSL_ERROR_INVALID_ARG;
     return CELL_OK;
 }
 

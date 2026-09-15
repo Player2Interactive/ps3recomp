@@ -187,6 +187,33 @@ s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param
 s32 cellNetCtlNetStartDialogAbortAsync(void);
 s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result);
 
+/* Game-update check lives in libnetctl.sprx (same PRX as cellNetCtl). ACIT
+ * imports these five NIDs; an unregistered hit faked CELL_OK and never
+ * delivered status/error to the guest callback. */
+#define CELL_GAMEUPDATE_ERROR_NOT_INITIALIZED      0x8002CC01
+#define CELL_GAMEUPDATE_ERROR_ALREADY_INITIALIZED  0x8002CC02
+#define CELL_GAMEUPDATE_ERROR_INVALID_ADDR         0x8002CC03
+
+#define CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE    0
+#define CELL_GAMEUPDATE_RESULT_STATUS_UPDATE_FOUND 1
+#define CELL_GAMEUPDATE_RESULT_STATUS_MAINTENANCE  2
+#define CELL_GAMEUPDATE_RESULT_STATUS_ERROR        3
+#define CELL_GAMEUPDATE_RESULT_STATUS_CANCELLED    4
+#define CELL_GAMEUPDATE_RESULT_STATUS_FINISHED     5
+#define CELL_GAMEUPDATE_RESULT_STATUS_ABORTED      6
+
+typedef struct CellGameUpdateParam {
+    s32 size;   /* caller-set: 8 */
+    s32 cid;
+} CellGameUpdateParam;
+
+s32 cellGameUpdateInit(void);
+s32 cellGameUpdateTerm(void);
+s32 cellGameUpdateCheckStartAsync(const CellGameUpdateParam* param,
+                                  u32 cb_opd, u32 userdata);
+s32 cellGameUpdateCheckStartWithoutDialogAsync(u32 cb_opd, u32 userdata);
+s32 cellGameUpdateCheckFinishAsync(u32 cb_opd, u32 userdata);
+
 #ifdef __cplusplus
 }
 #endif

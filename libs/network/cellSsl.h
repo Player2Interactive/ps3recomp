@@ -41,8 +41,15 @@ s32 cellSslEnd(void);
 s32 cellSslCertificateLoader(u64 flags, char* buffer, u32 size, u32* required);
 s32 cellSslCertGetSerialNumber(CellSslCertId certId, u8* serial, u32* serialSize);
 s32 cellSslCertGetPublicKey(CellSslCertId certId, u8* key, u32* keySize);
+s32 cellSslCertGetRsaPublicKeyModulus(CellSslCertId certId, u32* sboData, u32* sboLength);
+s32 cellSslCertGetRsaPublicKeyExponent(CellSslCertId certId, u32* sboData, u32* sboLength);
 s32 cellSslCertGetNotBefore(CellSslCertId certId, u64* time);
 s32 cellSslCertGetNotAfter(CellSslCertId certId, u64* time);
+s32 cellSslCertGetSubjectName(CellSslCertId certId, u32* certName);
+s32 cellSslCertGetIssuerName(CellSslCertId certId, u32* certName);
+s32 cellSslCertGetNameEntryCount(u32 certName, u32* entryCount);
+s32 cellSslCertGetNameEntryInfo(u32 certName, u32 entryNum,
+                                u32* oidName, u32* value, u32* valueLength, s32 flag);
 
 /* Entropy / RNG */
 s32 cellSslGetRandomNumber(u8* buf, u32 size);
