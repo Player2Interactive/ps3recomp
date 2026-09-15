@@ -24,6 +24,8 @@ extern "C" {
 
 /* Default user */
 #define CELL_USERINFO_DEFAULT_USER_ID       1
+/* cellSysutil: "current logged-in user". Games pass this to GetStat/GetHomeDir. */
+#define CELL_SYSUTIL_USERID_CURRENT         0
 
 /* Error codes */
 #define CELL_USERINFO_ERROR_BASE            0x8002B200
