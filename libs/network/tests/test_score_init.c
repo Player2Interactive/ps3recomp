@@ -30,7 +30,60 @@ int main(void)
     assert((u32)sceNpScoreTerm() == SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED);
     assert(sceNpScoreInit() == CELL_OK);
     assert(sceNpScoreTerm() == CELL_OK);
+    /* Uninitialized ticket getters must not touch out-params. */
+    assert((u32)sceNpTerm() == CELL_OK);
+    vm_write32(0x300, 0xDEADBEEFu);
+    assert((u32)sceNpManagerGetTicket((void*)0x400, (void*)0x300)
+           == SCE_NP_ERROR_NOT_INITIALIZED);
+    assert(vm_read32(0x300) == 0xDEADBEEFu);
+    assert(sceNpInit(131072, (void*)0x1000) == CELL_OK);
+    vm_write32(0x300, 0xDEADBEEFu);
+    assert(sceNpManagerGetTicket(NULL, NULL) == SCE_NP_ERROR_INVALID_ARGUMENT);
+    assert(sceNpManagerGetTicket(NULL, (void*)0x300) == CELL_OK);
+    assert(vm_read32(0x300) == 0);
+    vm_write32(0x300, 0xDEADBEEFu);
+    assert(sceNpManagerGetTicket((void*)0x400, (void*)0x300) == CELL_OK);
+    assert(vm_read32(0x300) == 0);
+    memset(vm_base + 0x500, 0xA5, SCE_NP_TICKET_PARAM_DATA_LEN);
+    assert(sceNpManagerGetTicketParam(SCE_NP_TICKET_PARAM_SERIAL_ID, NULL)
+           == SCE_NP_ERROR_INVALID_ARGUMENT);
+    assert(sceNpManagerGetTicketParam(-1, (void*)0x500)
+           == SCE_NP_ERROR_INVALID_ARGUMENT);
+    assert(sceNpManagerGetTicketParam(SCE_NP_TICKET_PARAM_SUBJECT_DOB + 1,
+                                      (void*)0x500)
+           == SCE_NP_ERROR_INVALID_ARGUMENT);
+    assert(sceNpManagerGetTicketParam(SCE_NP_TICKET_PARAM_SUBJECT_ONLINE_ID,
+                                      (void*)0x500) == CELL_OK);
+    for (int i = 0; i < SCE_NP_TICKET_PARAM_DATA_LEN; i++)
+        assert(vm_base[0x500 + i] == 0);
+    memset(vm_base + 0x600, 0xA5, SCE_NP_AVATAR_URL_MAX_LENGTH + 1);
+    assert(sceNpManagerGetAvatarUrl(NULL) == SCE_NP_ERROR_INVALID_ARGUMENT);
+    assert(sceNpManagerGetAvatarUrl((void*)0x600) == CELL_OK);
+    for (int i = 0; i < SCE_NP_AVATAR_URL_MAX_LENGTH + 1; i++)
+        assert(vm_base[0x600 + i] == 0);
+    assert((u32)sceNpManagerRequestTicket(NULL, (void*)0x100, NULL, 0, NULL, 0)
+           == SCE_NP_AUTH_EINVALID_ARGUMENT);
+    assert((u32)sceNpManagerRequestTicket((void*)0x100, NULL, NULL, 0, NULL, 0)
+           == SCE_NP_AUTH_EINVALID_ARGUMENT);
+    assert((u32)sceNpManagerRequestTicket((void*)0x100, (void*)0x200, NULL,
+                                          SCE_NP_COOKIE_MAX_SIZE + 1, NULL, 0)
+           == SCE_NP_AUTH_EINVALID_ARGUMENT);
+    assert(sceNpManagerRequestTicket((void*)0x100, (void*)0x200, NULL, 0,
+                                     NULL, 0) == CELL_OK);
+    assert((u32)sceNpBasicGetFriendPresenceByIndex(0, NULL, (void*)0x700, 0)
+           == SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    assert((u32)sceNpBasicGetFriendPresenceByIndex(0, (void*)0x600, NULL, 0)
+           == SCE_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    assert((u32)sceNpBasicGetFriendPresenceByIndex(0, (void*)0x600, (void*)0x700, 0)
+           == SCE_NP_BASIC_ERROR_NOT_CONNECTED);
     assert(sceNpTerm() == CELL_OK);
+    assert((u32)sceNpManagerGetAvatarUrl((void*)0x600)
+           == SCE_NP_ERROR_NOT_INITIALIZED);
+    assert((u32)sceNpManagerRequestTicket((void*)0x100, (void*)0x200, NULL, 0,
+                                          NULL, 0)
+           == SCE_NP_ERROR_NOT_INITIALIZED);
+    assert((u32)sceNpBasicGetFriendPresenceByIndex(0, (void*)0x600, (void*)0x700, 0)
+           == SCE_NP_BASIC_ERROR_NOT_INITIALIZED);
     assert((u32)sceNpScoreInit() == SCE_NP_ERROR_NOT_INITIALIZED);
     free(vm_base);
     puts("Score lifecycle and offline status checks passed");

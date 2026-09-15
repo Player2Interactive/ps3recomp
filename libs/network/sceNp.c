@@ -248,6 +248,85 @@ s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId) { return sceNpGetOnlineId(0
 s32 sceNpManagerGetOnlineName(SceNpOnlineName* name) { return sceNpGetOnlineName(0, name); }
 s32 sceNpManagerGetAccountAge(s32* age)              { return sceNpGetAccountAge(0, age); }
 
+s32 sceNpManagerGetTicket(void* buffer, SceNpTicketSize* bufferSize)
+{
+    (void)buffer;
+
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+    /* buffer may be NULL (size query). bufferSize is required. */
+    if (!bufferSize)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+
+    /* No PSN session: empty-but-valid ticket. Always write length 0 so the
+     * guest does not treat leftover stack/heap as a ticket size. */
+    vm_write32((u32)(uintptr_t)bufferSize, 0);
+    printf("[sceNp] ManagerGetTicket() -> size=0 (offline)\n");
+    return CELL_OK;
+}
+
+s32 sceNpManagerGetTicketParam(s32 paramId, SceNpTicketParam* param)
+{
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!param || paramId < SCE_NP_TICKET_PARAM_SERIAL_ID
+        || paramId > SCE_NP_TICKET_PARAM_SUBJECT_DOB)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+
+    vm_memset((u32)(uintptr_t)param, 0, SCE_NP_TICKET_PARAM_DATA_LEN);
+    printf("[sceNp] ManagerGetTicketParam(id=%d) -> empty (offline)\n", paramId);
+    return CELL_OK;
+}
+
+s32 sceNpManagerGetAvatarUrl(SceNpAvatarUrl* avatarUrl)
+{
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!avatarUrl)
+        return SCE_NP_ERROR_INVALID_ARGUMENT;
+
+    /* No PSN avatar: empty-but-valid URL (127 chars + NUL). Guest EA. */
+    vm_memset((u32)(uintptr_t)avatarUrl, 0, SCE_NP_AVATAR_URL_MAX_LENGTH + 1);
+    printf("[sceNp] ManagerGetAvatarUrl() -> empty (offline)\n");
+    return CELL_OK;
+}
+
+s32 sceNpManagerRequestTicket(const SceNpId* npId, const char* serviceId,
+                              const void* cookie, u32 cookieSize,
+                              const void* entitlementId, u32 consumedCount)
+{
+    (void)cookie;
+    (void)entitlementId;
+    (void)consumedCount;
+
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+    /* RPCS3/SDK: npId and serviceId required; cookie may be NULL at size 0. */
+    if (!npId || !serviceId || cookieSize > SCE_NP_COOKIE_MAX_SIZE)
+        return (s32)SCE_NP_AUTH_EINVALID_ARGUMENT;
+
+    /* No live PSN: accept the request. GetTicket already reports size 0. */
+    printf("[sceNp] ManagerRequestTicket() -> ok (offline, empty ticket)\n");
+    return CELL_OK;
+}
+
+s32 sceNpBasicGetFriendPresenceByIndex(u32 index, SceNpUserInfo* user,
+                                       void* pres, u32 options)
+{
+    (void)options;
+
+    if (!pres)
+        return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
+    if (!s_np_initialized)
+        return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
+    if (!user)
+        return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
+
+    /* Offline: do not write a fake friend. ACIT copies user->npId on CELL_OK. */
+    printf("[sceNp] BasicGetFriendPresenceByIndex(%u) -> NOT_CONNECTED\n", index);
+    return (s32)SCE_NP_BASIC_ERROR_NOT_CONNECTED;
+}
+
 /* Score setup is local even while the NP manager is offline. Games may
  * initialize it before starting the worker that decides whether to use PSN. */
 s32 sceNpScoreInit(void)

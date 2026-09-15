@@ -358,3 +358,70 @@ s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result)
     netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED);
     return CELL_OK;
 }
+
+/* ---------------------------------------------------------------------------
+ * cellGameUpdate (libnetctl.sprx)
+ *
+ * ACIT imports Init/Term/CheckStartAsync/CheckStartWithoutDialogAsync/
+ * CheckFinishAsync by NID. Unregistered, those returned CELL_OK and never
+ * wrote status/error into the callback (r3/r4) or userdata (r5). Queue the
+ * completion for the next cellSysutilCheckCallback poll, matching RPCS3.
+ * -----------------------------------------------------------------------*/
+
+static int s_gameupdate_initialized = 0;
+
+static s32 gameupdate_queue(u32 cb_opd, s32 status, s32 error, u32 userdata)
+{
+    if (!cb_opd)
+        return (s32)CELL_GAMEUPDATE_ERROR_INVALID_ADDR;
+    const u64 args[8] = {
+        (u64)(u32)status, (u64)(u32)error, (u64)userdata, 0, 0, 0, 0, 0
+    };
+    return cellSysutilQueueGuestCallbackArgs(cb_opd, args);
+}
+
+s32 cellGameUpdateInit(void)
+{
+    printf("[cellGameUpdate] Init()\n");
+    if (s_gameupdate_initialized)
+        return (s32)CELL_GAMEUPDATE_ERROR_ALREADY_INITIALIZED;
+    s_gameupdate_initialized = 1;
+    return CELL_OK;
+}
+
+s32 cellGameUpdateTerm(void)
+{
+    printf("[cellGameUpdate] Term()\n");
+    s_gameupdate_initialized = 0;
+    return CELL_OK;
+}
+
+s32 cellGameUpdateCheckStartAsync(const CellGameUpdateParam* param,
+                                  u32 cb_opd, u32 userdata)
+{
+    (void)param;
+    if (!s_gameupdate_initialized)
+        return (s32)CELL_GAMEUPDATE_ERROR_NOT_INITIALIZED;
+    printf("[cellGameUpdate] CheckStartAsync(cb=0x%08X) -> NO_UPDATE\n", cb_opd);
+    return gameupdate_queue(cb_opd, CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE,
+                            CELL_OK, userdata);
+}
+
+s32 cellGameUpdateCheckStartWithoutDialogAsync(u32 cb_opd, u32 userdata)
+{
+    if (!s_gameupdate_initialized)
+        return (s32)CELL_GAMEUPDATE_ERROR_NOT_INITIALIZED;
+    printf("[cellGameUpdate] CheckStartWithoutDialogAsync(cb=0x%08X) -> NO_UPDATE\n",
+           cb_opd);
+    return gameupdate_queue(cb_opd, CELL_GAMEUPDATE_RESULT_STATUS_NO_UPDATE,
+                            CELL_OK, userdata);
+}
+
+s32 cellGameUpdateCheckFinishAsync(u32 cb_opd, u32 userdata)
+{
+    if (!s_gameupdate_initialized)
+        return (s32)CELL_GAMEUPDATE_ERROR_NOT_INITIALIZED;
+    printf("[cellGameUpdate] CheckFinishAsync(cb=0x%08X) -> FINISHED\n", cb_opd);
+    return gameupdate_queue(cb_opd, CELL_GAMEUPDATE_RESULT_STATUS_FINISHED,
+                            CELL_OK, userdata);
+}

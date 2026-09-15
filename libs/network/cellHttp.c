@@ -771,6 +771,18 @@ s32 cellHttpGetStatusCode(CellHttpTransId transId, s32* code)
     return CELL_OK;
 }
 
+/* ACIT (and the SDK) import these names. The Get* aliases above compute
+ * different NIDs, so an unresolved CELL_OK left *code / *length as garbage. */
+s32 cellHttpResponseGetStatusCode(CellHttpTransId transId, s32* code)
+{
+    return cellHttpGetStatusCode(transId, code);
+}
+
+s32 cellHttpResponseGetContentLength(CellHttpTransId transId, u64* length)
+{
+    return cellHttpGetResponseContentLength(transId, length);
+}
+
 s32 cellHttpSetResolveTimeOut(CellHttpTransId transId, u32 usec)
 {
     if (!s_http_initialized)
