@@ -97,6 +97,7 @@ extern uint32_t g_ps3_sdk_version;
 #define SYS_EVENT_PORT_CONNECT_LOCAL    136
 #define SYS_EVENT_PORT_DISCONNECT       137
 #define SYS_EVENT_PORT_SEND             138
+#define SYS_EVENT_PORT_CONNECT_IPC      140   /* RPCS3 lv2.cpp; was CELL_OK stub */
 
 /* Canonical LV2 numbers (RPCS3 lv2.cpp ground truth). The previous 139-146
  * block was fictional and collided with the timer family: 141 was also
@@ -115,17 +116,18 @@ extern uint32_t g_ps3_sdk_version;
 /* lv2 lightweight primitives are the _sys_lw* slow-path syscalls (95-99,
  * 111-117); the old 150-160 values squatted on sys_raw_spu_* (150-154)
  * and sys_spu_image_open/import (156/157). */
-#define SYS_LWMUTEX_CREATE              95
-#define SYS_LWMUTEX_DESTROY             96
-#define SYS_LWMUTEX_LOCK                97
-#define SYS_LWMUTEX_UNLOCK              98
-#define SYS_LWMUTEX_TRYLOCK             99
+#define SYS_LWMUTEX_CREATE              95    /* _sys_lwmutex_create; writes *lwmutex_id */
+#define SYS_LWMUTEX_DESTROY             96    /* _sys_lwmutex_destroy */
+#define SYS_LWMUTEX_LOCK                97    /* _sys_lwmutex_lock; sleeps on sleep_queue */
+#define SYS_LWMUTEX_UNLOCK              98    /* _sys_lwmutex_unlock; wakes a waiter */
+#define SYS_LWMUTEX_TRYLOCK             99    /* _sys_lwmutex_trylock */
 
-#define SYS_LWCOND_CREATE               111
-#define SYS_LWCOND_DESTROY              112
+#define SYS_LWCOND_CREATE               111   /* _sys_lwcond_create; writes *lwcond_id */
+#define SYS_LWCOND_DESTROY              112   /* _sys_lwcond_destroy */
 #define SYS_LWCOND_WAIT                 113   /* _sys_lwcond_queue_wait */
-#define SYS_LWCOND_SIGNAL               115
-#define SYS_LWCOND_SIGNAL_ALL           116
+#define SYS_LWCOND_SIGNAL               115   /* _sys_lwcond_signal */
+#define SYS_LWCOND_SIGNAL_ALL           116   /* _sys_lwcond_signal_all */
+#define SYS_LWMUTEX_UNLOCK2             117   /* _sys_lwmutex_unlock2; RPCS3 lv2.cpp; was CELL_OK stub */
 
 /* Timer */
 #define SYS_TIMER_CREATE                70
@@ -139,6 +141,8 @@ extern uint32_t g_ps3_sdk_version;
 #define SYS_TIMER_SLEEP                 142
 
 /* Time */
+#define SYS_TIME_SET_TIMEZONE           143
+#define SYS_TIME_GET_TIMEZONE           144
 #define SYS_TIME_GET_CURRENT_TIME       145
 #define SYS_TIME_GET_TIMEBASE_FREQUENCY 147
 
@@ -226,14 +230,28 @@ extern uint32_t g_ps3_sdk_version;
 #define SYS_FS_CLOSEDIR                 807
 #define SYS_FS_STAT                     808
 #define SYS_FS_FSTAT                    809
+#define SYS_FS_LINK                     810
 #define SYS_FS_MKDIR                    811
 #define SYS_FS_RENAME                   812
 #define SYS_FS_RMDIR                    813
 #define SYS_FS_UNLINK                   814
+#define SYS_FS_UTIME                    815
+#define SYS_FS_ACCESS                   816  /* path + POSIX/st_mode bits; no ByFd */
+#define SYS_FS_FCNTL                    817
 #define SYS_FS_LSEEK                    818
-#define SYS_FS_FTRUNCATE                820
+#define SYS_FS_FDATASYNC                819
+#define SYS_FS_FSYNC                    820
+#define SYS_FS_TRUNCATE                 831
+#define SYS_FS_FTRUNCATE                832
+#define SYS_FS_SYMLINK                  833  /* target, linkpath — POSIX order; no ByFd */
+#define SYS_FS_CHMOD                    834
+#define SYS_FS_CHOWN                    835  /* path, uid, gid — no ByFd */
+/* 840/841: this port's GetBlockSize numbers (RPCS3 uses 821/822; 840 is disk_free). */
 #define SYS_FS_FGET_BLOCK_SIZE          840
 #define SYS_FS_GET_BLOCK_SIZE           841
+/* 845/846 stay RPCS3/lv2 mapped allocate/free (0x34D/0x34E). Not remapped. */
+#define SYS_FS_MAPPED_ALLOCATE          845
+#define SYS_FS_MAPPED_FREE              846
 
 /* Misc */
 #define SYS_TTY_READ                    402
