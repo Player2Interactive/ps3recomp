@@ -2,7 +2,11 @@
  * ps3recomp - cellSaveData HLE implementation
  *
  * Game save data management with callback-driven flow.
- * Save data is stored under: {root}/gamedata/dev_hdd0/home/00000001/savedata/{dirName}/
+ * Save data is stored under the host /dev_hdd0 mount:
+ *   $PS3_HDD0_ROOT/home/00000001/savedata/{dirName}/
+ * falling back to game/hdd0/... when that tree exists (cwd), else the
+ * compiled-in ./gamedata/... path. Parents are created; the per-title
+ * save folder itself is not, so first-run funcStat still sees isNewData=1.
  */
 
 #include "cellSaveData.h"
@@ -50,7 +54,10 @@
  * Internal helpers
  * -----------------------------------------------------------------------*/
 
-static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
+#define SAVEDATA_DEFAULT_ROOT "./gamedata/dev_hdd0/home/00000001/savedata"
+static char s_save_root[1024] = SAVEDATA_DEFAULT_ROOT;
+static int s_save_root_resolved;
+static void savedata_resolve_root(void);
 
 /* Ensure directory (and parents) exist */
 static void ensure_dirs(const char* path)
@@ -72,6 +79,7 @@ static void ensure_dirs(const char* path)
 
 static void build_save_path(char* buf, size_t buf_size, const char* dirName)
 {
+    savedata_resolve_root();
     snprintf(buf, buf_size, "%s/%s", s_save_root, dirName);
 #ifdef _WIN32
     for (char* p = buf; *p; p++) {
@@ -101,6 +109,58 @@ static int dir_exists(const char* path)
 #else
     return S_ISDIR(st.st_mode);
 #endif
+}
+
+/* Seed the firmware home tree (not the per-title save folder). Empty
+ * BCUS98124-AUTOSAVE would make isNewData=0 with fileNum=0 and look broken. */
+static void savedata_seed_home(const char* hdd0)
+{
+    static const char* k_tails[] = {
+        "/home/00000001/savedata",
+        "/home/00000001/trophy",
+        "/home/00000001/exdata",
+    };
+    char path[1024];
+    for (size_t i = 0; i < sizeof k_tails / sizeof k_tails[0]; i++) {
+        snprintf(path, sizeof path, "%s%s", hdd0, k_tails[i]);
+        ensure_dirs(path);
+    }
+}
+
+static void savedata_slash(char* p)
+{
+    for (; p && *p; p++)
+        if (*p == '\\') *p = '/';
+}
+
+/* Map onto game/hdd0 (or $PS3_HDD0_ROOT) so cellSaveData and the VFS share a
+ * tree. Tests strcpy s_save_root before any call and keep that override. */
+static void savedata_resolve_root(void)
+{
+    if (s_save_root_resolved)
+        return;
+    s_save_root_resolved = 1;
+    if (strcmp(s_save_root, SAVEDATA_DEFAULT_ROOT) != 0)
+        return;
+
+    const char* hdd0 = getenv("PS3_HDD0_ROOT");
+    if (hdd0 && *hdd0) {
+        snprintf(s_save_root, sizeof s_save_root, "%s/home/00000001/savedata", hdd0);
+    } else if (dir_exists("game/hdd0")) {
+        snprintf(s_save_root, sizeof s_save_root, "game/hdd0/home/00000001/savedata");
+        hdd0 = "game/hdd0";
+    } else {
+        hdd0 = NULL;
+    }
+    savedata_slash(s_save_root);
+    if (hdd0) {
+        char host[1024];
+        snprintf(host, sizeof host, "%s", hdd0);
+        savedata_slash(host);
+        savedata_seed_home(host);
+    }
+    ensure_dirs(s_save_root);
+    printf("[cellSaveData] save root (host): %s\n", s_save_root);
 }
 
 /* ---------------------------------------------------------------------------
@@ -373,6 +433,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
 {
     u32 count = 0;
 
+    savedata_resolve_root();
     ensure_dirs(s_save_root);
 
 #ifdef _WIN32
@@ -700,6 +761,7 @@ static s32 savedata_execute(const char* dirName, int is_save,
     if (!dirName || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
+    savedata_resolve_root();
     char save_path[1024];
     build_save_path(save_path, sizeof(save_path), dirName);
 
@@ -1051,6 +1113,19 @@ s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
     return savedata_fixed(0, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
 }
 
+s32 cellSaveDataListAutoSave(u32 version, u32 errDialog,
+                            CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                            CellSaveDataFixedCallback funcFixed,
+                            CellSaveDataStatCallback funcStat,
+                            CellSaveDataFileCallback funcFile,
+                            u32 container, void* userdata)
+{
+    (void)container;
+    if (errDialog > 2) return CELL_SAVEDATA_ERROR_PARAM;
+    printf("[cellSaveData] ListAutoSave(version=%u)\n", version);
+    return savedata_fixed(1, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
+}
+
 s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
                            u32 errDialog,
                            CellSaveDataSetBuf* setBuf,
@@ -1296,6 +1371,53 @@ s32 cellSaveDataUserAutoSave(u32 version, u32 userId, const char* dirName,
                                 funcStat, funcFile, container, NULL);
 }
 
+/* 8-reg fallbacks: userdata lives on the guest stack (arg9 for UserListSave/
+ * Load, arg10 for UserListAuto*). Ctx handlers below override these on the
+ * NID path. ACIT branches on userId!=0 from ListSave2/ListLoad2/ListAuto*. */
+s32 cellSaveDataUserListSave(u32 version, u32 userId,
+                             CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                             CellSaveDataListCallback funcList,
+                             CellSaveDataStatCallback funcStat,
+                             CellSaveDataFileCallback funcFile, u32 container)
+{
+    printf("[cellSaveData] UserListSave(user=%u) [8-arg path: userdata unavailable]\n", userId);
+    return cellSaveDataListSave2(version, setList, setBuf, funcList, funcStat,
+                                 funcFile, container, NULL);
+}
+
+s32 cellSaveDataUserListLoad(u32 version, u32 userId,
+                             CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                             CellSaveDataListCallback funcList,
+                             CellSaveDataStatCallback funcStat,
+                             CellSaveDataFileCallback funcFile, u32 container)
+{
+    printf("[cellSaveData] UserListLoad(user=%u) [8-arg path: userdata unavailable]\n", userId);
+    return cellSaveDataListLoad2(version, setList, setBuf, funcList, funcStat,
+                                 funcFile, container, NULL);
+}
+
+s32 cellSaveDataUserListAutoSave(u32 version, u32 userId, u32 errDialog,
+                                 CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                                 CellSaveDataFixedCallback funcFixed,
+                                 CellSaveDataStatCallback funcStat,
+                                 CellSaveDataFileCallback funcFile)
+{
+    printf("[cellSaveData] UserListAutoSave(user=%u) [8-arg path: userdata unavailable]\n", userId);
+    return cellSaveDataListAutoSave(version, errDialog, setList, setBuf,
+                                    funcFixed, funcStat, funcFile, 0, NULL);
+}
+
+s32 cellSaveDataUserListAutoLoad(u32 version, u32 userId, u32 errDialog,
+                                 CellSaveDataSetList* setList, CellSaveDataSetBuf* setBuf,
+                                 CellSaveDataFixedCallback funcFixed,
+                                 CellSaveDataStatCallback funcStat,
+                                 CellSaveDataFileCallback funcFile)
+{
+    printf("[cellSaveData] UserListAutoLoad(user=%u) [8-arg path: userdata unavailable]\n", userId);
+    return cellSaveDataListAutoLoad(version, errDialog, setList, setBuf,
+                                    funcFixed, funcStat, funcFile, 0, NULL);
+}
+
 /* NOTE: the User* entry points take NINE arguments -- cellSaveDataUserAutoLoad
  * inserts `userId` ahead of dirName, which pushes `userdata` into the ninth
  * slot. The generic HLE adapter only forwards r3..r10 (eight), so the ninth
@@ -1327,24 +1449,35 @@ extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_
  * parameter save area shadowing r3.. one doubleword each -> arg9 at SP+112. */
 #define SAVEDATA_ARG9_SP_OFF 112u
 
-static uint32_t savedata_arg9(ppu_context* ctx)
+static int savedata_arg9_off(void)
 {
-    uint32_t sp = (uint32_t)ctx->gpr[1];
     static int off = -1;
     if (off < 0) {
         const char* e = getenv("PS3_SAVEDATA_ARG9_OFF");
         off = e ? (int)strtol(e, NULL, 0) : (int)SAVEDATA_ARG9_SP_OFF;
     }
-    { static int dumped = 0;
-      if (!dumped) { dumped = 1;
-        printf("[cellSaveData] caller SP=0x%08X param-save-area window:\n", sp);
-        for (uint32_t o = 48; o <= 136; o += 8)
-            printf("    SP+%3u = 0x%016llX%s\n", o,
-                   (unsigned long long)vm_read64(sp + o),
-                   o == (uint32_t)off ? "   <- taking as arg9 (userdata)" : "");
-      } }
-    return (uint32_t)vm_read64(sp + (uint32_t)off);
+    return off;
 }
+
+static uint32_t savedata_stack_arg(ppu_context* ctx, unsigned extra)
+{
+    uint32_t sp = (uint32_t)ctx->gpr[1];
+    int off = savedata_arg9_off();
+    if (extra == 0) {
+        static int dumped = 0;
+        if (!dumped) { dumped = 1;
+            printf("[cellSaveData] caller SP=0x%08X param-save-area window:\n", sp);
+            for (uint32_t o = 48; o <= 136; o += 8)
+                printf("    SP+%3u = 0x%016llX%s\n", o,
+                       (unsigned long long)vm_read64(sp + o),
+                       o == (uint32_t)off ? "   <- taking as arg9" : "");
+        }
+    }
+    return (uint32_t)vm_read64(sp + (uint32_t)off + extra * 8u);
+}
+
+static uint32_t savedata_arg9(ppu_context* ctx) { return savedata_stack_arg(ctx, 0); }
+static uint32_t savedata_arg10(ppu_context* ctx) { return savedata_stack_arg(ctx, 1); }
 
 static void hle_cellSaveDataUserAutoLoad(ppu_context* ctx)
 {
@@ -1380,12 +1513,100 @@ void ps3_savedata_list_auto_load(ppu_context* ctx)
         (u32)ctx->gpr[10], (void*)(uintptr_t)savedata_arg9(ctx));
 }
 
+void ps3_savedata_list_auto_save(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(int64_t)cellSaveDataListAutoSave(
+        (u32)ctx->gpr[3], (u32)ctx->gpr[4],
+        (CellSaveDataSetList*)(uintptr_t)(u32)ctx->gpr[5],
+        (CellSaveDataSetBuf*)(uintptr_t)(u32)ctx->gpr[6],
+        (CellSaveDataFixedCallback)(uintptr_t)(u32)ctx->gpr[7],
+        (CellSaveDataStatCallback)(uintptr_t)(u32)ctx->gpr[8],
+        (CellSaveDataFileCallback)(uintptr_t)(u32)ctx->gpr[9],
+        (u32)ctx->gpr[10], (void*)(uintptr_t)savedata_arg9(ctx));
+}
+
+/* UserListSave/Load: version, userId, setList, setBuf, funcList, funcStat,
+ * funcFile, container, userdata(arg9). RPCS3 names omit the "2" suffix. */
+void ps3_savedata_user_list_save(ppu_context* ctx)
+{
+    u32 userId = (u32)ctx->gpr[4];
+    u32 userdata = savedata_arg9(ctx);
+    printf("[cellSaveData] UserListSave(user=%u, userdata=0x%08X)\n", userId, userdata);
+    ctx->gpr[3] = (uint64_t)(int64_t)cellSaveDataListSave2(
+        (u32)ctx->gpr[3],
+        (CellSaveDataSetList*)(uintptr_t)(u32)ctx->gpr[5],
+        (CellSaveDataSetBuf*)(uintptr_t)(u32)ctx->gpr[6],
+        (CellSaveDataListCallback)(uintptr_t)(u32)ctx->gpr[7],
+        (CellSaveDataStatCallback)(uintptr_t)(u32)ctx->gpr[8],
+        (CellSaveDataFileCallback)(uintptr_t)(u32)ctx->gpr[9],
+        (u32)ctx->gpr[10], (void*)(uintptr_t)userdata);
+}
+
+void ps3_savedata_user_list_load(ppu_context* ctx)
+{
+    u32 userId = (u32)ctx->gpr[4];
+    u32 userdata = savedata_arg9(ctx);
+    printf("[cellSaveData] UserListLoad(user=%u, userdata=0x%08X)\n", userId, userdata);
+    ctx->gpr[3] = (uint64_t)(int64_t)cellSaveDataListLoad2(
+        (u32)ctx->gpr[3],
+        (CellSaveDataSetList*)(uintptr_t)(u32)ctx->gpr[5],
+        (CellSaveDataSetBuf*)(uintptr_t)(u32)ctx->gpr[6],
+        (CellSaveDataListCallback)(uintptr_t)(u32)ctx->gpr[7],
+        (CellSaveDataStatCallback)(uintptr_t)(u32)ctx->gpr[8],
+        (CellSaveDataFileCallback)(uintptr_t)(u32)ctx->gpr[9],
+        (u32)ctx->gpr[10], (void*)(uintptr_t)userdata);
+}
+
+/* UserListAuto*: version, userId, errDialog, setList, setBuf, funcFixed,
+ * funcStat, funcFile, container(arg9), userdata(arg10). */
+void ps3_savedata_user_list_auto_save(ppu_context* ctx)
+{
+    u32 userId = (u32)ctx->gpr[4];
+    u32 container = savedata_arg9(ctx);
+    u32 userdata = savedata_arg10(ctx);
+    printf("[cellSaveData] UserListAutoSave(user=%u, userdata=0x%08X)\n", userId, userdata);
+    ctx->gpr[3] = (uint64_t)(int64_t)cellSaveDataListAutoSave(
+        (u32)ctx->gpr[3], (u32)ctx->gpr[5],
+        (CellSaveDataSetList*)(uintptr_t)(u32)ctx->gpr[6],
+        (CellSaveDataSetBuf*)(uintptr_t)(u32)ctx->gpr[7],
+        (CellSaveDataFixedCallback)(uintptr_t)(u32)ctx->gpr[8],
+        (CellSaveDataStatCallback)(uintptr_t)(u32)ctx->gpr[9],
+        (CellSaveDataFileCallback)(uintptr_t)(u32)ctx->gpr[10],
+        container, (void*)(uintptr_t)userdata);
+}
+
+void ps3_savedata_user_list_auto_load(ppu_context* ctx)
+{
+    u32 userId = (u32)ctx->gpr[4];
+    u32 container = savedata_arg9(ctx);
+    u32 userdata = savedata_arg10(ctx);
+    printf("[cellSaveData] UserListAutoLoad(user=%u, userdata=0x%08X)\n", userId, userdata);
+    ctx->gpr[3] = (uint64_t)(int64_t)cellSaveDataListAutoLoad(
+        (u32)ctx->gpr[3], (u32)ctx->gpr[5],
+        (CellSaveDataSetList*)(uintptr_t)(u32)ctx->gpr[6],
+        (CellSaveDataSetBuf*)(uintptr_t)(u32)ctx->gpr[7],
+        (CellSaveDataFixedCallback)(uintptr_t)(u32)ctx->gpr[8],
+        (CellSaveDataStatCallback)(uintptr_t)(u32)ctx->gpr[9],
+        (CellSaveDataFileCallback)(uintptr_t)(u32)ctx->gpr[10],
+        container, (void*)(uintptr_t)userdata);
+}
+
 void cellSaveData_register_ctx_handlers(void)
 {
     /* Overrides the generated 8-arg registration: ctx handlers are dispatched
      * before the generic table. */
     ps3_hle_register_ctx(0xCDC6AEFDu, "cellSaveDataUserAutoLoad",
                          hle_cellSaveDataUserAutoLoad);
+    ps3_hle_register_ctx(0x4DD03A4Eu, "cellSaveDataListAutoSave",
+                         ps3_savedata_list_auto_save);
+    ps3_hle_register_ctx(0x0E091C36u, "cellSaveDataUserListAutoSave",
+                         ps3_savedata_user_list_auto_save);
+    ps3_hle_register_ctx(0x0F03CFB0u, "cellSaveDataUserListSave",
+                         ps3_savedata_user_list_save);
+    ps3_hle_register_ctx(0x248BD1D8u, "cellSaveDataUserListAutoLoad",
+                         ps3_savedata_user_list_auto_load);
+    ps3_hle_register_ctx(0x39DD8425u, "cellSaveDataUserListLoad",
+                         ps3_savedata_user_list_load);
 }
 
 s32 cellSaveDataUserAutoLoad(u32 version, u32 userId, const char* dirName,

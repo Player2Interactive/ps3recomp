@@ -383,6 +383,8 @@ if(UNIX)
                     --out "${SMOKE_GEN}/ppu_hle_nids.cpp" --all
             DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_hle_nids.py"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/nid_database.py"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/libs/system/cellSaveData.c"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/libs/system/cellGame.c"
             COMMENT "Generating the HLE NID -> handler table")
 
         add_executable(ps3recomp_boot_smoke
