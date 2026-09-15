@@ -45,10 +45,15 @@ int     lv2_deadline_passed(int64_t deadline); /* 1 once QPC >= deadline */
 
 #define SYS_TIMER_MAX  64
 
+/* SDK / RPCS3 sys_timer_information_t.timer_state */
+#define SYS_TIMER_STATE_STOP  0u
+#define SYS_TIMER_STATE_RUN   1u
+
 typedef struct sys_timer_info {
     int      active;
     int      running;
     uint64_t period_usec;
+    int64_t  next_expire;      /* system_time_t usec; unused when stopped */
     int32_t  event_queue_id;   /* connected event queue */
     uint64_t source;           /* event source value */
     uint64_t data1;            /* event data1 */
@@ -72,9 +77,11 @@ extern sys_timer_info g_sys_timers[SYS_TIMER_MAX];
 int64_t sys_timer_usleep(ppu_context* ctx);
 int64_t sys_timer_sleep(ppu_context* ctx);
 int64_t sys_time_get_current_time(ppu_context* ctx);
+int64_t sys_time_get_timezone(ppu_context* ctx);
 int64_t sys_time_get_timebase_frequency(ppu_context* ctx);
 int64_t sys_timer_create(ppu_context* ctx);
 int64_t sys_timer_destroy(ppu_context* ctx);
+int64_t sys_timer_get_information(ppu_context* ctx);
 int64_t sys_timer_start(ppu_context* ctx);
 int64_t sys_timer_stop(ppu_context* ctx);
 int64_t sys_timer_connect_event_queue(ppu_context* ctx);

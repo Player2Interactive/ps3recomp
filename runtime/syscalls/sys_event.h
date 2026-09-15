@@ -83,6 +83,7 @@ extern sys_event_queue_info g_sys_event_queues[SYS_EVENT_QUEUE_MAX];
 #define SYS_EVENT_PORT_MAX  256
 
 #define SYS_EVENT_PORT_LOCAL  1
+#define SYS_EVENT_PORT_IPC    3   /* unofficial SDK name; RPCS3 sys_event.h */
 
 typedef struct sys_event_port_info {
     int      active;
@@ -110,6 +111,8 @@ typedef struct sys_event_flag_info {
     uint32_t type;       /* single / multi waiter */
     char     name[8];
     uint64_t pattern;    /* 64-bit flag word */
+    int      waiters;    /* threads currently blocked in wait */
+    uint32_t cancel_gen; /* bumped by sys_event_flag_cancel */
 
 #ifdef _WIN32
     CRITICAL_SECTION lock;
@@ -136,6 +139,7 @@ int64_t sys_event_queue_drain(ppu_context* ctx);
 int64_t sys_event_port_create(ppu_context* ctx);
 int64_t sys_event_port_destroy(ppu_context* ctx);
 int64_t sys_event_port_connect_local(ppu_context* ctx);
+int64_t sys_event_port_connect_ipc(ppu_context* ctx);
 int64_t sys_event_port_disconnect(ppu_context* ctx);
 int64_t sys_event_port_send(ppu_context* ctx);
 
@@ -146,6 +150,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx);
 int64_t sys_event_flag_trywait(ppu_context* ctx);
 int64_t sys_event_flag_set(ppu_context* ctx);
 int64_t sys_event_flag_clear(ppu_context* ctx);
+int64_t sys_event_flag_cancel(ppu_context* ctx);
 int64_t sys_event_flag_get(ppu_context* ctx);
 
 /* Registration */

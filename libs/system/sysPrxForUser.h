@@ -167,7 +167,8 @@ s32   _sys_heap_free(sys_heap_t heap, void* ptr);
  * PRX utilities
  * -----------------------------------------------------------------------*/
 
-s32 sys_prx_exitspawn_with_level(void);
+/* NID 0xA2C7BA64. r3 is a PRX stop/interrupt level, not a path. */
+s32 sys_prx_exitspawn_with_level(s32 level);
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id);
 
 /* ---------------------------------------------------------------------------

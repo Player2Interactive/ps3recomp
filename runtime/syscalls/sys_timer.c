@@ -99,6 +99,20 @@ static void write_be64(uint32_t addr, uint64_t val)
     *p = val;
 }
 
+static int64_t sys_timer_now_usec(void)
+{
+#ifdef _WIN32
+    ensure_qpc_init();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (int64_t)((uint64_t)now.QuadPart * 1000000ULL / (uint64_t)s_qpc_freq.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000LL + (int64_t)ts.tv_nsec / 1000LL;
+#endif
+}
+
 /* ---------------------------------------------------------------------------
  * sys_timer_usleep
  *
@@ -202,6 +216,26 @@ int64_t sys_timer_sleep(ppu_context* ctx)
     sleep(sec);
 #endif
 
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_time_get_timezone (lv2 144)
+ *
+ * r3 = s32* timezone, minutes from UTC
+ * r4 = s32* summertime, 0 or 1
+ * Matches cellSysutil TIMEZONE/SUMMERTIME (UTC, no DST).
+ * -----------------------------------------------------------------------*/
+int64_t sys_time_get_timezone(ppu_context* ctx)
+{
+    uint32_t tz_addr  = LV2_ARG_PTR(ctx, 0);
+    uint32_t dst_addr = LV2_ARG_PTR(ctx, 1);
+
+    if (tz_addr == 0 || dst_addr == 0)
+        return (int64_t)(int32_t)CELL_EFAULT;
+
+    write_be32(tz_addr, 0);
+    write_be32(dst_addr, 0);
     return CELL_OK;
 }
 
@@ -328,6 +362,9 @@ static void timer_send_event(sys_timer_info* t)
     evt.data1  = t->data1;
     evt.data2  = 0;
     evt.data3  = 0;
+
+    if (t->period_usec)
+        t->next_expire += (int64_t)t->period_usec;
 
     /* Push event (ignore if queue full) */
 #ifdef _WIN32
@@ -515,6 +552,7 @@ int64_t sys_timer_start(ppu_context* ctx)
 
     t->period_usec = period;
     t->running     = 1;
+    t->next_expire = sys_timer_now_usec() + (int64_t)period;
 
 #ifdef _WIN32
     t->stop_event    = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -571,6 +609,47 @@ int64_t sys_timer_stop(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
+ * sys_timer_get_information (lv2 72)
+ *
+ * r3 = timer_id
+ * r4 = sys_timer_information_t*  (SDK / RPCS3, 24 bytes BE)
+ *        s64 next_expire   system_time_t usec of next fire (0 if stopped)
+ *        s64 period        period usec (0 if stopped)
+ *        u32 timer_state   SYS_TIMER_STATE_STOP=0 / RUN=1
+ *        u32 pad
+ * -----------------------------------------------------------------------*/
+int64_t sys_timer_get_information(ppu_context* ctx)
+{
+    uint32_t timer_id  = LV2_ARG_U32(ctx, 0);
+    uint32_t info_addr = LV2_ARG_PTR(ctx, 1);
+
+    if (info_addr == 0)
+        return (int64_t)(int32_t)CELL_EFAULT;
+
+    if (timer_id == 0 || timer_id > SYS_TIMER_MAX)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    sys_timer_info* t = &g_sys_timers[timer_id - 1];
+    if (!t->active)
+        return (int64_t)(int32_t)CELL_ESRCH;
+
+    int64_t next_expire = 0;
+    int64_t period      = 0;
+    uint32_t state      = SYS_TIMER_STATE_STOP;
+    if (t->running) {
+        next_expire = t->next_expire;
+        period      = (int64_t)t->period_usec;
+        state       = SYS_TIMER_STATE_RUN;
+    }
+
+    write_be64(info_addr + 0,  (uint64_t)next_expire);
+    write_be64(info_addr + 8,  (uint64_t)period);
+    write_be32(info_addr + 16, state);
+    write_be32(info_addr + 20, 0);
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
  * Registration
  *
  * NOTE: There are syscall number collisions in the existing table:
@@ -592,6 +671,7 @@ void sys_timer_init(lv2_syscall_table* tbl)
 
     lv2_syscall_register(tbl, SYS_TIMER_CREATE,                   sys_timer_create);
     lv2_syscall_register(tbl, SYS_TIMER_DESTROY,                  sys_timer_destroy);
+    lv2_syscall_register(tbl, SYS_TIMER_GET_INFORMATION,          sys_timer_get_information);
     lv2_syscall_register(tbl, SYS_TIMER_START,                    sys_timer_start);
     lv2_syscall_register(tbl, SYS_TIMER_STOP,                     sys_timer_stop);
     lv2_syscall_register(tbl, SYS_TIMER_CONNECT_EVENT_QUEUE,      sys_timer_connect_event_queue);
@@ -607,5 +687,6 @@ void sys_timer_init(lv2_syscall_table* tbl)
     /* Register these but be aware of collisions */
     lv2_syscall_register(tbl, SYS_TIMER_USLEEP,            sys_timer_usleep);
     lv2_syscall_register(tbl, SYS_TIMER_SLEEP,             sys_timer_sleep);
+    lv2_syscall_register(tbl, SYS_TIME_GET_TIMEZONE,       sys_time_get_timezone);
     lv2_syscall_register(tbl, SYS_TIME_GET_CURRENT_TIME,   sys_time_get_current_time);
 }

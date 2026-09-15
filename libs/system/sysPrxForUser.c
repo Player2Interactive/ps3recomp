@@ -1034,9 +1034,36 @@ s32 _sys_heap_free(sys_heap_t heap, void* ptr)
  * PRX utilities
  * -----------------------------------------------------------------------*/
 
-s32 sys_prx_exitspawn_with_level(void)
+/* NID 0xA2C7BA64. liblv2 userland (not an LV2 syscall). RPCS3's HLE is
+ * `error_code sys_prx_exitspawn_with_level() { todo; return CELL_OK; }` with
+ * no path and no spawn. PSL1GHT exports the same NID as both
+ * sysPrxExitSpawnWithLevel and sysProcessExitSpawnWithLevel.
+ *
+ * r3 is a PRX *stop/interrupt level*. Firmware walks loaded modules and runs
+ * stop entries with stop_level >= r3. ACIT's only caller is the CRT wrapper
+ * at 0x000102C8, which stores r3=0 and bl's the import — never a filesystem
+ * path and never an Insomniac game-level id. Sysmodules here are HLE, so the
+ * stop walk is empty and CELL_OK is the honest result.
+ *
+ * A guest pointer in r3 would be a surprise: log it, do not spawn (this
+ * recompiler has one ELF), still CELL_OK. Do not swallow the later
+ * sys_process_exit(1) — that abort is from unresolved 0x0051977C. */
+s32 sys_prx_exitspawn_with_level(s32 level)
 {
-    printf("[sysPrxForUser] sys_prx_exitspawn_with_level() - no-op\n");
+    u32 r3 = (u32)level;
+    const char* path = 0;
+    if (r3 >= 0x00010000u && r3 < 0x10000000u && vm_base) {
+        const char* s = (const char*)(vm_base + r3);
+        if (s[0] == '/' || s[0] == '.')
+            path = s;
+    }
+    if (path) {
+        printf("[sysPrxForUser] sys_prx_exitspawn_with_level(r3=0x%08X path='%s') -- unexpected path; no spawn, CELL_OK\n",
+               r3, path);
+    } else {
+        printf("[sysPrxForUser] sys_prx_exitspawn_with_level(level=%d) -- PRX stop-level, no path, CELL_OK\n",
+               (int)level);
+    }
     return CELL_OK;
 }
 
