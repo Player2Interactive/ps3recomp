@@ -141,6 +141,15 @@ static inline void spu_ls_watch_hit(uint32_t lsa, int is_write, const uint8_t* p
 #define MFC_PUTQLLUC_CMD    0xB8   /* queued store unconditional              */
 #define MFC_ATOMIC_LINE     128
 
+/* MFC_RdAtomicStat (ch 27) after an atomic command. Cell SDK / gcc
+ * spu_mfcio.h: GETLLAR completion is bit 2 (value 4), not 0. Helper 173
+ * (job_00b9b580) GETLLAR-loops with `rdch; brz` and never leaves if this
+ * stays 0. PUTLLC still uses bit 0: 0 = committed, 1 = reservation lost. */
+#define MFC_PUTLLC_SUCCESS   0u
+#define MFC_PUTLLC_FAILURE   1u
+#define MFC_PUTLLUC_SUCCESS  2u
+#define MFC_GETLLAR_SUCCESS  4u
+
 /* ---------------------------------------------------------------------------
  * Channel state
  * -----------------------------------------------------------------------*/

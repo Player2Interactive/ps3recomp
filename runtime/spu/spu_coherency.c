@@ -77,6 +77,15 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
     s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
+    /* Overlay-12 GETLLAR is on IO 20020880; packer stw liveB at RAM twin
+     * 00FC7D80. Mark the twin so VM_WRITE_COH notifies this reservation. */
+    {
+        uint32_t twin = ovl12_io_to_ram(ea & ~127u);
+        if (twin) {
+            uint32_t tline = twin >> SPU_COH_LINE_SHIFT;
+            s_coh_bitmap[tline >> 3] |= (unsigned char)(1u << (tline & 7));
+        }
+    }
     s_coh_armed = 1;
 
     if (!ctx) return;
@@ -104,18 +113,23 @@ int spu_coh_is_reserved(uint32_t addr)
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
+    uint32_t extra = ovl12_ram_to_io(line);
+    if (!extra)
+        extra = ovl12_io_to_ram(line);
     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
         spu_context* c = s_coh_ctxs[i];
         if (!c) continue;
-        if (c->resv_valid && (c->resv_ea & ~127u) == line) {
-            c->event_status |= SPU_EVENT_LR;
-            c->resv_valid = 0;          /* reservation lost, PUTLLC must fail */
-            g_spu_lr_raise++;
-            /* The event_status store has to be visible before the wake. The
-             * waiter re-polls its predicate on a timeout as well, so a
-             * straggling store costs latency and not the wakeup itself. */
-            spu_ch_wake(c);
-        }
+        if (!c->resv_valid) continue;
+        uint32_t rline = c->resv_ea & ~127u;
+        if (rline != line && (!extra || rline != extra))
+            continue;
+        c->event_status |= SPU_EVENT_LR;
+        c->resv_valid = 0;          /* reservation lost, PUTLLC must fail */
+        g_spu_lr_raise++;
+        /* The event_status store has to be visible before the wake. The
+         * waiter re-polls its predicate on a timeout as well, so a
+         * straggling store costs latency and not the wakeup itself. */
+        spu_ch_wake(c);
     }
 }
 

@@ -36,6 +36,27 @@ extern "C" {
 /* SPU external event: lock-line reservation lost. */
 #define SPU_EVENT_LR  0x400u
 
+/* Overlay-12 cmd 00FBE6C0: IO 20020600 aliases RAM live heads 00FC7B00
+ * (sig<<7). Idle GETLLAR waits on 20020880; packer 00695E84 stw liveB at
+ * 00FC7D80. Linear map: RAM = 00FC7B00 + (IO - 20020600). */
+#define OVL12_IO_BASE     0x20020600u
+#define OVL12_RAM_BASE    0x00FC7B00u
+#define OVL12_ALIAS_SPAN  0x500u
+
+static inline uint32_t ovl12_io_to_ram(uint32_t ea)
+{
+    if (ea >= OVL12_IO_BASE && ea < OVL12_IO_BASE + OVL12_ALIAS_SPAN)
+        return OVL12_RAM_BASE + (ea - OVL12_IO_BASE);
+    return 0;
+}
+
+static inline uint32_t ovl12_ram_to_io(uint32_t ea)
+{
+    if (ea >= OVL12_RAM_BASE && ea < OVL12_RAM_BASE + OVL12_ALIAS_SPAN)
+        return OVL12_IO_BASE + (ea - OVL12_RAM_BASE);
+    return 0;
+}
+
 /* The lock-line lock. One process-wide spinlock serializing every lock-line
  * transaction, SPU and PPU alike: the SPU's GETLLAR snapshot and PUTLLC
  * compare-and-commit, and a PPU store or stwcx to a line some SPU has
