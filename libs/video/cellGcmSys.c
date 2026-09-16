@@ -507,6 +507,12 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     vm_write32(GCM_CONTROL_GUEST_ADDR + 0, 0);
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, 0);
     vm_write32(GCM_CONTROL_GUEST_ADDR + 8, 0);
+    /* Labels live in the inject window (not s_labels[]). Waiters lwz these. */
+    {
+        u32 i;
+        for (i = 0; i < CELL_GCM_MAX_LABEL_COUNT; i++)
+            vm_write32(GCM_LABEL_GUEST_BASE + i * GCM_LABEL_STRIDE, 0);
+    }
 
     s_gcm_initialized = 1;
     cellGcm_fifo_kick();
@@ -786,7 +792,83 @@ unsigned long long ps3_ms_now(void)
 #endif
 }
 
-static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
+static u32 s_sema_offset_406e = 0; /* NV406E SEMAPHORE_OFFSET (byte off in label window) */
+static u32 s_sema_offset_4097 = 0; /* NV4097 SET_SEMAPHORE_OFFSET */
+/* NV4097_BACK_END_WRITE_SEMAPHORE_RELEASE stores this 16-bit-pair swap
+ * (RPCS3 nv4097.cpp). NV406E RELEASE writes the FIFO word as-is. */
+static u32 gcm_sema_backend_swap(u32 arg)
+{
+    return (arg & 0xff00ff00u) | ((arg & 0xffu) << 16) | ((arg >> 16) & 0xffu);
+}
+static u32 s_sema_last_off, s_sema_last_val, s_sema_last_ea;
+static const char* s_sema_last_tag = "";
+static void gcm_sema_store(u32 offset, u32 value, const char* tag)
+{
+    /* index*0x10 byte offset. Labels occupy 4 KB at GetLabelAddress base.
+     * vm_write32 stores big-endian for guest lwz. */
+    u32 off = offset & 0x00FFFFFCu;
+    u32 ea = GCM_LABEL_GUEST_BASE + off;
+    vm_write32(ea, value);
+#ifdef _WIN32
+    MemoryBarrier();
+#endif
+    s_sema_last_off = off;
+    s_sema_last_val = value;
+    s_sema_last_ea = ea;
+    s_sema_last_tag = tag;
+    { static int n = 0;
+      if (n++ < 24)
+          fprintf(stderr, "[cellGcmSys] SEMA %s off=0x%X ea=0x%08X val=0x%08X\n",
+                  tag, off, ea, value); }
+}
+
+void gcm_sema_set_offset(u32 offset) { s_sema_offset_406e = offset & 0x00FFFFFCu; }
+void gcm_sema_release(u32 value) { gcm_sema_store(s_sema_offset_406e, value, "NV406E_RELEASE"); }
+void gcm_sema_release_backend(u32 value)
+{
+    gcm_sema_store(s_sema_offset_4097, gcm_sema_backend_swap(value), "NV4097_BACKEND");
+}
+/* 1 if this method is a semaphore (NV406E 0x60/64/68/6C or NV4097 0x1D6C/1D70/1D74). */
+static int gcm_sema_method(u32 m, u32 v)
+{
+    /* NV406E SEMAPHORE_OFFSET/ACQUIRE/RELEASE and NV4097 SET_SEMAPHORE_OFFSET /
+     * BACK_END_WRITE / TEXTURE_READ. Do not take 0x60/0x1A4: those collide
+     * with leftover FIFO words and are not required to hit GetLabelAddress. */
+    if (m == 0x64u)  { s_sema_offset_406e = v & 0x00FFFFFCu; return 1; }
+    if (m == 0x6Cu)  { gcm_sema_store(s_sema_offset_406e, v, "NV406E_RELEASE"); return 1; }
+    if (m == 0x68u)  { return 1; } /* ACQUIRE: consume; block is opt-in below */
+    if (m == 0x1D6Cu) { s_sema_offset_4097 = v & 0x00FFFFFCu; return 1; }
+    if (m == 0x1D70u) { gcm_sema_store(s_sema_offset_4097, gcm_sema_backend_swap(v),
+                                      "NV4097_BACKEND"); return 1; }
+    if (m == 0x1D74u) { gcm_sema_store(s_sema_offset_4097, v, "NV4097_TEXREAD"); return 1; }
+    return 0;
+}
+
+int gcm_sema_apply(u32 method, u32 data)
+{
+    return gcm_sema_method(method, data);
+}
+
+static void gcm_fifo_scan_sema(u32 from, u32 to)
+{
+    for (u32 io = from; io + 8 <= to; io += 4) {
+        u32 ea = gcm_io2ea(io);
+        u32 w, method, count, i;
+        if (!ea) continue;
+        w = vm_read32(ea);
+        if ((w >> 29) != 0) continue;
+        method = w & 0x1FFCu;
+        if (method != 0x64u && method != 0x68u && method != 0x6Cu &&
+            method != 0x1D6Cu && method != 0x1D70u && method != 0x1D74u)
+            continue;
+        count = (w >> 18) & 0x7FF;
+        for (i = 0; i < count && io + 8 + i * 4 <= to; i++) {
+            u32 dea = gcm_io2ea(io + 4 + i * 4);
+            if (!dea) break;
+            gcm_sema_method(method + i * 4, vm_read32(dea));
+        }
+    }
+}
 /* Backlog past which the drain stops honouring one-flip-per-tick and
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
@@ -1180,7 +1262,11 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
         if (rescued) { static int m = 0; if (m++ < 8)
             fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) from"
                     " 0x%08X..0x%08X\n", rescued, from, put); }
+        gcm_fifo_scan_sema(from, put);
     }
+    /* Do not replay put-0x80 on wrap. That applies ring-head next-gen
+     * RELEASE (0x30000000 / 0x90000000) the walker has not reached yet
+     * and clobbers the current done cookie the waiter still holds. */
     *getoff = put;
 }
 
@@ -1324,6 +1410,69 @@ void cellGcm_on_put_write(u32 put)
 {
     (void)put;
     cellGcm_fifo_kick();
+}
+
+void cellGcm_dump_hang(u32 put, u32 get)
+{
+    static int once = 0;
+    if (once) return;
+    once = 1;
+    fprintf(stderr, "[cellGcmSys] hang dump put=0x%08X get=0x%08X ctx_out=0x%08X "
+            "hle_ctx=0x%08X drained=0x%08X\n",
+            put, get, s_gcm_ctx_out_ea, s_gcm_context_ea, g_gcm_fifo_drained_ea);
+    if (s_gcm_ctx_out_ea) {
+        u32 ctx = vm_read32(s_gcm_ctx_out_ea);
+        fprintf(stderr, "[cellGcmSys] hang gCellGcmCurrentContext -> 0x%08X "
+                "begin=0x%08X end=0x%08X current=0x%08X callback=0x%08X\n",
+                ctx,
+                ctx ? vm_read32(ctx + 0x0) : 0,
+                ctx ? vm_read32(ctx + 0x4) : 0,
+                ctx ? vm_read32(ctx + 0x8) : 0,
+                ctx ? vm_read32(ctx + 0xC) : 0);
+        if (ctx && vm_read32(ctx + 0xC)) {
+            u32 opd = vm_read32(ctx + 0xC);
+            fprintf(stderr, "[cellGcmSys] hang callback OPD func=0x%08X toc=0x%08X\n",
+                    vm_read32(opd + 0x0), vm_read32(opd + 0x4));
+        }
+    }
+    if (s_gcm_context_ea)
+        fprintf(stderr, "[cellGcmSys] hang hle ctx begin=0x%08X end=0x%08X "
+                "current=0x%08X callback=0x%08X\n",
+                vm_read32(s_gcm_context_ea + 0x0),
+                vm_read32(s_gcm_context_ea + 0x4),
+                vm_read32(s_gcm_context_ea + 0x8),
+                vm_read32(s_gcm_context_ea + 0xC));
+    for (int k = -8; k < 8; k++) {
+        u32 io = put + (u32)(k * 4);
+        u32 ea = gcm_io2ea(io);
+        fprintf(stderr, "[cellGcmSys] hang fifo put%+d io=0x%08X ea=0x%08X w=0x%08X\n",
+                k * 4, io, ea, ea ? vm_read32(ea) : 0xDEADDEADu);
+    }
+    {
+        u32 i;
+        for (i = 0x40; i <= 0x45; i++) {
+            u32 ea = GCM_LABEL_GUEST_BASE + i * GCM_LABEL_STRIDE;
+            fprintf(stderr, "[cellGcmSys] hang label idx=0x%X ea=0x%08X val=0x%08X\n",
+                    i, ea, vm_read32(ea));
+        }
+        fprintf(stderr, "[cellGcmSys] hang last SEMA %s off=0x%X ea=0x%08X val=0x%08X "
+                "off406e=0x%X off4097=0x%X\n",
+                s_sema_last_tag, s_sema_last_off, s_sema_last_ea, s_sema_last_val,
+                s_sema_offset_406e, s_sema_offset_4097);
+        {
+            /* ACIT waiter: obj at *(SDA-0x7FF8), cookie at obj+0x488.
+             * HOTREAD r30 is that SDA (0x00CAA3C8 on this title). */
+            u32 sda = 0x00CAA3C8u;
+            u32 obj = vm_read32(sda - 0x7FF8u);
+            fprintf(stderr, "[cellGcmSys] hang waiter obj=0x%08X cookie=0x%08X gen=0x%08X "
+                    "label41=0x%08X\n",
+                    obj,
+                    obj ? vm_read32(obj + 0x488u) : 0,
+                    obj ? vm_read32(obj + 0xBB0u) : 0,
+                    vm_read32(GCM_LABEL_GUEST_BASE + 0x41u * GCM_LABEL_STRIDE));
+        }
+    }
+    fflush(stderr);
 }
 
 /* Guest load of put/get: if the FIFO has work, wake the drain thread and
@@ -1659,41 +1808,43 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                   k << 2, hist[k], tot[k], 10);
                   }
               } }
-            /* NV406E semaphore: OFFSET(0x64) / ACQUIRE(0x68) / RELEASE(0x6C).
-             *
-             * These were falling through to rsx_process_method as "unknown method" --
-             * i.e. no-ops. A title that syncs with cellGcmSetFlipCommandWithWaitLabel and
-             * cellGcmGetLabelAddress (Twisted Metal does both) then waits on a label the
-             * RSX is supposed to write and never sees it move, so it never appends its
-             * next FIFO segment and the GPU sits on a park forever.
-             *
-             * RELEASE writes the value; ACQUIRE stops this drain pass without consuming
-             * the method, so the next pass re-reads it -- which is what the hardware does
-             * while it waits. Semaphore offsets index the same label window
-             * cellGcmGetLabelAddress hands out. */
-            if (subch == 0 && (method == 0x64u || method == 0x68u || method == 0x6Cu)) {
-                int sem_blocked = 0;
+            /* NV406E OFFSET(0x64)/ACQUIRE(0x68)/RELEASE(0x6C) and NV4097
+             * SET_SEMAPHORE_OFFSET(0x1D6C) / BACK_END_WRITE(0x1D70) /
+             * TEXTURE_READ(0x1D74). Sony writes the label at
+             * GetLabelAddress = inject_base + offset (index*0x10).
+             * Any subchannel: ACIT encodes 0x00040064 (subch 0). */
+            if (method == 0x64u || method == 0x68u || method == 0x6Cu ||
+                method == 0x1D6Cu || method == 0x1D70u || method == 0x1D74u) {
                 for (u32 i = 0; i < count; i++) {
                     u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                     if (!dea) break;
                     u32 m = (type == 0) ? method + i * 4 : method;
-                    u32 v = vm_read32(dea);
-                    u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
-                    { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
-                        fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
-                    if (m == 0x64u)      s_sema_offset = v;
-                    else if (m == 0x6Cu) vm_write32(la, v);
-                    else if (m == 0x68u && vm_read32(la) != v) {
-            /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
-             * the hardware does. Off by default: a title whose label nothing
-             * ever writes would wedge the drain permanently, and RELEASE on
-             * its own is the half that unblocks a waiting guest. */
-            static int blk = -1;
-            if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0; }
-            if (blk) { sem_blocked = 1; break; }
-        }
+                    gcm_sema_method(m, vm_read32(dea));
                 }
-                if (sem_blocked) break;
+                s_fifo_getoff += 4 + count * 4;
+                continue;
+            }
+            /* NV4097_GET_REPORT (0x1800): RSX writes CellGcmReportData
+             * {timer, value, pad} to local+offset. ACIT's wrap path
+             * (func_005CB084) emits this then waits; without the write the
+             * waiter can only see leftover FIFO methods at PUT. */
+            if (subch == 0 && method == 0x1800u) {
+                for (u32 i = 0; i < count; i++) {
+                    u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                    if (!dea) break;
+                    u32 v = vm_read32(dea);
+                    u32 off = v & 0x00FFFFFCu;
+                    u32 ea = s_config.localAddress + off;
+                    u64 ts = get_timestamp_ns();
+                    vm_write32(ea + 0, (u32)(ts >> 32));
+                    vm_write32(ea + 4, (u32)ts);
+                    vm_write32(ea + 8, 1u);   /* completed */
+                    vm_write32(ea + 12, 0);
+                    { static int n = 0;
+                      if (n++ < 8)
+                          fprintf(stderr, "[cellGcmSys] GET_REPORT type=%u off=0x%08X "
+                                  "ea=0x%08X\n", (v >> 24) & 0xFFu, off, ea); }
+                }
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
@@ -1924,19 +2075,47 @@ static void gcm_rsx_process_fifo_unlocked(void)
             u32 io_begin = gcm_ea2io(begin);
             if (io_begin != 0xFFFFFFFFu) {
                 u32 jmp_at = (cur + 4 <= end) ? cur : end - 4;
+                u32 io_jmp = gcm_ea2io(jmp_at);
                 vm_write32(jmp_at, 0x20000000u | io_begin);   /* JUMP -> begin */
                 vm_write32(ctx + 0x8, begin);                 /* current = begin */
-                vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
-                s_fifo_getoff = io_begin;                          /* get */
-                put = io_begin;
+                /* PUT past the JUMP, not at begin. PUT=begin equalizes put/get
+                 * at the write head; a title waiting for space (GET off current)
+                 * or for PUT to stay at the JUMP then spins forever. Hardware
+                 * leaves PUT on the JUMP until the next real flush. Do not
+                 * teleport GET -- the walker consumes the tail and follows. */
+                if (io_jmp != 0xFFFFFFFFu) {
+                    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_jmp + 4u);
+                    put = io_jmp + 4u;
+                }
                 static int n = 0;
                 if (n++ < 8)
                     fprintf(stderr, "[cellGcmSys] recycled the title's own ring "
-                            "(ctx=0x%08X begin=0x%08X end=0x%08X) -- its callback "
-                            "does not%c", ctx, begin, end, 10);
+                            "(ctx=0x%08X begin=0x%08X end=0x%08X put=0x%08X) -- its callback "
+                            "does not%c", ctx, begin, end, put, 10);
+            }
+        } else if (s_fifo_getoff == put) {
+            u32 io_begin = begin ? gcm_ea2io(begin) : 0xFFFFFFFFu;
+            u32 io_end = end ? gcm_ea2io(end) : 0xFFFFFFFFu;
+            /* PUT must actually live in this context's ring. ACIT's
+             * gCellGcmCurrentContext stays on the 132 KB default (io_end
+             * 0x21000) while PUT walks a 5 MB ring at 0x0161AF20; treating
+             * any large PUT as "this ring's end" was a false wrap-miss. */
+            if (io_begin != 0xFFFFFFFFu && io_end != 0xFFFFFFFFu &&
+                put >= io_begin && put + 0x1000u >= io_end) {
+                static int miss = 0;
+                if (miss++ < 4)
+                    fprintf(stderr, "[cellGcmSys] wrap miss put=get=0x%08X ctx=0x%08X "
+                            "begin=0x%08X end=0x%08X cur=0x%08X head=%d io_end=0x%08X\n",
+                            put, ctx, begin, end, cur, head_consumed, io_end);
             }
         }
     }
+
+    /* Idle FIFO: last NV406E OFFSET/RELEASE may sit just behind PUT after a
+     * wrap. Replaying them is idempotent and unblocks GetLabelAddress waiters
+     * if the walker skipped the pair. Do not move GET. */
+    if (s_fifo_getoff == put && put >= 0x40u)
+        gcm_fifo_scan_sema(put - 0x40u, put);
 
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
@@ -1994,11 +2173,14 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
                 g_gcm_fifo_drained_ea);
 
-    /* Do what the SDK's default command-buffer-full callback does: append a
-     * JUMP-to-begin at the write head and move `put` to begin. The FIFO walker
-     * consumes the tail, follows the jump, and idles at begin; then it's safe
-     * for the guest to write from begin (that region was consumed long ago). */
+    /* SDK default callback: JUMP at `current`, flush PUT *past* that JUMP, wait
+     * for GET to leave the [begin, begin+reserve) window (GET is still in the
+     * tail while the buffer is full), then set current=begin. Publishing
+     * PUT=begin here was wrong: the walker equalizes get to put at the write
+     * head, and ACIT then HOTREADs PUT forever (put=get=0x0161AF20, method
+     * 00041FCC = NV4097_SET_ATTRIB_TEX_COORD_EX sitting unsubmitted). */
     u32 io_begin = gcm_ea2io(begin);
+    u32 io_cur   = gcm_ea2io(current);
     if (io_begin != 0xFFFFFFFFu) {
         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
         /* The jump has to be in guest memory before `put` moves behind the
@@ -2006,13 +2188,30 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
          * may observe the new `put`, find `get` != `put`, and read the old
          * word at `current` before the jump lands there. */
         atomic_thread_fence(memory_order_release);
-        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
+        if (io_cur != 0xFFFFFFFFu)
+            vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_cur + 4u); /* put = after JUMP */
+        { static int n = 0;
+          if (n++ < 8)
+              fprintf(stderr, "[cellGcmSys] fifo recycle JUMP put=0x%08X "
+                      "begin=0x%08X cur=0x%08X\n",
+                      io_cur != 0xFFFFFFFFu ? io_cur + 4u : io_begin,
+                      begin, current); }
     }
 
-    /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
-     * no commands are lost; a stalled ticker degrades to dropped commands. */
+    /* SDK waits until GET is *not* in the destination window -- while the
+     * buffer is full GET is still in the tail, so writing at `begin` is safe.
+     * Waiting for drained_ea==begin was the opposite: instant drain parked GET
+     * on the write head (put=get=begin) and the producer spun on PUT. */
     int spins = 0;
-    while (g_gcm_fifo_drained_ea != begin && spins < 2000) { Sleep(1); spins++; }
+    for (;;) {
+        u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
+        u32 putv = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+        if (get == putv) break;                         /* empty */
+        if (io_cur != 0xFFFFFFFFu && get >= io_cur) break; /* still in tail */
+        if (get > io_begin + 0x2000u) break;            /* past reserved head */
+        if (++spins >= 2000) break;
+        Sleep(1);
+    }
     if (spins >= 2000) {
         static int warned = 0;
         if (warned++ < 4)
