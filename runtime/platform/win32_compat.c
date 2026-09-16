@@ -31,7 +31,7 @@
 #ifndef _WIN32
 
 #if defined(__linux__) && !defined(_GNU_SOURCE)
-#  define _GNU_SOURCE          /* pthread_setaffinity_np, CPU_SET, REG_RIP */
+#  define _GNU_SOURCE          /* pthread_setaffinity_np / sched_setaffinity, CPU_SET, REG_RIP */
 #endif
 
 #include "win32_compat.h"
@@ -450,16 +450,26 @@ static void apply_priority(pthread_t pt, DWORD tid, int level, int is_self)
 #endif
 }
 
-static void apply_affinity(pthread_t pt, DWORD_PTR mask)
+static void apply_affinity(pthread_t pt, DWORD tid, int is_self, DWORD_PTR mask)
 {
 #if defined(__linux__)
     cpu_set_t set; CPU_ZERO(&set);
     for (unsigned i = 0; i < 8 * sizeof mask && i < CPU_SETSIZE; i++)
         if (mask & ((DWORD_PTR)1 << i)) CPU_SET(i, &set);
+#  if defined(__ANDROID__) || defined(__BIONIC__)
+    /* Bionic has no pthread_setaffinity_np. sched_setaffinity takes a kernel
+     * tid (0 = the caller), which every thread here publishes before it can
+     * be reached through a handle, so the two are interchangeable for us. */
+    if (is_self)  sched_setaffinity(0, sizeof set, &set);
+    else if (tid) sched_setaffinity((pid_t)tid, sizeof set, &set);
+    (void)pt;
+#  else
     pthread_setaffinity_np(pt, sizeof set, &set);
+    (void)tid; (void)is_self;
+#  endif
 #else
     /* Apple Silicon has no thread affinity; QoS (above) is the lever there. */
-    (void)pt; (void)mask;
+    (void)pt; (void)tid; (void)is_self; (void)mask;
 #endif
 }
 
@@ -500,7 +510,7 @@ static void* thread_trampoline(void* p)
     pthread_mutex_unlock(&s_lock);
 
     if (prio != THREAD_PRIORITY_NORMAL) apply_priority(pthread_self(), t->tid, prio, 1);
-    if (aff) apply_affinity(pthread_self(), aff);
+    if (aff) apply_affinity(pthread_self(), t->tid, 1, aff);
 
     DWORD rc = t->fn ? t->fn(t->arg) : (DWORD)t->fn_crt(t->arg);
     t_current_thread = NULL;
@@ -973,7 +983,7 @@ DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
         started = t->started;
         pthread_mutex_unlock(&s_lock);
     }
-    if (started) apply_affinity(pt, mask);
+    if (started) apply_affinity(pt, tid, self, mask);
     return prev;
 }
 
