@@ -424,19 +424,30 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     /* Guard atomic line ops against an uncommitted/garbage EA (e.g. a SPURS
      * policy computing a lock-line address from an incomplete instance context).
      * Same rationale as the DMA EA guard: a bad guest atomic must not segfault
-     * the host. GETLLAR returns a zeroed line (no reservation); PUTLLC fails. */
+     * the host. GETLLAR returns a zeroed line (no reservation); PUTLLC fails.
+     * Overlay-12 GETLLAR of IO 20020880: if the IO window is unmapped, the
+     * occupancy line is RAM 00FC7D80 -- reserve that twin instead of dropping. */
     if (!mfc_ea_range_committed(ea, MFC_ATOMIC_LINE)) {
-        static int s_w = 0;
-        if (s_w++ < 16)
-            fprintf(stderr, "[spu-atomic] cmd=0x%X ea=0x%08X pc=0x%05X img=%d uncommitted -- skipped\n",
-                    cmd, ea, (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id);
-        if (cmd == MFC_GETLLAR_CMD) {
-            memset(ls, 0, MFC_ATOMIC_LINE);
-            ctx->resv_ea = ea; ctx->resv_valid = 0; ctx->atomic_stat = 0;
+        uint32_t ram = ovl12_io_to_ram((uint32_t)ea);
+        if (ram && mfc_ea_range_committed(ram, MFC_ATOMIC_LINE)) {
+            mem = vm_base + ram;
+            { static int s_u = 0;
+              if (s_u++ < 8)
+                  fprintf(stderr, "[ovl12-llar] uncommitted IO ea=0x%08X using ram=0x%08X\n",
+                          ea, ram); }
         } else {
-            ctx->atomic_stat = 1;   /* PUTLLC failure (line "moved") */
+            static int s_w = 0;
+            if (s_w++ < 16)
+                fprintf(stderr, "[spu-atomic] cmd=0x%X ea=0x%08X pc=0x%05X img=%d uncommitted -- skipped\n",
+                        cmd, ea, (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id);
+            if (cmd == MFC_GETLLAR_CMD) {
+                memset(ls, 0, MFC_ATOMIC_LINE);
+                ctx->resv_ea = ea; ctx->resv_valid = 0; ctx->atomic_stat = 0;
+            } else {
+                ctx->atomic_stat = MFC_PUTLLC_FAILURE;   /* line "moved" */
+            }
+            return 1;
         }
-        return 1;
     }
 
     /* SPU_ATOM_EA=<hex>: log every lock-line atomic touching that EA`s 128B line.
@@ -521,6 +532,23 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * and a store that lands after the read now leaves BOTH stale -- which
          * is what makes the lost-reservation event fire. */
         memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
+        /* Overlay-12 GETLLAR of IO 20020880: occupancy lives at RAM twin
+         * 00FC7D80. Copy the twin so the reserved line matches the producer. */
+        {
+            uint32_t ram = ovl12_io_to_ram((uint32_t)ea);
+            if (ram && mfc_ea_range_committed(ram, MFC_ATOMIC_LINE)) {
+                memcpy(ls, vm_base + ram, MFC_ATOMIC_LINE);
+                { static int s_ov = 0;
+                  if (s_ov++ < 8) {
+                      const uint8_t* r = vm_base + ram;
+                      fprintf(stderr, "[ovl12-llar] ea=0x%08X ram=0x%08X word0=0x%08X pc=0x%05X\n",
+                              (uint32_t)ea, ram,
+                              ((uint32_t)r[0]<<24)|((uint32_t)r[1]<<16)|
+                              ((uint32_t)r[2]<<8)|r[3],
+                              (uint32_t)ctx->pc & SPU_LS_MASK);
+                      fflush(stderr); } }
+            }
+        }
         /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
          * single atomic 128-byte read, so the reserved data and the reservation
          * come from the same instant. Reading guest memory twice lets a PPU store
@@ -532,7 +560,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * wakes anybody. Snapshotting from `ls` makes a later store leave BOTH
          * stale, which is exactly what makes the lost-reservation event fire. */
         memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);   /* snapshot for compare */
-        ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 0;
+        ctx->resv_ea = ea; ctx->resv_valid = 1;
+        /* Hardware GETLLAR writes MFC_GETLLAR_STATUS (4) into RdAtomicStat.
+         * 0 here made job_00b9b580's `rdch; brz` at LS 0x12E0 spin forever. */
+        ctx->atomic_stat = MFC_GETLLAR_SUCCESS;
         spu_lockline_unlock();
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
@@ -614,9 +645,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
              * lock-line lock, which is what spu_coh_notify_write expects. */
             ctx->resv_valid = 0;
             spu_coh_notify_write(ea);
-            ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
+            ctx->atomic_stat = MFC_PUTLLC_SUCCESS;
         } else {
-            ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
+            ctx->atomic_stat = MFC_PUTLLC_FAILURE;     /* reservation lost -> retry */
         }
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
@@ -807,6 +838,19 @@ static void spu_resv_lost_poll(spu_context* ctx)
 {
     if (!(ctx->event_mask & 0x400u) || !ctx->resv_valid) return;
     if (!vm_base || ctx->resv_ea == 0) return;
+    /* Overlay-12: GETLLAR EA is IO 20020880; occupancy is RAM 00FC7D80.
+     * Compare the twin only -- IO bytes may be poison/unmapped and would
+     * raise LR every poll, so EventStat would never park. */
+    {
+        uint32_t ram = ovl12_io_to_ram(ctx->resv_ea);
+        if (ram) {
+            if (memcmp(vm_base + ram, ctx->resv_line, 128) != 0) {
+                ctx->resv_valid = 0;
+                ctx->event_status |= 0x400u;
+            }
+            return;
+        }
+    }
     if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
         ctx->resv_valid = 0;
         ctx->event_status |= 0x400u;
@@ -833,10 +877,23 @@ void spu_ch_wake(spu_context* ctx)
     WakeAllConditionVariable((CONDITION_VARIABLE*)&ctx->ch_wait_cv);
 }
 
+/* Overlay-12 idle is `GETLLAR; GET liveB; ceq; rdch EventStat` with no
+ * rchcnt. Hardware blocks on LR. yz_ch_block() is off unless a raw SPU
+ * exists, so the wait used to return immediately, the PM quantum ended,
+ * and Ice's 0055BF88 never redispatched igPm after packer stw liveB. */
+static int spu_ch_wait_enabled(spu_context* ctx, uint32_t channel)
+{
+    if (yz_ch_block()) return 1;
+    if (channel == SPU_RdEventStat && (ctx->event_mask & SPU_EVENT_LR)
+        && ctx->resv_valid && ovl12_io_to_ram(ctx->resv_ea))
+        return 1;
+    return 0;
+}
+
 /* Block the calling SPU host thread until `channel` is readable. */
 static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 {
-    if (!yz_ch_block() || spu_ch_ready(ctx, channel)) return;
+    if (!spu_ch_wait_enabled(ctx, channel) || spu_ch_ready(ctx, channel)) return;
 
     { static unsigned long bn = 0; unsigned long n = ++bn;
       if (n <= 50 || (n % 512) == 0)
