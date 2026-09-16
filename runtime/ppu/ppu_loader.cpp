@@ -1098,6 +1098,7 @@ static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
     } while (0)
 
 extern "C" {
+void ppu_gcm_pump(void);
 /* PPU_RWATCH=<hex>[,len] -- see the note in vm_read8. */
 static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
 {
@@ -1143,9 +1144,49 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
       else { last=(uint32_t)a; n=0; } }
     return vm_base[(uint32_t)a]; }
 uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
+    uint16_t hv = __builtin_bswap16(v);
     { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
-      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
-    return __builtin_bswap16(v); }
+      if ((uint32_t)a==last) {
+        ++n;
+        /* Cell mailbox waits (func_00555B30: lhz +0xC, wait bit 0x0100) delay
+         * with 32x `or r31,r31,r31` so the sibling PPU hardware thread can
+         * post. Those nops do not yield a host OS thread; without a yield
+         * the producer starves and the bit never lands. */
+        if ((n & 8191u) == 0u) {
+          /* Both are sched_yield() through win32_compat.h off Windows; the
+           * starving producer is just as real on a 1+3+4 core arm64 SoC. */
+          SwitchToThread();
+          Sleep(0);
+          ppu_gcm_pump();
+        }
+        if (n==200000) {
+          fprintf(stderr, "[HOTREAD16] spinning on 0x%08X val=0x%04X tid=%lu cia=0x%08X lr=0x%08X guest-fn=0x%08X\n",
+                  (uint32_t)a, hv, (unsigned long)GetCurrentThreadId(),
+                  g_active_ctx ? (uint32_t)g_active_ctx->cia : 0,
+                  g_active_ctx ? (uint32_t)g_active_ctx->lr : 0,
+                  ppu_prof_resolve_host(__builtin_return_address(0)));
+          { static PPU_THREAD_LOCAL int dumps=0;
+            if (dumps++ < 3 && vm_base && !vm_oob((uint32_t)a & ~15u, 16)) {
+              uint32_t b = (uint32_t)a & ~15u;
+              uint32_t w0,w1,w2,w3;
+              memcpy(&w0, vm_base+b, 4); memcpy(&w1, vm_base+b+4, 4);
+              memcpy(&w2, vm_base+b+8, 4); memcpy(&w3, vm_base+b+12, 4);
+              fprintf(stderr, "[HOTREAD16] words@0x%08X %08X %08X %08X %08X\n", b,
+                      __builtin_bswap32(w0), __builtin_bswap32(w1),
+                      __builtin_bswap32(w2), __builtin_bswap32(w3));
+              /* Job doorbell is mailbox+0x130 (0x00F3CF30). Sibling flag 0x00F3CEA0. */
+              if (!vm_oob(0x00F3CF30u, 4) && !vm_oob(0x00F3CEA0u, 4)) {
+                uint32_t ww, sib;
+                extern uint32_t cellGcm_user_handler_opd(void);
+                memcpy(&ww, vm_base+0x00F3CF30u, 4); ww = __builtin_bswap32(ww);
+                memcpy(&sib, vm_base+0x00F3CEA0u, 4); sib = __builtin_bswap32(sib);
+                fprintf(stderr, "[HOTREAD16] wake=0x%08X sibling=0x%08X user-opd=0x%08X\n",
+                        ww, sib, cellGcm_user_handler_opd());
+              }
+            } }
+          n=0; } }
+      else { last=(uint32_t)a; n=0; } }
+    return hv; }
 uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
     /* Raw SPU problem state: reading the outbound mailbox POPS it, so that one
      * cannot be served out of memory. Everything else in the window the SPU
