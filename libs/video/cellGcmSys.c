@@ -29,6 +29,17 @@ static u32 s_gcm_context_ea = 0;
 #include <windows.h>
 #else
 #include <time.h>
+#include <stdatomic.h>
+#endif
+
+/* Full fence between a guest-visible store and the next one that publishes
+ * it (label after GET, GET after the FIFO words). x86 program order hides a
+ * missing one; arm64 does not: the PPU thread can see the label before the
+ * GET it is about to snapshot, and the loc_005CB1BC wait never leaves. */
+#ifdef _WIN32
+#  define GCM_PUBLISH_FENCE() MemoryBarrier()
+#else
+#  define GCM_PUBLISH_FENCE() atomic_thread_fence(memory_order_seq_cst)
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -738,6 +749,32 @@ void ppu_gcm_pump(void)
         u32 cmd = (u32)user;
         if (s_user_handler_opd && g_ps3_guest_caller)
             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
+        else {
+            static int once;
+            if (once++ < 4)
+                fprintf(stderr, "[gcm-pump] USER_CMD 0x%08X dropped (opd=0x%08X caller=%p)\n",
+                        cmd, s_user_handler_opd, (void*)g_ps3_guest_caller);
+        }
+    } else if (s_user_handler_opd && g_ps3_guest_caller) {
+        /* Insomniac job doorbell at mailbox+0x130 (0x00F3CF30): OR 0x180.
+         * On Cell the libgcm interrupt / SMT sibling consumes it. HLE never
+         * created that thread; ppu_gcm_pump is the stand-in. func_005C4B58
+         * (SetUserHandler OPD 0x00D12490) treats r3 as an OPD — pass the
+         * last USER_COMMAND argument, not the wake bits. */
+        u32 wake = vm_read32(0x00F3CF30u);
+        if (wake & 0x180u) {
+            u32 cmd = (u32)s_user_command;
+            static unsigned long wk;
+            if (cmd && g_ps3_guest_caller) {
+                if (wk++ < 6 || (wk % 256) == 0)
+                    fprintf(stderr, "[gcm-pump] wake=0x%08X user-opd=0x%08X cmd=0x%08X\n",
+                            wake, s_user_handler_opd, cmd);
+                g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
+            } else if (wk++ < 4) {
+                fprintf(stderr, "[gcm-pump] wake=0x%08X user-opd=0x%08X no USER_CMD arg\n",
+                        wake, s_user_handler_opd);
+            }
+        }
     }
     GCM_PUMP_LEAVE();
 }
@@ -788,7 +825,9 @@ unsigned long long ps3_ms_now(void)
 #ifdef _WIN32
     return (unsigned long long)GetTickCount64();
 #else
-    return 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
 #endif
 }
 
@@ -802,16 +841,30 @@ static u32 gcm_sema_backend_swap(u32 arg)
 }
 static u32 s_sema_last_off, s_sema_last_val, s_sema_last_ea;
 static const char* s_sema_last_tag = "";
+/* Guest GET must be current before a label is visible. func_005CB084 waits
+ * on label 0x41, then loc_005CB1BC snapshots GET and spins until PUT equals
+ * that snapshot. Hardware advances GET as it parses RELEASE; we used to
+ * write the label mid-drain and only publish GET at tick end, so the PPU
+ * saw a match with a stale GET (HOTREAD r29=0x1020 vs put=0x10B20) and
+ * never left the 132 KB default ring. */
+static void gcm_sema_publish_get(u32 after)
+{
+    u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    u32 ge = after;
+    if (put >= after && put - after <= 0x40u)
+        ge = put;
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, ge);
+    GCM_PUBLISH_FENCE();
+}
 static void gcm_sema_store(u32 offset, u32 value, const char* tag)
 {
     /* index*0x10 byte offset. Labels occupy 4 KB at GetLabelAddress base.
      * vm_write32 stores big-endian for guest lwz. */
     u32 off = offset & 0x00FFFFFCu;
     u32 ea = GCM_LABEL_GUEST_BASE + off;
+    gcm_sema_publish_get(s_fifo_getoff);
     vm_write32(ea, value);
-#ifdef _WIN32
-    MemoryBarrier();
-#endif
+    GCM_PUBLISH_FENCE();
     s_sema_last_off = off;
     s_sema_last_val = value;
     s_sema_last_ea = ea;
@@ -1262,12 +1315,16 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
         if (rescued) { static int m = 0; if (m++ < 8)
             fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) from"
                     " 0x%08X..0x%08X\n", rescued, from, put); }
-        gcm_fifo_scan_sema(from, put);
     }
+    /* GET = PUT before labels, or loc_005CB1BC snapshots the old GET. */
+    *getoff = put;
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, put);
+    GCM_PUBLISH_FENCE();
+    if (from < put)
+        gcm_fifo_scan_sema(from, put);
     /* Do not replay put-0x80 on wrap. That applies ring-head next-gen
      * RELEASE (0x30000000 / 0x90000000) the walker has not reached yet
      * and clobbers the current done cookie the waiter still holds. */
-    *getoff = put;
 }
 
 static void gcm_fifo_dump_around(u32 getoff)
@@ -1815,13 +1872,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * Any subchannel: ACIT encodes 0x00040064 (subch 0). */
             if (method == 0x64u || method == 0x68u || method == 0x6Cu ||
                 method == 0x1D6Cu || method == 0x1D70u || method == 0x1D74u) {
+                u32 sema_at = s_fifo_getoff;
+                u32 next = sema_at + 4 + count * 4;
+                /* GET first, then the label (gcm_sema_store). loc_005CB1BC
+                 * snapshots GET after the label matches. */
+                s_fifo_getoff = next;
+                gcm_sema_publish_get(next);
                 for (u32 i = 0; i < count; i++) {
-                    u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                    u32 dea = gcm_io2ea(sema_at + 4 + i * 4);
                     if (!dea) break;
                     u32 m = (type == 0) ? method + i * 4 : method;
                     gcm_sema_method(m, vm_read32(dea));
                 }
-                s_fifo_getoff += 4 + count * 4;
                 continue;
             }
             /* NV4097_GET_REPORT (0x1800): RSX writes CellGcmReportData
@@ -1864,8 +1926,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
                               m, vm_read32(dea)); }
                 if (subch == 7 && m == 0x0B00u) {
+                    /* Title-linked libgcm's ISR thread is never created under
+                     * HLE cellGcmInit (no sys_rsx context). Raise for the
+                     * sys_rsx queue if it exists, and always queue the HLE
+                     * pump so SetUserHandler's OPD still runs. */
+                    u32 uarg = vm_read32(dea);
                     extern void rsx_raise_user_cmd(u32 arg);
-                    rsx_raise_user_cmd(vm_read32(dea));
+                    rsx_raise_user_cmd(uarg);
+                    cellGcmQueueUserCommand(uarg);
                     continue;
                 }
                 /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
@@ -2111,12 +2179,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
     }
 
-    /* Idle FIFO: last NV406E OFFSET/RELEASE may sit just behind PUT after a
-     * wrap. Replaying them is idempotent and unblocks GetLabelAddress waiters
-     * if the walker skipped the pair. Do not move GET. */
-    if (s_fifo_getoff == put && put >= 0x40u)
-        gcm_fifo_scan_sema(put - 0x40u, put);
-
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
      * the walker actually is. A probe, not a fix -- it removes the back-pressure
@@ -2127,6 +2189,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
     { static int eq = -1;
       if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
       vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
+    GCM_PUBLISH_FENCE();
+    /* Idle FIFO: last NV406E OFFSET/RELEASE may sit just behind PUT after a
+     * wrap. Replay after GET is published so loc_005CB1BC cannot snapshot a
+     * stale GET. Do not move GET. */
+    if (s_fifo_getoff == put && put >= 0x40u)
+        gcm_fifo_scan_sema(put - 0x40u, put);
 
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
     gcm_ref_publish_one();
@@ -2458,6 +2526,8 @@ void cellGcmSetUserHandler(CellGcmUserHandler handler)
     s_user_handler = handler;
     gcm_update_handler_mask();
 }
+
+u32 cellGcm_user_handler_opd(void) { return s_user_handler_opd; }
 
 /* NID: 0x21AC3697 */
 u64 cellGcmGetLastFlipTime(void)

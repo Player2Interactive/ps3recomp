@@ -287,12 +287,15 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler);
  * title-screen state machine from the VBlank handler. */
 void cellGcmTickVBlank(void);
 void cellGcmTickFlip(void);
+/* Deliver pending vblank/flip/user handlers on the calling thread. */
+void ppu_gcm_pump(void);
 
 /* NID: 0xF9BFCDA3 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);
 
-/* NID: 0x0B4B62D5 */
+/* NID: 0x06EDEA9E (0x0B4B62D5 is SetPrepareFlip) */
 void cellGcmSetUserHandler(CellGcmUserHandler handler);
+u32 cellGcm_user_handler_opd(void);
 
 /* NID: 0x21AC3697 */
 u64 cellGcmGetLastFlipTime(void);
