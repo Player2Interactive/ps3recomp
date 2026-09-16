@@ -122,23 +122,62 @@ static void fs_normalize_sep(char* p) {
  *
  * All three path translators call this -- sys_fs, cellFs and ppu_fs each do
  * their own translation (see docs), and a guest path can arrive at any of them. */
+static char s_disc_root[1024];
+
+void ps3_vfs_set_disc_root(const char* root)
+{
+    if (!root || !*root) {
+        s_disc_root[0] = 0;
+        return;
+    }
+    snprintf(s_disc_root, sizeof s_disc_root, "%s", root);
+    for (char* c = s_disc_root; *c; c++)
+        if (*c == '\\') *c = '/';
+    size_t n = strlen(s_disc_root);
+    while (n > 1 && s_disc_root[n - 1] == '/')
+        s_disc_root[--n] = 0;
+}
+
+static char* ps3_vfs_find_ps3game(char* path)
+{
+    char* p = strstr(path, "/PS3_GAME/");
+    if (p) return p;
+    p = strstr(path, "\\PS3_GAME\\");
+    if (p) return p;
+    p = strstr(path, "/PS3_GAME\\");
+    if (p) return p;
+    return strstr(path, "\\PS3_GAME/");
+}
+
 void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 {
     struct stat st;
     if (!path || !*path || stat(path, &st) == 0)
         return;
-    char* p = strstr(path, "/PS3_GAME/");
+    char* p = ps3_vfs_find_ps3game(path);
     if (!p)
         return;
     char alt[1024];
+    /* Flattened tree: drop the PS3_GAME component. */
     size_t head = (size_t)(p - path);
-    if (head + 1 >= sizeof alt)
-        return;
-    memcpy(alt, path, head);
-    snprintf(alt + head, sizeof alt - head, "/%s", p + 10);
-    if (stat(alt, &st) != 0)
-        return;
-    snprintf(path, cap, "%s", alt);
+    if (head + 1 < sizeof alt) {
+        memcpy(alt, path, head);
+        snprintf(alt + head, sizeof alt - head, "/%s", p + 10);
+        if (stat(alt, &st) == 0) {
+            snprintf(path, cap, "%s", alt);
+            return;
+        }
+    }
+    /* Wrong $PS3_VFS_ROOT (no disc files): rewrite onto the ELF dump root. */
+    if (s_disc_root[0]) {
+        snprintf(alt, sizeof alt, "%s/%s", s_disc_root, p + 1);
+        for (char* c = alt; *c; c++)
+            if (*c == '\\') *c = '/';
+        if (stat(alt, &st) == 0) {
+            fprintf(stderr, "[fs] disc-root fallback '%s' -> '%s'\n", path, alt);
+            snprintf(path, cap, "%s", alt);
+        }
+    }
 }
 
 /* Host directory that /dev_hdd1 maps into (cellSysCacheMount / FIOS overlay).
@@ -233,11 +272,21 @@ static void sys_fs_hdd1_prepare(const char* guest, const char* hpath)
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
 {
-    /* Lazily adopt PS3_VFS_ROOT if the root is still the default ".", so this
-     * sys_fs layer points at the same place as the cellFs layer (ppu_vfs_root). */
+    /* Lazily adopt the same root as ppu_fs (ppu_vfs_root), which may have
+     * rejected a $PS3_VFS_ROOT that has no PARAM.SFO/game.psarc. */
     if (g_sys_fs_root[0] == '.' && g_sys_fs_root[1] == '\0') {
-        const char* env = getenv("PS3_VFS_ROOT");
-        if (env && *env) { strncpy(g_sys_fs_root, env, sizeof(g_sys_fs_root) - 1); g_sys_fs_root[sizeof(g_sys_fs_root)-1] = 0; }
+        extern const char* ppu_vfs_root;
+        if (ppu_vfs_root && ppu_vfs_root[0] &&
+            !(ppu_vfs_root[0] == '.' && ppu_vfs_root[1] == '\0')) {
+            strncpy(g_sys_fs_root, ppu_vfs_root, sizeof(g_sys_fs_root) - 1);
+            g_sys_fs_root[sizeof(g_sys_fs_root) - 1] = 0;
+        } else {
+            const char* env = getenv("PS3_VFS_ROOT");
+            if (env && *env) {
+                strncpy(g_sys_fs_root, env, sizeof(g_sys_fs_root) - 1);
+                g_sys_fs_root[sizeof(g_sys_fs_root) - 1] = 0;
+            }
+        }
     }
 
     /* /dev_hdd1 is the title syscache, not disc data. ppu_fs / cellFs already
