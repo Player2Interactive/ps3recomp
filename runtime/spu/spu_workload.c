@@ -193,6 +193,10 @@ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail)
 
 /* ---- dispatch ---------------------------------------------------------- */
 
+/* No ACIT_ENABLE_SPU / per-image ifdef here: dispatch runs whatever the
+ * title registered. ACIT extra embedded ELFs (images 2/3) are compiled
+ * via game/CMakeLists.txt ACIT_SPU_IMAGE_ALLOWLIST, not this file. */
+
 int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
                           uint32_t args_ea)
 {

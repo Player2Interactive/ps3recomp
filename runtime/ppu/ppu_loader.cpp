@@ -42,6 +42,14 @@
 #include <unistd.h>
 #endif
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+extern "C" volatile long g_ice_wake_n;
+extern "C" volatile long g_ice_wake_polls;
+extern "C" volatile unsigned long g_ice_wake_tid;
+extern "C" volatile unsigned int g_hang_actor;
+extern "C" void ppu_dump_threads(const char* tag);
+extern "C" void ppu_dump_lwcond(void);
+extern "C" void ppu_fs_dump_last_stat(void);
+extern "C" void ppu_dump_ice_fios(void);
 
 /* Resolve the GUEST function on the host stack (closest lifted entry below
  * each frame) -- the same trick the [BLOCK] profiler uses. */
@@ -1022,6 +1030,62 @@ static inline int vm_oob(uint32_t a, uint32_t n)
     return vm_oob_report(a, n);
 }
 
+static uint32_t ice_fios_be32(uint32_t ea)
+{
+    uint32_t t;
+    if (!vm_base || vm_oob(ea, 4)) return 0u;
+    memcpy(&t, vm_base + ea, 4);
+    return __builtin_bswap32(t);
+}
+static void ice_fios_obj(const char* tag, uint32_t ea)
+{
+    char path[96];
+    unsigned i;
+    uint32_t b98;
+    if (ea < 0x10000u) {
+        fprintf(stderr, "[ice-fios] %s ea=0x%08X (null)\n", tag, ea);
+        return;
+    }
+    b98 = ea + 0x98u;
+    fprintf(stderr,
+            "[ice-fios] %s ea=0x%08X vt=0x%08X +5C=0x%08X +60=0x%08X "
+            "+B8=0x%08X +D0=0x%08X +E0 mtx?=0x%08X +E4 qid=0x%08X "
+            "+F0=0x%08X +F4=0x%08X "
+            "+118=0x%08X +11C=0x%08X +130=0x%08X +134=0x%08X "
+            "w68=0x%08X w6c=0x%08X w70=0x%08X w74=0x%08X\n",
+            tag, ea, ice_fios_be32(ea), ice_fios_be32(ea + 0x5Cu),
+            ice_fios_be32(ea + 0x60u), ice_fios_be32(ea + 0xB8u),
+            ice_fios_be32(ea + 0xD0u), ice_fios_be32(ea + 0xE0u),
+            ice_fios_be32(ea + 0xE4u), ice_fios_be32(ea + 0xF0u),
+            ice_fios_be32(ea + 0xF4u), ice_fios_be32(ea + 0x118u),
+            ice_fios_be32(ea + 0x11Cu), ice_fios_be32(ea + 0x130u),
+            ice_fios_be32(ea + 0x134u), ice_fios_be32(b98 + 0x68u),
+            ice_fios_be32(b98 + 0x6Cu), ice_fios_be32(b98 + 0x70u),
+            ice_fios_be32(b98 + 0x74u));
+    for (i = 0; i < sizeof path - 1u; i++) {
+        uint8_t c = (!vm_base || vm_oob(ea + 0x34Au + i, 1)) ? 0 : vm_base[ea + 0x34Au + i];
+        if (!c) break;
+        path[i] = (char)((c >= 32 && c < 127) ? c : '.');
+    }
+    path[i] = 0;
+    fprintf(stderr, "[ice-fios] %s +34A='%s'\n", tag, path);
+}
+extern "C" void ppu_dump_ice_fios(void)
+{
+    uint32_t bss = 0x00F77980u;
+    fprintf(stderr,
+            "[ice-fios] BSS 00F77980 +00=0x%08X +14=0x%08X +18=0x%08X +1C=0x%08X +20=0x%08X\n",
+            ice_fios_be32(bss), ice_fios_be32(bss + 0x14u),
+            ice_fios_be32(bss + 0x18u), ice_fios_be32(bss + 0x1Cu),
+            ice_fios_be32(bss + 0x20u));
+    ice_fios_obj("o0", ice_fios_be32(bss));
+    ice_fios_obj("o14", ice_fios_be32(bss + 0x14u));
+    ice_fios_obj("o18", ice_fios_be32(bss + 0x18u));
+    ppu_dump_lwcond();
+    ppu_fs_dump_last_stat();
+    fflush(stderr);
+}
+
 /* ---------------------------------------------------------------------------
  * Big-endian guest memory accessors (PPU is big-endian; vm_base holds the
  * guest image in its native byte order).
@@ -1048,6 +1112,7 @@ static void vm_hotmap(uint32_t ea, int width)
     }
 }
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;  /* fwd decl (defined below) */
+extern "C" void acit_ovl_enq_hang_dump(void);
 /* Tracks the most recent vm_read32 {addr,value} on this thread, so PPU_WVAL can
  * report the SOURCE a copied value came from (poison propagation vs true origin). */
 static PPU_THREAD_LOCAL uint32_t g_last_rd_addr = 0;
@@ -1098,6 +1163,7 @@ static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
     } while (0)
 
 extern "C" {
+void ppu_gcm_pump(void);
 /* PPU_RWATCH=<hex>[,len] -- see the note in vm_read8. */
 static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
 {
@@ -1143,9 +1209,502 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
       else { last=(uint32_t)a; n=0; } }
     return vm_base[(uint32_t)a]; }
 uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
+    uint16_t hv = __builtin_bswap16(v);
     { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
-      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
-    return __builtin_bswap16(v); }
+      if ((uint32_t)a==last) {
+        ++n;
+        /* Cell mailbox waits (func_00555B30: lhz +0xC, wait bit 0x0100) delay
+         * with 32x `or r31,r31,r31` so the sibling PPU hardware thread can
+         * post. Those nops do not yield a host OS thread; without a yield
+         * the producer starves and the bit never lands. */
+        if ((n & 8191u) == 0u) {
+          /* Both are sched_yield() through win32_compat.h off Windows; the
+           * starving producer is just as real on a 1+3+4 core arm64 SoC. */
+          SwitchToThread();
+          Sleep(0);
+          ppu_gcm_pump();
+        }
+        if (n==200000) {
+          fprintf(stderr, "[HOTREAD16] spinning on 0x%08X val=0x%04X tid=%lu cia=0x%08X lr=0x%08X guest-fn=0x%08X\n",
+                  (uint32_t)a, hv, (unsigned long)GetCurrentThreadId(),
+                  g_active_ctx ? (uint32_t)g_active_ctx->cia : 0,
+                  g_active_ctx ? (uint32_t)g_active_ctx->lr : 0,
+                  ppu_prof_resolve_host(__builtin_return_address(0)));
+          { static PPU_THREAD_LOCAL int dumps=0;
+            if (dumps++ < 3 && vm_base && !vm_oob((uint32_t)a & ~15u, 16)) {
+              uint32_t b = (uint32_t)a & ~15u;
+              uint32_t w0,w1,w2,w3;
+              memcpy(&w0, vm_base+b, 4); memcpy(&w1, vm_base+b+4, 4);
+              memcpy(&w2, vm_base+b+8, 4); memcpy(&w3, vm_base+b+12, 4);
+              fprintf(stderr, "[HOTREAD16] words@0x%08X %08X %08X %08X %08X\n", b,
+                      __builtin_bswap32(w0), __builtin_bswap32(w1),
+                      __builtin_bswap32(w2), __builtin_bswap32(w3));
+              /* Job doorbell is mailbox+0x130 (0x00F3CF30). Sibling flag 0x00F3CEA0. */
+              if (!vm_oob(0x00F3CF30u, 4) && !vm_oob(0x00F3CEA0u, 4)) {
+                uint32_t ww, sib;
+                extern uint32_t cellGcm_user_handler_opd(void);
+                memcpy(&ww, vm_base+0x00F3CF30u, 4); ww = __builtin_bswap32(ww);
+                memcpy(&sib, vm_base+0x00F3CEA0u, 4); sib = __builtin_bswap32(sib);
+                fprintf(stderr, "[HOTREAD16] wake=0x%08X sibling=0x%08X user-opd=0x%08X\n",
+                        ww, sib, cellGcm_user_handler_opd());
+              }
+              if (g_active_ctx) {
+                extern void ppu_dump_guest_stack(ppu_context*, const char*);
+                ppu_dump_guest_stack(g_active_ctx, "hot16");
+                /* 004E8044: lwz r0,0(r6); beq skip wait. r6 is the stack
+                 * request at 001DE574 SP+0xB0 (addi r3,r1,0xb0). 0055BF88
+                 * stdu -0x150; 004E8044 stdu -0xB0. */
+                auto be32 = [](uint32_t ea) -> uint32_t {
+                    uint32_t t;
+                    if (!vm_base || vm_oob(ea, 4)) return 0u;
+                    memcpy(&t, vm_base + ea, 4);
+                    return __builtin_bswap32(t);
+                };
+                uint32_t sp = (uint32_t)g_active_ctx->gpr[1];
+                uint32_t f8044 = be32(sp + 4u);
+                uint32_t fde574 = f8044 ? be32(f8044 + 4u) : 0u;
+                uint32_t req = fde574 ? (fde574 + 0xB0u) : 0u;
+                fprintf(stderr,
+                        "[ice-slot] 004E8044_sp=0x%08X 001DE574_sp=0x%08X req=0x%08X +0=0x%08X +4=0x%08X "
+                        "+18=0x%08X +24=0x%02X mask=0x%08X slot0+0=0x%08X "
+                        "+1010=0x%08X SDA-7FF8=0x%08X world+94=0x%08X\n",
+                        f8044, fde574, req,
+                        req ? be32(req) : 0u,
+                        req ? be32(req + 4u) : 0u,
+                        req ? be32(req + 0x18u) : 0u,
+                        req ? (be32(req + 0x24u) >> 24) : 0u,
+                        be32(0x00EF83C0u),
+                        be32(0x00EF83D0u),
+                        be32(0x00EF83C0u + 0x1010u),
+                        be32(0x00C9FACCu),
+                        be32(0x00E898A0u + 0x94u));
+                /* Type-6 hang: Ice+0x2E4 enqueue vs empty slot body. Dump only. */
+                {
+                    uint32_t ice_sda = be32(0x00CA1390u); /* Ice SDA-0x7FF8 */
+                    fprintf(stderr,
+                            "[ice-0100] mbox +0=0x%08X +4=0x%08X +8=0x%08X +C=0x%04X "
+                            "+10=0x%08X +14=0x%08X +1C=0x%08X door=0x%08X "
+                            "mgr +2D0=0x%08X +2E4=0x%08X +190=0x%08X "
+                            "iceSDA=0x%08X ice +0=0x%08X +190=0x%08X +2D0=0x%08X +2E4=0x%08X "
+                            "world +40=0x%08X +54=0x%08X +94=0x%08X "
+                            "coll +0=0x%08X +40=0x%08X +94=0x%08X +A0=0x%08X "
+                            "+2D0=0x%08X +2E4=0x%08X "
+                            "slot +00=0x%08X +04=0x%08X +08=0x%08X +0C=0x%08X "
+                            "+10=0x%08X +14=0x%08X +30=0x%08X +34=0x%08X +38=0x%08X\n",
+                            be32(0x00F3CE00u), be32(0x00F3CE04u), be32(0x00F3CE08u),
+                            (uint16_t)(be32(0x00F3CE0Cu) >> 16),
+                            be32(0x00F3CE10u), be32(0x00F3CE14u), be32(0x00F3CE1Cu),
+                            be32(0x00F3CF30u),
+                            be32(0x00F3CF00u + 0x2D0u), be32(0x00F3CF00u + 0x2E4u),
+                            be32(0x00F3CF00u + 0x190u),
+                            ice_sda,
+                            ice_sda ? be32(ice_sda) : 0u,
+                            ice_sda ? be32(ice_sda + 0x190u) : 0u,
+                            ice_sda ? be32(ice_sda + 0x2D0u) : 0u,
+                            ice_sda ? be32(ice_sda + 0x2E4u) : 0u,
+                            be32(0x00E898A0u + 0x40u), be32(0x00E898A0u + 0x54u),
+                            be32(0x00E898A0u + 0x94u),
+                            be32(0x00F27D10u), be32(0x00F27D10u + 0x40u),
+                            be32(0x00F27D10u + 0x94u), be32(0x00F27D10u + 0xA0u),
+                            be32(0x00F27D10u + 0x2D0u), be32(0x00F27D10u + 0x2E4u),
+                            be32(0x00EF83D0u), be32(0x00EF83D4u),
+                            be32(0x00EF83D8u), be32(0x00EF83DCu),
+                            be32(0x00EF83E0u), be32(0x00EF83E4u),
+                            be32(0x00EF8400u), be32(0x00EF8404u),
+                            be32(0x00EF8408u));
+                    /* 00555A18 skip is *(SDA-0x7F60)=00F38D80. Dump only. */
+                    {
+                        uint32_t req = (uint32_t)g_active_ctx->gpr[31];
+                        uint32_t head = req ? be32(req + 0x14u) : 0u;
+                        uint32_t node = head ? be32(head) : 0u;
+                        uint32_t tobj = be32(0x00F27D10u);
+                        fprintf(stderr,
+                                "[ice-skip] F38D80=0x%08X CA1428=0x%08X CA1568=0x%08X "
+                                "F3CEA0=0x%08X CA1418=0x%08X CA1414=0x%08X "
+                                "r31=0x%08X req+0=0x%08X +4=0x%08X +14=0x%08X "
+                                "head0=0x%08X node+8=0x%08X +15=0x%02X "
+                                "mbox40=%08X %08X %08X %08X "
+                                "mbox50=%08X %08X %08X %08X "
+                                "tobj=0x%08X aabb %08X %08X %08X %08X "
+                                "%08X %08X %08X %08X\n",
+                                be32(0x00F38D80u), be32(0x00CA1428u),
+                                be32(0x00CA1568u),
+                                be32(0x00F3CEA0u), be32(0x00CA1418u),
+                                be32(0x00CA1414u),
+                                req,
+                                req ? be32(req) : 0u,
+                                req ? be32(req + 4u) : 0u,
+                                head, node,
+                                node ? be32(node + 8u) : 0u,
+                                node ? (be32(node + 0x14u) >> 24) : 0u,
+                                be32(0x00F3CE40u), be32(0x00F3CE44u),
+                                be32(0x00F3CE48u), be32(0x00F3CE4Cu),
+                                be32(0x00F3CE50u), be32(0x00F3CE54u),
+                                be32(0x00F3CE58u), be32(0x00F3CE5Cu),
+                                tobj,
+                                tobj ? be32(tobj) : 0u,
+                                tobj ? be32(tobj + 4u) : 0u,
+                                tobj ? be32(tobj + 8u) : 0u,
+                                tobj ? be32(tobj + 0xCu) : 0u,
+                                tobj ? be32(tobj + 0x10u) : 0u,
+                                tobj ? be32(tobj + 0x14u) : 0u,
+                                tobj ? be32(tobj + 0x18u) : 0u,
+                                tobj ? be32(tobj + 0x1Cu) : 0u);
+                    }
+                    fprintf(stderr,
+                            "[ovl-ring] cmd 00FBE6C0 +0=0x%08X +4=0x%08X +8=0x%08X "
+                            "obj 00FBE680 +0=0x%08X +4=0x%08X "
+                            "liveA 00FC7B00 +0=0x%08X +4=0x%08X +80=0x%08X "
+                            "liveB 00FC7D80 +0=0x%08X +80=0x%08X tmplA 00FCAC80 +0=0x%08X "
+                            "stage 00FCE680 +0=0x%08X +4=0x%08X "
+                            "occ 618000 A=0x%08X B=0x%08X 618400 A=0x%08X B=0x%08X "
+                            "bump=0x%08X pack0+30=0x%08X ptr0=0x%08X shadow=0x%08X\n",
+                            be32(0x00FBE6C0u), be32(0x00FBE6C0u + 4u),
+                            be32(0x00FBE6C0u + 8u),
+                            be32(0x00FBE680u), be32(0x00FBE680u + 4u),
+                            be32(0x00FC7B00u), be32(0x00FC7B00u + 4u),
+                            be32(0x00FC7B00u + 0x80u),
+                            be32(0x00FC7D80u), be32(0x00FC7D80u + 0x80u),
+                            be32(0x00FCAC80u),
+                            be32(0x00FCE680u), be32(0x00FCE680u + 4u),
+                            be32(0x00FC7B00u), be32(0x00FC7D80u),
+                            be32(0x00FC7B80u), be32(0x00FC7E00u),
+                            be32(0x00FC66F4u), be32(0x00FBE6F0u + 0x30u),
+                            be32(0x00FC66FCu), be32(0x00FC8028u));
+                    acit_ovl_enq_hang_dump();
+                    uint32_t door_ptr = be32(0x00CA1390u);
+                    uint32_t door_tgt = door_ptr ? be32(door_ptr) : 0u;
+                    fprintf(stderr,
+                            "[ice-thr] hang-tid=%lu ice-wake-tid=%lu wake_n=%ld polls=%ld "
+                            "ovl 00EB3DC0 +0=0x%08X +4=0x%08X +18=0x%08X "
+                            "walker 00EB3980 +0=0x%08X +4=0x%08X +18=0x%08X "
+                            "+3C=0x%08X "
+                            "CA1390=0x%08X *CA1390=0x%08X "
+                            "world+40=0x%08X coll=0x%08X\n",
+                            (unsigned long)GetCurrentThreadId(),
+                            g_ice_wake_tid, g_ice_wake_n, g_ice_wake_polls,
+                            be32(0x00EB3DC0u), be32(0x00EB3DC0u + 4u),
+                            be32(0x00EB3DC0u + 0x18u),
+                            be32(0x00EB3980u), be32(0x00EB3980u + 4u),
+                            be32(0x00EB3980u + 0x18u),
+                            be32(0x00EB3980u + 0x3Cu),
+                            door_ptr, door_tgt,
+                            be32(0x00E898A0u + 0x40u),
+                            be32(0x00F27D10u));
+                    {
+                        uint32_t w40 = be32(0x00E898A0u + 0x40u);
+                        fprintf(stderr,
+                                "[c30c8c] intern C770FC=0x%08X C7632C=0x%08X "
+                                "walker+3C=0x%08X world+40=0x%08X 40vt=0x%08X "
+                                "coll=0x%08X\n",
+                                be32(0x00C770FCu), be32(0x00C7632Cu),
+                                be32(0x00EB3980u + 0x3Cu),
+                                w40, w40 >= 0x10000u ? be32(w40) : 0u,
+                                be32(0x00F27D10u));
+                    }
+                    /* 004E13B4 flag-loop ticks 00F70CE0 via 00669740 r4=1.
+                     * Dump the live type-record job list. Do not poke 0x0100. */
+                    {
+                        static unsigned sched_dumps;
+                        if (sched_dumps < 2u) {
+                            uint32_t sch = 0x00F70CE0u;
+                            uint32_t rec = be32(sch + 0x18u);
+                            uint32_t hdr, njob, typ, j;
+                            sched_dumps++;
+                            if (!rec)
+                                rec = be32(sch + 0x10u);
+                            hdr = rec ? be32(rec) : 0u;
+                            njob = hdr & 0xFFFFu;
+                            typ = (hdr >> 16) & 0xFFFFu;
+                            if (njob > 16u)
+                                njob = 16u;
+                            fprintf(stderr,
+                                    "[ice-sched] 00F70CE0 +0=0x%08X +4=0x%08X +8=0x%08X "
+                                    "+C=0x%08X +10=0x%08X +14=0x%08X +18=0x%08X "
+                                    "rec=0x%08X type=%u n=%u "
+                                    "D3E990=0x%02X F77980+2C=0x%08X "
+                                    "EF7CC0=0x%02X EF7C94=0x%08X\n",
+                                    be32(sch), be32(sch + 4u), be32(sch + 8u),
+                                    be32(sch + 0xCu), be32(sch + 0x10u),
+                                    be32(sch + 0x14u), be32(sch + 0x18u),
+                                    rec, typ, njob,
+                                    be32(0x00D3E990u) >> 24,
+                                    be32(0x00F77980u + 0x2Cu),
+                                    be32(0x00EF7CC0u) >> 24,
+                                    be32(0x00EF7C94u));
+                            /* 00F77980 InitOnce/factory this. +0x2C ready flag.
+                             * Completer OPD is on heap *(this+0), not BSS +0x5C. */
+                            fprintf(stderr,
+                                    "[ice-f77980] D3E990=0x%02X "
+                                    "+0=0x%08X +4=0x%08X +8=0x%08X +C=0x%08X "
+                                    "+10=0x%08X +14=0x%08X +18=0x%08X +1C=0x%08X "
+                                    "+20=0x%08X +24=0x%08X +28=0x%08X +2C=0x%08X "
+                                    "+30=0x%08X +34=0x%08X +38=0x%08X +3C=0x%08X "
+                                    "+40=0x%08X +5C=0x%08X +60=0x%08X\n",
+                                    be32(0x00D3E990u) >> 24,
+                                    be32(0x00F77980u),
+                                    be32(0x00F77980u + 4u),
+                                    be32(0x00F77980u + 8u),
+                                    be32(0x00F77980u + 0xCu),
+                                    be32(0x00F77980u + 0x10u),
+                                    be32(0x00F77980u + 0x14u),
+                                    be32(0x00F77980u + 0x18u),
+                                    be32(0x00F77980u + 0x1Cu),
+                                    be32(0x00F77980u + 0x20u),
+                                    be32(0x00F77980u + 0x24u),
+                                    be32(0x00F77980u + 0x28u),
+                                    be32(0x00F77980u + 0x2Cu),
+                                    be32(0x00F77980u + 0x30u),
+                                    be32(0x00F77980u + 0x34u),
+                                    be32(0x00F77980u + 0x38u),
+                                    be32(0x00F77980u + 0x3Cu),
+                                    be32(0x00F77980u + 0x40u),
+                                    be32(0x00F77980u + 0x5Cu),
+                                    be32(0x00F77980u + 0x60u));
+                            /* 006FC7F8 stores OPD at heap this+0x5C (factory r3 = *(BSS+0)). */
+                            {
+                                uint32_t o0 = be32(0x00F77980u);
+                                uint32_t o14 = be32(0x00F77980u + 0x14u);
+                                fprintf(stderr,
+                                        "[ice-cbslot] o0=0x%08X vt=0x%08X +5C=0x%08X +60=0x%08X "
+                                        "+C0=0x%08X +24A=0x%02X "
+                                        "o14=0x%08X vt=0x%08X +5C=0x%08X +60=0x%08X "
+                                        "+C0=0x%08X +24A=0x%02X\n",
+                                        o0,
+                                        o0 ? be32(o0) : 0u,
+                                        o0 ? be32(o0 + 0x5Cu) : 0u,
+                                        o0 ? be32(o0 + 0x60u) : 0u,
+                                        o0 ? be32(o0 + 0xC0u) : 0u,
+                                        o0 ? (uint32_t)vm_base[o0 + 0x24Au] : 0u,
+                                        o14,
+                                        o14 ? be32(o14) : 0u,
+                                        o14 ? be32(o14 + 0x5Cu) : 0u,
+                                        o14 ? be32(o14 + 0x60u) : 0u,
+                                        o14 ? be32(o14 + 0xC0u) : 0u,
+                                        o14 ? (uint32_t)vm_base[o14 + 0x24Au] : 0u);
+                            }
+                            for (j = 0; j < njob; j++) {
+                                uint32_t job = rec ? be32(rec + 4u + j * 4u) : 0u;
+                                uint32_t vt = job ? be32(job) : 0u;
+                                uint32_t opd = vt ? be32(vt + 0xCu) : 0u;
+                                uint32_t code = opd ? be32(opd) : 0u;
+                                fprintf(stderr,
+                                        "[ice-sched] job[%u] ea=0x%08X +0=0x%08X +4=0x%08X "
+                                        "+8=0x%08X +C=0x%08X +10=0x%08X +14=0x%08X +18=0x%08X "
+                                        "vt+C=0x%08X fn=0x%08X\n",
+                                        j, job,
+                                        job ? be32(job) : 0u,
+                                        job ? be32(job + 4u) : 0u,
+                                        job ? be32(job + 8u) : 0u,
+                                        job ? be32(job + 0xCu) : 0u,
+                                        job ? be32(job + 0x10u) : 0u,
+                                        job ? be32(job + 0x14u) : 0u,
+                                        job ? be32(job + 0x18u) : 0u,
+                                        opd, code);
+                            }
+                        }
+                    }
+                    ppu_dump_threads("hang");
+                    ppu_dump_ice_fios();
+                    /* 0016A3AC std r29 then mr r29,r3 — SP+0x78 is the OLD r29.
+                     * 001DE574 std r31 then mr r31,r3 — SP+0x108 is 001E0B84 this
+                     * after its mr, which is 0016A3AC this (vt 00C306D0). */
+                    {
+                        uint32_t fsp = sp;
+                        unsigned fi;
+                        uint32_t actor = 0, world14 = 0;
+                        uint32_t sp_de = sp + 0x150u + 0xB0u;
+                        uint32_t this_de = be32(sp_de + 0x10Cu);
+                        uint32_t this_e0 = be32(sp + 0x150u + 0xB0u + 0x110u + 0xA4u);
+                        uint32_t this_16 = be32(sp + 0x150u + 0xB0u + 0x110u + 0xB0u + 0x7Cu);
+                        fprintf(stderr,
+                                "[actor-world] expect 001DE574_sp=0x%08X this=0x%08X "
+                                "001E0B84_old_r31=0x%08X 0016A3AC_old_r29=0x%08X\n",
+                                sp_de, this_de, this_e0, this_16);
+                        if (this_de >= 0x10000u) actor = this_de;
+                        else if (this_e0 >= 0x10000u &&
+                                 be32(this_e0) >= 0x00C20000u && be32(this_e0) < 0x00D20000u)
+                            actor = this_e0;
+                        if (actor)
+                            g_hang_actor = actor;
+                        for (fi = 0; fi < 12u && fsp >= 0x0F000000u && fsp < 0x10000000u; fi++) {
+                            uint32_t back = be32(fsp + 4u);
+                            uint32_t lr16 = be32(fsp + 0x14u);
+                            uint32_t r29 = be32(fsp + 0x7Cu);
+                            uint32_t r31a = be32(fsp + 0xA4u);
+                            uint32_t r31b = be32(fsp + 0x10Cu);
+                            fprintf(stderr,
+                                    "[actor-world] fr[%u] sp=0x%08X back=0x%08X "
+                                    "+14=0x%08X r29@78=0x%08X r31@A0=0x%08X r31@108=0x%08X\n",
+                                    fi, fsp, back, lr16, r29, r31a, r31b);
+                            if (!back || back <= fsp || back == fsp)
+                                break;
+                            fsp = back;
+                        }
+                        if (be32(0x24A41BA0u) && be32(0x24A41BA0u + 0x14u)) {
+                            fprintf(stderr,
+                                    "[actor-world] stk24A41BA0 +0=0x%08X +14=0x%08X "
+                                    "+40=0x%08X +54=0x%08X +59=0x%02X\n",
+                                    be32(0x24A41BA0u), be32(0x24A41BA0u + 0x14u),
+                                    be32(0x24A41BA0u + 0x40u),
+                                    be32(0x24A41BA0u + 0x54u),
+                                    be32(0x24A41BA0u + 0x58u) >> 24);
+                        }
+                        if (actor) {
+                            world14 = be32(actor + 0x14u);
+                            uint32_t ice94 = world14 ? be32(world14 + 0x94u) : 0u;
+                            fprintf(stderr,
+                                    "[actor-world] this=0x%08X +00=0x%08X +14=0x%08X "
+                                    "+40=0x%08X +50=0x%08X +54=0x%08X +59=0x%02X "
+                                    "+84=0x%08X +150=0x%08X "
+                                    "world+00=0x%08X +40=0x%08X +54=0x%08X "
+                                    "+94=0x%08X +2D0=0x%08X +2E4=0x%08X "
+                                    "ice=0x%08X ice+2D0=0x%08X ice+2E4=0x%08X "
+                                    "wad0ice=0x23A87480 wad0+2D0=0x%08X "
+                                    "wad0=0x247D1880 match=%d\n",
+                                    actor, be32(actor), world14,
+                                    be32(actor + 0x40u), be32(actor + 0x50u),
+                                    be32(actor + 0x54u),
+                                    be32(actor + 0x58u) >> 24,
+                                    be32(actor + 0x84u), be32(actor + 0x150u),
+                                    world14 ? be32(world14) : 0u,
+                                    world14 ? be32(world14 + 0x40u) : 0u,
+                                    world14 ? be32(world14 + 0x54u) : 0u,
+                                    world14 ? be32(world14 + 0x94u) : 0u,
+                                    world14 ? be32(world14 + 0x2D0u) : 0u,
+                                    world14 ? be32(world14 + 0x2E4u) : 0u,
+                                    ice94,
+                                    ice94 ? be32(ice94 + 0x2D0u) : 0u,
+                                    ice94 ? be32(ice94 + 0x2E4u) : 0u,
+                                    be32(0x23A87480u + 0x2D0u),
+                                    world14 == 0x247D1880u);
+                            fprintf(stderr,
+                                    "[ice-a0] mbox +0=0x%08X +4=0x%08X desc+0=0x%08X "
+                                    "coll +00=0x%08X +40=0x%08X +48=0x%08X +4C=0x%08X "
+                                    "+A0=0x%08X ice=0x%08X ice+40=0x%08X ice+48=0x%08X "
+                                    "ice+4C=0x%08X ice+A0=0x%08X ice+2D0=0x%08X "
+                                    "ice+2E4=0x%08X actor+48=0x%08X actor+4C=0x%08X "
+                                    "actor+A0=0x%08X wad+40=0x%08X\n",
+                                    be32(0x00F3CE00u), be32(0x00F3CE04u),
+                                    be32(0x00DE1F10u),
+                                    be32(0x00F27D10u), be32(0x00F27D10u + 0x40u),
+                                    be32(0x00F27D10u + 0x48u),
+                                    be32(0x00F27D10u + 0x4Cu),
+                                    be32(0x00F27D10u + 0xA0u),
+                                    ice94,
+                                    ice94 ? be32(ice94 + 0x40u) : 0u,
+                                    ice94 ? be32(ice94 + 0x48u) : 0u,
+                                    ice94 ? be32(ice94 + 0x4Cu) : 0u,
+                                    ice94 ? be32(ice94 + 0xA0u) : 0u,
+                                    ice94 ? be32(ice94 + 0x2D0u) : 0u,
+                                    ice94 ? be32(ice94 + 0x2E4u) : 0u,
+                                    be32(actor + 0x48u), be32(actor + 0x4Cu),
+                                    be32(actor + 0xA0u),
+                                    world14 ? be32(world14 + 0x40u) : 0u);
+                            fprintf(stderr,
+                                    "[ice-a0] desc +00=0x%08X +04=0x%08X +08=0x%08X "
+                                    "+10=0x%08X +14=0x%08X +18=0x%08X +1C=0x%08X "
+                                    "+20=0x%08X +28=0x%08X +30=0x%08X +A0=0x%08X "
+                                    "CA1424=0x%08X sing 00F23380 +0=0x%08X +16c=0x%08X "
+                                    "sib23600 +00=0x%08X +40=0x%08X +A0=0x%08X "
+                                    "sib23700 +00=0x%08X +40=0x%08X +A0=0x%08X "
+                                    "sib28D10 +00=0x%08X +40=0x%08X +A0=0x%08X\n",
+                                    be32(0x00DE1F10u), be32(0x00DE1F10u + 0x04u),
+                                    be32(0x00DE1F10u + 0x08u),
+                                    be32(0x00DE1F10u + 0x10u),
+                                    be32(0x00DE1F10u + 0x14u),
+                                    be32(0x00DE1F10u + 0x18u),
+                                    be32(0x00DE1F10u + 0x1Cu),
+                                    be32(0x00DE1F10u + 0x20u),
+                                    be32(0x00DE1F10u + 0x28u),
+                                    be32(0x00DE1F10u + 0x30u),
+                                    be32(0x00DE1F10u + 0xA0u),
+                                    be32(0x00CA1424u),
+                                    be32(0x00F23380u),
+                                    be32(0x00F23380u + 0x16Cu),
+                                    be32(0x00F23600u), be32(0x00F23600u + 0x40u),
+                                    be32(0x00F23600u + 0xA0u),
+                                    be32(0x00F23700u), be32(0x00F23700u + 0x40u),
+                                    be32(0x00F23700u + 0xA0u),
+                                    be32(0x00F28D10u), be32(0x00F28D10u + 0x40u),
+                                    be32(0x00F28D10u + 0xA0u));
+                        }
+                        {
+                            static const uint32_t objs[6] = {
+                                0x24586200u, 0x24586380u, 0x24586680u,
+                                0x247D1880u, 0x247D1A00u, 0x247D1B80u
+                            };
+                            unsigned oi;
+                            for (oi = 0; oi < 6u; oi++) {
+                                uint32_t o = objs[oi];
+                                fprintf(stderr,
+                                        "[actor-world] obj 0x%08X +00=0x%08X +14=0x%08X "
+                                        "+40=0x%08X +50=0x%08X +54=0x%08X +59=0x%02X "
+                                        "+84=0x%08X +90=0x%08X +94=0x%08X "
+                                        "+150=0x%08X +2D0=0x%08X +2E4=0x%08X\n",
+                                        o, be32(o), be32(o + 0x14u),
+                                        be32(o + 0x40u), be32(o + 0x50u),
+                                        be32(o + 0x54u),
+                                        be32(o + 0x58u) >> 24,
+                                        be32(o + 0x84u),
+                                        be32(o + 0x90u), be32(o + 0x94u),
+                                        be32(o + 0x150u),
+                                        be32(o + 0x2D0u), be32(o + 0x2E4u));
+                            }
+                        }
+                        /* 004C4D6C / 00332050 vt 00C3C4C0 +0x1C. Dump only. */
+                        {
+                            uint32_t sidecar = 0x00EB4D00u;
+                            uint32_t act = g_hang_actor ? g_hang_actor : actor;
+                            uint32_t opd1c = be32(0x00C3C4C0u + 0x1Cu);
+                            uint32_t w100 = be32(0x00EF2040u + 0x100u);
+                            uint32_t ea, hits = 0;
+                            fprintf(stderr,
+                                    "[ice-c332] 00EB4D00 +0=0x%08X +4=0x%08X +8=0x%08X "
+                                    "+C=0x%08X +18=0x%08X +1C0=0x%08X "
+                                    "vt00C3C4C0 +0=0x%08X +C=0x%08X +1C=0x%08X fn1C=0x%08X "
+                                    "C94154=0x%08X C94158=0x%08X C94168=0x%08X "
+                                    "EF2040 +0=0x%08X +100=0x%02X +101=0x%02X "
+                                    "+104=0x%08X +108=0x%08X "
+                                    "actor=0x%08X +14=0x%08X +1aac=0x%08X +1ab0=0x%08X "
+                                    "coll00F27D10=0x%08X\n",
+                                    be32(sidecar), be32(sidecar + 4u),
+                                    be32(sidecar + 8u), be32(sidecar + 0xCu),
+                                    be32(sidecar + 0x18u),
+                                    be32(sidecar + 0x1C0u),
+                                    be32(0x00C3C4C0u),
+                                    be32(0x00C3C4C0u + 0xCu),
+                                    opd1c, opd1c ? be32(opd1c) : 0u,
+                                    be32(0x00C94154u), be32(0x00C94158u),
+                                    be32(0x00C94168u),
+                                    be32(0x00EF2040u),
+                                    (w100 >> 24) & 0xFFu, (w100 >> 16) & 0xFFu,
+                                    be32(0x00EF2040u + 0x104u),
+                                    be32(0x00EF2040u + 0x108u),
+                                    act,
+                                    act ? be32(act + 0x14u) : 0u,
+                                    act ? be32(act + 0x1AACu) : 0u,
+                                    act ? be32(act + 0x1AB0u) : 0u,
+                                    be32(0x00F27D10u));
+                            for (ea = 0x00EB0000u; ea < 0x00EC8000u; ea += 4u) {
+                                if (be32(ea) != 0x00C3C4C0u)
+                                    continue;
+                                fprintf(stderr,
+                                        "[ice-c332] hit 00C3C4C0 @0x%08X\n", ea);
+                                if (++hits >= 8u)
+                                    break;
+                            }
+                            if (!hits)
+                                fprintf(stderr,
+                                        "[ice-c332] hit 00C3C4C0 none in 00EB0000-00EC8000\n");
+                        }
+                    }
+                }
+              }
+            } }
+          n=0; } }
+      else { last=(uint32_t)a; n=0; } }
+    return hv; }
 uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
     /* Raw SPU problem state: reading the outbound mailbox POPS it, so that one
      * cannot be served out of memory. Everything else in the window the SPU
@@ -1335,6 +1894,14 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
  * any PPU store into [base+0x40, base+0xC0) is then logged with its guest
  * function, catching whoever bumps the per-SPU lane counters. */
 extern "C" uint32_t g_barrier_sync_watch = 0;
+/* Armed from game/stubs.cpp acit_ovl_ctor_probe("ret"): who zeros
+ * overlay +0x2108 / +0x2304 after 0057FD88 returns. Compact; no stack dump. */
+extern "C" uint32_t g_ovl_clear_watch = 0;
+/* Ice world BSS 00E898A0 +0x50 (u16 index) / +0x54 (wad record) / +0x94 (Ice).
+ * Armed from boot in ps3_load_prx_modules; not an HLE call of 00644CE8. */
+extern "C" uint32_t g_world54_watch = 0;
+/* Overlay job cells / work flags. Dump-only. Do not plant a cell. */
+extern "C" uint32_t g_ovl_cell_watch = 0;
 
 /* Window for the INLINE write-watch in ppu_memory.h (libs/ stores). Same PPU_WWATCH
  * setting as below; kept as a pair so the inline check is two compares against
@@ -1455,6 +2022,151 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
               fflush(stderr);
           }
       } }
+    /* Ice world 00E898A0+0x50/+0x54 and +0x90/+0x94: every guest store until Ice hang. */
+    if (g_world54_watch &&
+        ((a >= 0x00E898F0u && a < 0x00E898F8u) ||
+         (a >= 0x00E89930u && a < 0x00E89938u))) {
+        static unsigned _n;
+        if (_n++ < 64u) {
+            extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+            extern void ppu_dump_guest_stack(ppu_context*, const char*);
+            ppu_context* c = g_active_ctx;
+            const char* tag = (a >= 0x00E89930u) ? "world94" : "world54";
+            fprintf(stderr,
+                    "[%s] n=%u 0x%08X <- 0x%08X w%d guest-fn=0x%08X "
+                    "cia=0x%08X lr=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r31=0x%08X "
+                    "world+50=0x%04X +52=0x%04X +54=0x%08X +90=0x%08X +94=0x%08X "
+                    "pool80=0x%08X%s\n",
+                    tag, _n, a, v, width, ppu_prof_resolve_host(ra),
+                    c ? (uint32_t)c->cia : 0u, c ? (uint32_t)c->lr : 0u,
+                    c ? (uint32_t)c->gpr[3] : 0u, c ? (uint32_t)c->gpr[4] : 0u,
+                    c ? (uint32_t)c->gpr[5] : 0u, c ? (uint32_t)c->gpr[31] : 0u,
+                    vm_read16(0x00E898A0u + 0x50u),
+                    vm_read16(0x00E898A0u + 0x52u),
+                    vm_read32(0x00E898A0u + 0x54u),
+                    vm_read32(0x00E898A0u + 0x90u),
+                    vm_read32(0x00E898A0u + 0x94u),
+                    vm_read32(0x00F5CD80u),
+                    v ? "" : "  <<< ZERO");
+            if (_n == 1u && c)
+                ppu_dump_guest_stack(c, tag);
+            if (a == 0x00E89934u && c)
+                ppu_dump_guest_stack(c, "world94");
+            fflush(stderr);
+        } else if (_n == 65u) {
+            fprintf(stderr, "[world54] --- print cap 64 reached ---\n");
+            fflush(stderr);
+        }
+    }
+    if (g_ovl_cell_watch &&
+        (a == 0x00F6D130u || a == 0x00F6D134u ||
+         a == 0x00F6D138u || a == 0x00F6D13Cu ||
+         a == 0x00F22B58u || a == 0x00F22B5Cu ||
+         a == 0x00F46C20u || a == 0x00F46C24u ||
+         a == 0x00F9BFB0u || a == 0x00F9BFB4u ||
+         a == 0x00FD67A0u || a == 0x00FD67A4u ||
+         a == 0x00F1E5D0u || a == 0x00F3EB8Cu ||
+         a == 0x00F6CF74u || a == 0x00F6CF78u ||
+         a == 0x00F6CF7Cu || a == 0x00F6CF80u ||
+         a == 0x00F23530u || a == 0x00F23534u ||
+         a == 0x00F23558u || a == 0x00F2355Cu ||
+         a == 0x00F7B488u || a == 0x00F7B48Cu)) {
+        static unsigned _n;
+        if (_n++ < 48u) {
+            extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+            ppu_context* c = g_active_ctx;
+            fprintf(stderr,
+                    "[ovl-cell] n=%u 0x%08X <- 0x%08X w%d guest-fn=0x%08X "
+                    "cia=0x%08X lr=0x%08X r3=0x%08X walk+4=0x%08X%s\n",
+                    _n, a, v, width, ppu_prof_resolve_host(ra),
+                    c ? (uint32_t)c->cia : 0u, c ? (uint32_t)c->lr : 0u,
+                    c ? (uint32_t)c->gpr[3] : 0u,
+                    vm_read32(0x00EB3980u + 4u),
+                    v ? "" : "  <<< ZERO");
+            fflush(stderr);
+        } else if (_n == 49u) {
+            fprintf(stderr, "[ovl-cell] --- print cap 48 reached ---\n");
+            fflush(stderr);
+        }
+    }
+    if (g_ovl_clear_watch && (a == 0x00F48E08u || a == 0x00F49004u)) {
+        static unsigned _n;
+        if (_n++ < 24u) {
+            extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+            ppu_context* c = g_active_ctx;
+            fprintf(stderr,
+                    "[ovl-clear] n=%u 0x%08X <- 0x%08X w%d guest-fn=0x%08X "
+                    "cia=0x%08X lr=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r31=0x%08X "
+                    "ovl+8=0x%08X +2440=0x%08X +2444=0x%08X +2490=0x%08X%s%s\n",
+                    _n, a, v, width, ppu_prof_resolve_host(ra),
+                    c ? (uint32_t)c->cia : 0u, c ? (uint32_t)c->lr : 0u,
+                    c ? (uint32_t)c->gpr[3] : 0u, c ? (uint32_t)c->gpr[4] : 0u,
+                    c ? (uint32_t)c->gpr[5] : 0u, c ? (uint32_t)c->gpr[31] : 0u,
+                    vm_read32(0x00F46D00u + 8u),
+                    vm_read32(0x00F46D00u + 0x2440u),
+                    vm_read32(0x00F46D00u + 0x2444u),
+                    vm_read32(0x00F46D00u + 0x2490u),
+                    (c && (uint32_t)c->lr == 0x0058D76Cu) ? " 00583ADC-ret" : "",
+                    v ? "" : "  <<< ZERO");
+            if (!v && a == 0x00F49004u) {
+                uint32_t pool = 0x00F5CD80u;
+                uint32_t base = vm_read32(pool);
+                uint32_t tls = vm_read32(0x00EE7500u);
+                uint32_t cur = 0x00F5C298u;
+                uint32_t hash = 0x00F8DF00u;
+                unsigned i;
+                fprintf(stderr,
+                        "[ice-wad] pool80 +0=0x%08X +4=0x%08X +8=0x%08X +C=0x%08X "
+                        "+10=0x%08X +14=0x%08X +18=0x%08X "
+                        "pool00 +0=0x%08X +4=0x%08X +8=0x%08X +14=0x%08X +18=0x%08X "
+                        "ovl+4=0x%08X +8=0x%08X +2308=0x%08X +2440=0x%08X +2444=0x%08X +2490=0x%08X "
+                        "F5C298 +0=0x%08X +4=0x%08X +8=0x%08X "
+                        "hash +0=0x%08X +4=0x%08X +24=0x%08X +28=0x%08X "
+                        "EE7500=0x%08X +54=0x%08X +94=0x%08X "
+                        "E898A0 +0=0x%08X +4=0x%08X +54=0x%08X +94=0x%08X\n",
+                        vm_read32(pool), vm_read32(pool + 4u),
+                        vm_read32(pool + 8u), vm_read32(pool + 0xCu),
+                        vm_read32(pool + 0x10u), vm_read32(pool + 0x14u),
+                        vm_read32(pool + 0x18u),
+                        vm_read32(0x00F5CD00u), vm_read32(0x00F5CD00u + 4u),
+                        vm_read32(0x00F5CD00u + 8u),
+                        vm_read32(0x00F5CD00u + 0x14u),
+                        vm_read32(0x00F5CD00u + 0x18u),
+                        vm_read32(0x00F46D00u + 4u),
+                        vm_read32(0x00F46D00u + 8u),
+                        vm_read32(0x00F46D00u + 0x2308u),
+                        vm_read32(0x00F46D00u + 0x2440u),
+                        vm_read32(0x00F46D00u + 0x2444u),
+                        vm_read32(0x00F46D00u + 0x2490u),
+                        vm_read32(cur), vm_read32(cur + 4u),
+                        vm_read32(cur + 8u),
+                        vm_read32(hash), vm_read32(hash + 4u),
+                        vm_read32(hash + 0x24u), vm_read32(hash + 0x28u),
+                        tls,
+                        tls ? vm_read32(tls + 0x54u) : 0u,
+                        tls ? vm_read32(tls + 0x94u) : 0u,
+                        vm_read32(0x00E898A0u),
+                        vm_read32(0x00E898A0u + 4u),
+                        vm_read32(0x00E898A0u + 0x54u),
+                        vm_read32(0x00E898A0u + 0x94u));
+                for (i = 0; i < 8u; i++) {
+                    uint32_t rec = (base >= 0x10000u) ? base + (i << 8) : 0u;
+                    fprintf(stderr,
+                            "[ice-wad] rec[%u] ea=0x%08X +0=0x%08X +12=0x%04X "
+                            "+28=0x%08X +40=0x%08X +4E=0x%04X +60=0x%08X +90=0x%08X\n",
+                            i, rec,
+                            rec ? vm_read32(rec) : 0u,
+                            rec ? vm_read16(rec + 0x12u) : 0u,
+                            rec ? vm_read32(rec + 0x28u) : 0u,
+                            rec ? vm_read32(rec + 0x40u) : 0u,
+                            rec ? vm_read16(rec + 0x4Eu) : 0u,
+                            rec ? vm_read32(rec + 0x60u) : 0u,
+                            rec ? vm_read32(rec + 0x90u) : 0u);
+                }
+            }
+            fflush(stderr);
+        }
+    }
     uint32_t b = g_barrier_sync_watch;
     if (!b) return;
     if (a >= b + 0x40 && a < b + 0xC0) {

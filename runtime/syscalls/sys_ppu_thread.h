@@ -102,6 +102,9 @@ int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx);
 /* Registration */
 void sys_ppu_thread_init(lv2_syscall_table* tbl);
 
+/* Guest PPU thread table dump for hang census (stderr). */
+void ppu_dump_threads(const char* tag);
+
 #ifdef __cplusplus
 }
 #endif

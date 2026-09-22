@@ -908,6 +908,34 @@ static void write_stat(uint32_t sb, uint32_t mode, uint64_t size)
     vm_write64(sb + 0x2C, 4096);         /* blksize */
 }
 
+#define FS_STAT_RING 8
+static struct {
+    char path[96];
+    int32_t rc;
+} s_stat_ring[FS_STAT_RING];
+static int s_stat_ring_n = 0;
+static void note_stat(const char* p, int32_t rc)
+{
+    int i = s_stat_ring_n % FS_STAT_RING;
+    strncpy(s_stat_ring[i].path, p ? p : "", sizeof s_stat_ring[i].path - 1);
+    s_stat_ring[i].path[sizeof s_stat_ring[i].path - 1] = 0;
+    s_stat_ring[i].rc = rc;
+    s_stat_ring_n++;
+}
+extern "C" void ppu_fs_dump_last_stat(void)
+{
+    int n = s_stat_ring_n;
+    int start = n > FS_STAT_RING ? n - FS_STAT_RING : 0;
+    int k;
+    fprintf(stderr, "[ice-fstat] n=%d\n", n);
+    for (k = start; k < n; k++) {
+        int i = k % FS_STAT_RING;
+        fprintf(stderr, "[ice-fstat] [%d] rc=0x%08X '%s'\n",
+                k, (uint32_t)s_stat_ring[i].rc, s_stat_ring[i].path);
+    }
+    fflush(stderr);
+}
+
 static void cellFsStat(ppu_context* ctx)
 {
     char gpath[1024], hpath[1100];
@@ -917,9 +945,11 @@ static void cellFsStat(ppu_context* ctx)
     struct stat st;
     if (stat(hpath, &st) != 0) {
         if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
+        note_stat(gpath, (int32_t)CELL_FS_ENOENT);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
+    note_stat(gpath, CELL_OK);
     uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
                                            : (CELL_FS_S_IFREG | 0x1B6);
     if (sb) write_stat(sb, mode, (uint64_t)st.st_size);

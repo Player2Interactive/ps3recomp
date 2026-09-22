@@ -1364,13 +1364,34 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * they are easy to miss entirely while diagnosing a pipeline that
          * never fills. Always report the issue: the DESTINATION lsa is the
          * value the whole transfer hangs on. */
-        { static int _l = 0; if (_l++ < 32)
+        { static int _l = 0; if (_l++ < 32) {
+            uint32_t list_lsa = (uint32_t)ea & SPU_LS_MASK;
             fprintf(stderr, "[mfc-list] ISSUE img=%d cmd=0x%02X dest_lsa=0x%05X "
                     "list\n0x%05X size=0x%X (%u elems) tag=%u\n",
-                    spu->image_id, cmd, lsa, (uint32_t)ea & SPU_LS_MASK,
-                    size, size / 8, tag); }
+                    spu->image_id, cmd, lsa, list_lsa,
+                    size, size / 8, tag);
+            if (size >= 8u) {
+                uint32_t szf = spu_ls_read32(spu, list_lsa);
+                uint32_t eal = spu_ls_read32(spu, list_lsa + 4);
+                fprintf(stderr, "[mfc-list] ELEM0 img=%d list=0x%05X "
+                        "size_flags=0x%08X xfer=%u eal=0x%08X\n",
+                        spu->image_id, list_lsa, szf, szf & 0x7FFFu, eal);
+            }
+        } }
         rc = mfc_do_list_transfer(spu, (uint32_t)ea & SPU_LS_MASK,
                                   ea & 0xFFFFFFFF00000000ull, size, cmd);
+        if (spu->image_id == 11 && lsa == 0x25280u && size >= 8u) {
+            static int _d = 0;
+            if (_d++ < 4) {
+                unsigned i;
+                fprintf(stderr, "[mfc-list] DEST img=11 lsa=0x25280:");
+                for (i = 0; i < 48u; i += 4u) {
+                    uint32_t w = spu_ls_read32(spu, 0x25280u + i);
+                    fprintf(stderr, " %08X", w);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
     } else {
         rc = mfc_do_transfer(spu, lsa, ea, size, cmd);
     }
@@ -1552,10 +1573,9 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
         return m;
     }
     case MFC_RdAtomicStat:
-        /* Result of the last atomic line op (GETLLAR/PUTLLC/PUTLLUC), set by
-         * spu_mfc_atomic(): 0 = PUTLLC_SUCCESS, 1 = PUTLLC_FAILURE (line moved,
-         * SPU must retry). Honoring this is what keeps the SPURS lock-free queue
-         * consistent across concurrent SPU kernel threads. */
+        /* Result of the last atomic line op, set by spu_mfc_atomic():
+         * GETLLAR -> 4 (MFC_GETLLAR_SUCCESS), PUTLLC -> 0 commit / 1 lost.
+         * Honoring GETLLAR=4 is what lets a `rdch; brz` lock-line loop leave. */
         return spu->atomic_stat;
     default:
         return 0;

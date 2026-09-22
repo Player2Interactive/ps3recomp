@@ -838,6 +838,44 @@ static int64_t lwc_signal_all_id(uint32_t id)
     return 0;
 }
 
+extern "C" void ppu_dump_lwcond(void)
+{
+    unsigned i, n = 0;
+    fprintf(stderr, "[ice-lwc] slots with waiters or live addr:\n");
+    for (i = 0; i < LWC_HASH; i++) {
+#ifdef _WIN32
+        uint32_t addr = (uint32_t)g_lwc[i].addr;
+#else
+        uint32_t addr = g_lwc[i].addr;
+#endif
+        long w = g_lwc[i].waiters;
+        if (!addr && w == 0)
+            continue;
+        if (w == 0 && n >= 16u)
+            continue;
+        uint32_t mtx = 0, qid = 0, own = 0, rec = 0;
+        if (addr >= 0x10000u && vm_base) {
+            uint32_t t;
+            memcpy(&t, vm_base + addr, 4);
+            mtx = __builtin_bswap32(t);
+            memcpy(&t, vm_base + addr + 4, 4);
+            qid = __builtin_bswap32(t);
+            if (mtx >= 0x10000u) {
+                memcpy(&t, vm_base + mtx + LWM_OWNER, 4);
+                own = __builtin_bswap32(t);
+                memcpy(&t, vm_base + mtx + LWM_RECUR, 4);
+                rec = __builtin_bswap32(t);
+            }
+        }
+        fprintf(stderr,
+                "[ice-lwc] slot=%u cond=0x%08X waiters=%ld mtx=0x%08X qid=0x%08X "
+                "own=%u rec=%u\n",
+                i, addr, w, mtx, qid, own, rec);
+        n++;
+    }
+    fflush(stderr);
+}
+
 /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.
  * The old fixed "1" broke every am-I-the-designated-thread check in
  * multithreaded titles (LBP's job system routes work by thread identity, so

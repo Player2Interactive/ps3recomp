@@ -30,6 +30,31 @@
 
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 
+/* igPm (image 11) overlay-12 idle GETLLAR. Hang census reads these. */
+static spu_context* s_ovl12_ctx[6];
+
+int acit_ovl12_pm_snap(int spu, uint32_t* pc, uint32_t* resv_ea,
+                       int* resv_valid, uint32_t* evmask,
+                       uint32_t* evstat, uint32_t* lsA,
+                       uint32_t* lsB)
+{
+    if (spu < 0 || spu >= 6) return 0;
+    spu_context* c = s_ovl12_ctx[spu];
+    if (!c || !c->ls) return 0;
+    if (pc) *pc = (uint32_t)c->pc & SPU_LS_MASK;
+    if (resv_ea) *resv_ea = c->resv_ea;
+    if (resv_valid) *resv_valid = c->resv_valid;
+    if (evmask) *evmask = c->event_mask;
+    if (evstat) *evstat = c->event_status;
+    if (lsA)
+        *lsA = ((uint32_t)c->ls[0x3FE00] << 24) | ((uint32_t)c->ls[0x3FE01] << 16)
+             | ((uint32_t)c->ls[0x3FE02] << 8) | c->ls[0x3FE03];
+    if (lsB)
+        *lsB = ((uint32_t)c->ls[0x3FE80] << 24) | ((uint32_t)c->ls[0x3FE81] << 16)
+             | ((uint32_t)c->ls[0x3FE82] << 8) | c->ls[0x3FE83];
+    return 1;
+}
+
 /* Counters the intercepts in spu_channels.c maintain for the CURRENT run
  * (single writer per run; reads are diagnostic). */
 volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
@@ -103,6 +128,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     s_pm_data[wid][spu_num] = wkl_data;
     ctx->image_id    = image_id;
     ctx->policy_mode = 1;
+    if (image_id == 11 && spu_num < 6)
+        s_ovl12_ctx[spu_num] = ctx;
 
     /* PM image at its load base (first entry only -- LS persists). */
     if (first)
