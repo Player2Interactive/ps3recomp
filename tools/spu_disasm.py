@@ -144,9 +144,17 @@ RI10_TABLE: dict[int, str] = {
     0b00010100: "andi",   # and word immediate
     0b00000100: "ori",    # or word immediate
     0b00000101: "orhi",   # or halfword immediate            (op8 0x05)
+    # orbi/xorhi/xorbi were missing: the lifter's RI10 map and the
+    # spu_orbi/spu_xorhi/spu_xorbi helpers existed, but the decoder fell
+    # through to `.word`, so every `orbi` lifted as spu_unsupported(). First
+    # seen in ACIT igCollNarrow (0x00B8A980 LS 0x138: `orbi $61,$62,4` building
+    # a shufb pattern from `ila $62,0x10203`).
+    0b00000110: "orbi",   # or byte immediate                (op8 0x06)
     0b00010101: "andhi",  # and halfword immediate           (op8 0x15)
     0b00010110: "andbi",  # and byte immediate               (op8 0x16)
     0b01000100: "xori",   # xor word immediate
+    0b01000101: "xorhi",  # xor halfword immediate           (op8 0x45)
+    0b01000110: "xorbi",  # xor byte immediate               (op8 0x46)
     0b01111100: "ceqi",   # compare equal word immediate
     0b01111101: "ceqhi",  # compare equal halfword immediate
     0b01111110: "ceqbi",  # compare equal byte immediate
