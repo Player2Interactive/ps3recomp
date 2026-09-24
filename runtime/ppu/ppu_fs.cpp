@@ -943,13 +943,55 @@ static void cellFsStat(ppu_context* ctx)
     uint32_t sb = (uint32_t)ctx->gpr[4];
     host_path(hpath, sizeof hpath, gpath);
     struct stat st;
+    uint32_t lr = (uint32_t)ctx->lr;
+    int leave_stat = (lr == 0x004C55F4u || lr == 0x004C5630u || lr == 0x004C5728u ||
+                      lr == 0x004C5740u);
+    if (leave_stat) {
+        fprintf(stderr, "[leave-fe] FsStat lr=0x%08X path='%s' host='%s'\n",
+                lr, gpath, hpath);
+        fflush(stderr);
+    }
     if (stat(hpath, &st) != 0) {
+        /* ACIT leave-FE (004C5558 @ 004C55FC): after vt+0x14 confirm, requires
+         * cellFsStat("<usrdir>/packed")==0. Disc boots set usrdir to
+         * /dev_hdd0/game/<id>/USRDIR even when content lives on /dev_bdvd.
+         * Seed the hdd0 packed directory when the bdvd copy exists so the
+         * gate observes a real dir without planting guest state or faking
+         * file contents (FIOS still ENOENT-falls-back to bdvd for members). */
+        const char* usr_packed = strstr(gpath, "/USRDIR/packed");
+        if (usr_packed && usr_packed[14] == '\0' &&
+            strncmp(gpath, "/dev_hdd0/", 10) == 0) {
+            char bdvd_guest[1024], bdvd_host[1100];
+            snprintf(bdvd_guest, sizeof bdvd_guest, "/dev_bdvd/PS3_GAME/USRDIR/packed");
+            host_path(bdvd_host, sizeof bdvd_host, bdvd_guest);
+            struct stat bst;
+            if (stat(bdvd_host, &bst) == 0 && (bst.st_mode & S_IFDIR)) {
+                if (host_mkdir_p(hpath) == 0 && stat(hpath, &st) == 0) {
+                    fprintf(stderr,
+                            "[leave-fe] seeded hdd0 packed dir '%s' (bdvd present)\n",
+                            hpath);
+                    fflush(stderr);
+                    goto stat_ok;
+                }
+            }
+        }
         if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
         note_stat(gpath, (int32_t)CELL_FS_ENOENT);
+        if (leave_stat) {
+            fprintf(stderr, "[leave-fe] FsStat FAIL lr=0x%08X path='%s' -> ENOENT\n",
+                    lr, gpath);
+            fflush(stderr);
+        }
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
+stat_ok:
     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
     note_stat(gpath, CELL_OK);
+    if (leave_stat) {
+        fprintf(stderr, "[leave-fe] FsStat OK lr=0x%08X path='%s' size=%lld\n",
+                lr, gpath, (long long)st.st_size);
+        fflush(stderr);
+    }
     uint32_t mode = (st.st_mode & S_IFDIR) ? (CELL_FS_S_IFDIR | 0x1FF)
                                            : (CELL_FS_S_IFREG | 0x1B6);
     if (sb) write_stat(sb, mode, (uint64_t)st.st_size);
