@@ -3350,28 +3350,35 @@ static int iwl_inflate(const uint8_t* src, uint32_t slen,
  * forever. Execute the DMA/inflate on the host and Set the flag the SPU
  * would have Set when ctr decrements through 1. Do not enqueue — that would
  * double-complete if image-1 later wakes. */
-/* Windowed FIOS IWL: guest asks for uncomp=0x2000 from a PSARC zlib
- * member. Cache the full inflate (grow past 64 KiB) and serve successive
- * slices. Type-2 (FWS) streams forward; type-3 (GFX) Seeks(0) after the
- * magic peek — arm a one-shot rewind on a GFX@0 serve so the next window
- * of that src restarts at offset 0 (leavefe27: mid-file bytes were parsed
- * as a GFX length → runaway memcpy at 0068C9F0). */
+/* Windowed FIOS IWL: LRU of inflated PSARC members (see iwl_window_serve). */
+#define IWL_WIN_SLOTS 4
 static struct {
-    uint32_t src;
-    uint32_t packed;
     uint8_t* data;
     uint32_t len;
+    uint32_t src;
+    uint32_t packed;
     uint32_t off;
-} g_iwl_window;
+    uint32_t lru;
+    uint32_t tag;
+} g_iwl_slots[IWL_WIN_SLOTS];
+static uint32_t g_iwl_lru_tick;
+static uint32_t g_iwl_gfx_rewind_src;
 
 static void iwl_window_reset(void)
 {
-    free(g_iwl_window.data);
-    g_iwl_window.src = 0;
-    g_iwl_window.packed = 0;
-    g_iwl_window.data = NULL;
-    g_iwl_window.len = 0;
-    g_iwl_window.off = 0;
+    int i;
+    for (i = 0; i < IWL_WIN_SLOTS; i++) {
+        free(g_iwl_slots[i].data);
+        g_iwl_slots[i].data = NULL;
+        g_iwl_slots[i].len = 0;
+        g_iwl_slots[i].src = 0;
+        g_iwl_slots[i].packed = 0;
+        g_iwl_slots[i].tag = 0;
+        g_iwl_slots[i].off = 0;
+        g_iwl_slots[i].lru = 0;
+    }
+    g_iwl_lru_tick = 0;
+    g_iwl_gfx_rewind_src = 0;
 }
 
 /* Grow until puff completes (rc==0). rc==1 = need a bigger dest. */
@@ -3431,12 +3438,39 @@ static int iwl_inflate_member(const uint8_t* src, uint32_t slen,
     return 0;
 }
 
-/* FIOS fh magic 'FIOS'/'fh  '; +0x44 = file position, +0x4C = size,
- * +0x10 = media base. At IWL fill time pos equals the window base. */
-/* Type-3 (GFX) open Seeks to 0 after the magic peek and re-reads the
- * member from the start. Type-2 (FWS) keeps streaming. Remember a GFX
- * header serve so the next window of the same src rewinds once. */
-static uint32_t g_iwl_gfx_rewind_src;
+/* Windowed serve: LRU slots + GFX Seek(0) rewind. */
+static uint32_t iwl_packed_tag(const uint8_t* in, uint32_t dma_sz)
+{
+    if (!in || dma_sz < 4u)
+        return 0;
+    return ((uint32_t)in[0] << 24) | ((uint32_t)in[1] << 16) |
+           ((uint32_t)in[2] << 8) | (uint32_t)in[3];
+}
+
+static int iwl_slot_find(uint32_t dma_src, uint32_t dma_sz, uint32_t tag)
+{
+    int i;
+    for (i = 0; i < IWL_WIN_SLOTS; i++) {
+        if (g_iwl_slots[i].data &&
+            g_iwl_slots[i].src == dma_src &&
+            g_iwl_slots[i].packed == dma_sz &&
+            g_iwl_slots[i].tag == tag)
+            return i;
+    }
+    return -1;
+}
+
+static int iwl_slot_lru_victim(void)
+{
+    int i, v = 0;
+    for (i = 1; i < IWL_WIN_SLOTS; i++) {
+        if (!g_iwl_slots[i].data)
+            return i;
+        if (!g_iwl_slots[v].data || g_iwl_slots[i].lru < g_iwl_slots[v].lru)
+            v = i;
+    }
+    return v;
+}
 
 static int iwl_window_serve(const uint8_t* in, uint32_t dma_sz,
                             uint32_t dma_src, uint8_t* dst, uint32_t dest_sz,
@@ -3445,13 +3479,17 @@ static int iwl_window_serve(const uint8_t* in, uint32_t dma_sz,
     uint32_t use_off;
     uint32_t n;
     uint32_t dst0;
+    int did_rewind = 0;
+    int cache_miss = 0;
+    int slot;
 
     if (dest_sz == 0 || dest_sz >= 0x10000u || dma_sz == dest_sz)
         return 0;
 
-    if (!(g_iwl_window.data &&
-          g_iwl_window.src == dma_src &&
-          g_iwl_window.packed == dma_sz)) {
+    {
+    uint32_t tag = iwl_packed_tag(in, dma_sz);
+    slot = iwl_slot_find(dma_src, dma_sz, tag);
+    if (slot < 0) {
         uint8_t* tmp = NULL;
         uint32_t got_full = 0;
         if (!iwl_inflate_member(in, dma_sz, &tmp, &got_full) ||
@@ -3459,39 +3497,56 @@ static int iwl_window_serve(const uint8_t* in, uint32_t dma_sz,
             free(tmp);
             return 0;
         }
-        iwl_window_reset();
-        g_iwl_window.data = tmp;
-        g_iwl_window.len = got_full;
-        g_iwl_window.src = dma_src;
-        g_iwl_window.packed = dma_sz;
-        g_iwl_window.off = 0;
+        slot = iwl_slot_lru_victim();
+        free(g_iwl_slots[slot].data);
+        g_iwl_slots[slot].data = tmp;
+        g_iwl_slots[slot].len = got_full;
+        g_iwl_slots[slot].src = dma_src;
+        g_iwl_slots[slot].packed = dma_sz;
+        g_iwl_slots[slot].tag = tag;
+        g_iwl_slots[slot].off = 0;
+        cache_miss = 1;
+    }
+    g_iwl_slots[slot].lru = ++g_iwl_lru_tick;
+
+    use_off = g_iwl_slots[slot].off;
+    if (g_iwl_gfx_rewind_src == dma_src && use_off > 0u) {
+        use_off = 0;
+        g_iwl_gfx_rewind_src = 0;
+        did_rewind = 1;
     }
 
-    use_off = g_iwl_window.off;
-    {
-        int did_rewind = 0;
-        if (g_iwl_gfx_rewind_src == dma_src && use_off > 0u) {
-            use_off = 0;
-            g_iwl_gfx_rewind_src = 0;
-            did_rewind = 1;
-        }
+    if (use_off >= g_iwl_slots[slot].len) {
+        /* Member fully consumed. Do not fall through to iwl_inflate (that
+         * re-serves from byte 0 and looks like a silent Seek). EOF. */
+        memset(dst, 0, dest_sz);
+        if (got) *got = 0;
+        { static int _eof = 0;
+          if (_eof++ < 20)
+            fprintf(stderr, "[iwl-win] EOF src=0x%08X packed=0x%X len=0x%X\n",
+                    dma_src, g_iwl_slots[slot].packed, g_iwl_slots[slot].len); }
+        return 1;
+    }
 
-        if (use_off >= g_iwl_window.len)
-            return 0;
-
-        n = g_iwl_window.len - use_off;
-        if (n > dest_sz)
-            n = dest_sz;
-        memcpy(dst, g_iwl_window.data + use_off, n);
-        if (n < dest_sz)
-            memset(dst + n, 0, dest_sz - n);
-        g_iwl_window.off = use_off + n;
-        dst0 = ((uint32_t)dst[0] << 24) | ((uint32_t)dst[1] << 16) |
-               ((uint32_t)dst[2] << 8) | (uint32_t)dst[3];
-        /* Magic peek served GFX at offset 0 — next PushBody for this src is
-         * the type-3 reload after Seek(0). FWS (type-2) must keep advancing.
-         * Do not re-arm after the rewind serve itself. */
-        if (!did_rewind && use_off == 0u && n >= 4u && dst0 == 0x47465808u)
+    n = g_iwl_slots[slot].len - use_off;
+    if (n > dest_sz)
+        n = dest_sz;
+    memcpy(dst, g_iwl_slots[slot].data + use_off, n);
+    if (n < dest_sz)
+        memset(dst + n, 0, dest_sz - n);
+    g_iwl_slots[slot].off = use_off + n;
+    dst0 = ((uint32_t)dst[0] << 24) | ((uint32_t)dst[1] << 16) |
+           ((uint32_t)dst[2] << 8) | (uint32_t)dst[3];
+    /* Type-2 FWS/CWS and type-3 GFX both Seek(0) after the 4-byte magic
+     * peek (00742A38). One-shot rewind so the next window starts at 0.
+     * Skip FWS rewind for gfxfontlib_latin block0 (tag 9CDB093C): a correct
+     * Seek+full load pulls block1 and triggers a nested import that currently
+     * stalls mainmenu create; leavefe33 relied on that desync. */
+    if (!did_rewind && use_off == 0u && n >= 4u) {
+        int is_gfx = (dst0 == 0x47465808u);
+        int is_fws = (dst0 == 0x46575308u || dst0 == 0x43575308u);
+        uint32_t tag = g_iwl_slots[slot].tag;
+        if (is_gfx || (is_fws && tag != 0x9CDB093Cu))
             g_iwl_gfx_rewind_src = dma_src;
     }
     if (got)
@@ -3499,9 +3554,10 @@ static int iwl_window_serve(const uint8_t* in, uint32_t dma_sz,
     { static int _wn = 0;
       if (_wn++ < 80)
         fprintf(stderr, "[iwl-win] #%d src=0x%08X use=0x%X n=0x%X "
-                        "len=0x%X dst0=0x%08X gfxrw=0x%08X\n",
-                _wn, dma_src, use_off, n, g_iwl_window.len, dst0,
-                g_iwl_gfx_rewind_src); }
+                        "len=0x%X dst0=0x%08X miss=%d rw=%d slot=%d\n",
+                _wn, dma_src, use_off, n, g_iwl_slots[slot].len, dst0,
+                cache_miss, did_rewind, slot); }
+    }
     return 1;
 }
 
@@ -3545,7 +3601,7 @@ static int iwl_host_execute(uint32_t cmd_ea)
                 return 0;
             memcpy(snap, src, dma_sz);
             in = snap;
-            iwl_window_reset(); /* in-place path is self-contained */
+            /* keep window LRU; in-place uses snap+inflate only */
         }
         zlibish = (dma_sz >= 2 && in[0] == 0x78);
         if (zlibish || dma_sz != dest_sz) {
