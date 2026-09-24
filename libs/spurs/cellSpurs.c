@@ -3364,6 +3364,222 @@ static struct {
 static uint32_t g_iwl_lru_tick;
 static uint32_t g_iwl_gfx_rewind_src;
 
+/* PSARC full-member inflate for multi-block scaleform (mainmenu.swf is
+ * 0x3C8CD across 4×64KiB blocks; DoAction/Key.addListener lives in block1).
+ * A single IWL DMA only carries one packed block — without TOC assembly the
+ * window cache EOFs at 0x10000 and the GFx parser never sees tag 12. */
+extern const char* ppu_vfs_root;
+static uint8_t* g_psarc_map;
+static size_t g_psarc_len;
+static uint32_t g_psarc_block_size;
+static uint32_t g_psarc_num;
+static uint32_t g_psarc_entry_size;
+static const uint8_t* g_psarc_entries;
+static const uint8_t* g_psarc_bt; /* BE u16 block lengths */
+static int g_psarc_ok;
+
+static int iwl_inflate_member(const uint8_t* src, uint32_t slen,
+                              uint8_t** out, uint32_t* out_len);
+
+static uint32_t iwl_be16(const uint8_t* p)
+{
+    return ((uint32_t)p[0] << 8) | (uint32_t)p[1];
+}
+
+static uint32_t iwl_be32(const uint8_t* p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static uint64_t iwl_be40(const uint8_t* p)
+{
+    return ((uint64_t)p[0] << 32) | ((uint64_t)p[1] << 24) |
+           ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 8) | (uint64_t)p[4];
+}
+
+static int iwl_psarc_ensure(void)
+{
+    char path[1024];
+    FILE* f;
+    uint8_t hdr[32];
+    uint32_t toc_len;
+    if (g_psarc_ok)
+        return 1;
+    if (g_psarc_map)
+        return 0;
+    path[0] = 0;
+    if (ppu_vfs_root && ppu_vfs_root[0])
+        snprintf(path, sizeof path,
+                 "%s/PS3_GAME/USRDIR/packed/game/global_cached.psarc",
+                 ppu_vfs_root);
+    if (!path[0] || !(f = fopen(path, "rb"))) {
+        snprintf(path, sizeof path,
+                 "dump/PS3_GAME/USRDIR/packed/game/global_cached.psarc");
+        f = fopen(path, "rb");
+    }
+    if (!f)
+        return 0;
+    if (fread(hdr, 1, 32, f) != 32 || memcmp(hdr, "PSAR", 4) != 0) {
+        fclose(f);
+        return 0;
+    }
+    toc_len = iwl_be32(hdr + 12);
+    g_psarc_entry_size = iwl_be32(hdr + 16);
+    g_psarc_num = iwl_be32(hdr + 20);
+    g_psarc_block_size = iwl_be32(hdr + 24);
+    if (!toc_len || !g_psarc_entry_size || !g_psarc_num ||
+        !g_psarc_block_size || toc_len > 0x400000u) {
+        fclose(f);
+        return 0;
+    }
+    fseek(f, 0, SEEK_END);
+    g_psarc_len = (size_t)ftell(f);
+    fseek(f, 0, SEEK_SET);
+    g_psarc_map = (uint8_t*)malloc(g_psarc_len);
+    if (!g_psarc_map || fread(g_psarc_map, 1, g_psarc_len, f) != g_psarc_len) {
+        free(g_psarc_map);
+        g_psarc_map = NULL;
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    g_psarc_entries = g_psarc_map + 0x20;
+    g_psarc_bt = g_psarc_entries + g_psarc_num * g_psarc_entry_size;
+    g_psarc_ok = 1;
+    fprintf(stderr, "[iwl-psarc] mapped %s len=0x%zX entries=%u block=0x%X\n",
+            path, (size_t)g_psarc_len, g_psarc_num, g_psarc_block_size);
+    return 1;
+}
+
+/* Match one packed IWL buffer to a PSARC entry's block and inflate the
+ * whole member (all blocks). Returns 1 and owns *out. *start_off is set to
+ * the uncompressed file offset of the matched block (0 for block0). */
+static int iwl_psarc_inflate_full(const uint8_t* in, uint32_t dma_sz,
+                                  uint8_t** out, uint32_t* out_len,
+                                  uint32_t* start_off)
+{
+    uint32_t ei, zi, blen, nblk, pos, remain, match_blk;
+    uint64_t off, length;
+    const uint8_t* ent;
+    uint8_t* acc = NULL;
+    uint32_t acc_len = 0, acc_cap = 0;
+    if (!in || dma_sz < 4u || !out || !out_len || !iwl_psarc_ensure())
+        return 0;
+    if (start_off)
+        *start_off = 0;
+    for (ei = 1; ei < g_psarc_num; ei++) {
+        uint32_t blk_i, nblocks_est, scan_pos;
+        ent = g_psarc_entries + ei * g_psarc_entry_size;
+        zi = iwl_be32(ent + 16);
+        length = iwl_be40(ent + 20);
+        off = iwl_be40(ent + 25);
+        if (length == 0 || length > 0x800000ull || off >= g_psarc_len)
+            continue;
+        nblocks_est = (uint32_t)((length + g_psarc_block_size - 1) /
+                                 g_psarc_block_size);
+        if (nblocks_est == 0 || nblocks_est > 0x10000u)
+            continue;
+        /* Find which block of this member matches the DMA payload. */
+        match_blk = 0xFFFFFFFFu;
+        scan_pos = (uint32_t)off;
+        for (blk_i = 0; blk_i < nblocks_est; blk_i++) {
+            blen = iwl_be16(g_psarc_bt + (zi + blk_i) * 2);
+            if (blen == 0) {
+                uint32_t take = g_psarc_block_size;
+                if (scan_pos + take > g_psarc_len)
+                    break;
+                scan_pos += take;
+                continue;
+            }
+            if (scan_pos + blen > g_psarc_len)
+                break;
+            if ((blen == dma_sz &&
+                 memcmp(g_psarc_map + scan_pos, in, dma_sz) == 0) ||
+                (blen >= 2u && dma_sz + 2u >= blen &&
+                 memcmp(g_psarc_map + scan_pos + 2, in, blen - 2u) == 0) ||
+                (blen > dma_sz &&
+                 memcmp(g_psarc_map + scan_pos + 2, in, dma_sz) == 0)) {
+                match_blk = blk_i;
+                break;
+            }
+            scan_pos += blen;
+        }
+        if (match_blk == 0xFFFFFFFFu)
+            continue;
+        /* Inflate every block of this member. */
+        pos = (uint32_t)off;
+        remain = (uint32_t)length;
+        nblk = zi;
+        acc_cap = (uint32_t)length;
+        acc = (uint8_t*)malloc(acc_cap);
+        if (!acc)
+            return 0;
+        acc_len = 0;
+        while (remain > 0 && nblk < zi + nblocks_est + 2u) {
+            uint32_t b = iwl_be16(g_psarc_bt + nblk * 2);
+            nblk++;
+            if (b == 0) {
+                uint32_t take = remain;
+                if (take > g_psarc_block_size)
+                    take = g_psarc_block_size;
+                if (pos + take > g_psarc_len) {
+                    free(acc);
+                    return 0;
+                }
+                memcpy(acc + acc_len, g_psarc_map + pos, take);
+                acc_len += take;
+                pos += take;
+                remain -= take;
+                continue;
+            }
+            if (pos + b > g_psarc_len) {
+                free(acc);
+                return 0;
+            }
+            {
+                const uint8_t* chunk = g_psarc_map + pos;
+                uint8_t* piece = NULL;
+                uint32_t piece_len = 0;
+                if (!iwl_inflate_member(chunk, b, &piece, &piece_len) ||
+                    !piece) {
+                    free(acc);
+                    return 0;
+                }
+                if (piece_len > remain)
+                    piece_len = remain;
+                if (acc_len + piece_len > acc_cap) {
+                    free(piece);
+                    free(acc);
+                    return 0;
+                }
+                memcpy(acc + acc_len, piece, piece_len);
+                acc_len += piece_len;
+                remain -= piece_len;
+                free(piece);
+                pos += b;
+            }
+        }
+        if (remain != 0 || acc_len != (uint32_t)length) {
+            free(acc);
+            return 0;
+        }
+        *out = acc;
+        *out_len = acc_len;
+        if (start_off)
+            *start_off = match_blk * g_psarc_block_size;
+        { static int _pf = 0;
+          if (_pf++ < 12)
+            fprintf(stderr,
+                    "[iwl-psarc] full member ei=%u len=0x%X head=%02X%02X%02X%02X "
+                    "packed=0x%X blk=%u off=0x%X\n",
+                    ei, acc_len, acc[0], acc[1], acc[2], acc[3], dma_sz,
+                    match_blk, match_blk * g_psarc_block_size); }
+        return 1;
+    }
+    return 0;
+}
+
 static void iwl_window_reset(void)
 {
     int i;
@@ -3483,8 +3699,11 @@ static int iwl_window_serve(const uint8_t* in, uint32_t dma_sz,
     int cache_miss = 0;
     int slot;
 
-    if (dest_sz == 0 || dest_sz >= 0x10000u || dma_sz == dest_sz)
+    if (dest_sz == 0 || dma_sz == dest_sz)
         return 0;
+    /* dest_sz >= 0x10000 used to bail so bulk Reads fell through to
+     * single-block iwl_inflate (zeros past 64KiB). With full-member cache
+     * we can satisfy those too. */
 
     {
     uint32_t tag = iwl_packed_tag(in, dma_sz);
@@ -3492,8 +3711,16 @@ static int iwl_window_serve(const uint8_t* in, uint32_t dma_sz,
     if (slot < 0) {
         uint8_t* tmp = NULL;
         uint32_t got_full = 0;
-        if (!iwl_inflate_member(in, dma_sz, &tmp, &got_full) ||
-            got_full < dest_sz) {
+        uint32_t start_off = 0;
+        /* Prefer full PSARC member (multi-block). Fallback: this DMA only. */
+        if (!iwl_psarc_inflate_full(in, dma_sz, &tmp, &got_full, &start_off)) {
+            if (!iwl_inflate_member(in, dma_sz, &tmp, &got_full) ||
+                got_full < dest_sz) {
+                free(tmp);
+                return 0;
+            }
+            start_off = 0;
+        } else if (got_full < dest_sz) {
             free(tmp);
             return 0;
         }
@@ -3504,7 +3731,8 @@ static int iwl_window_serve(const uint8_t* in, uint32_t dma_sz,
         g_iwl_slots[slot].src = dma_src;
         g_iwl_slots[slot].packed = dma_sz;
         g_iwl_slots[slot].tag = tag;
-        g_iwl_slots[slot].off = 0;
+        /* Matched mid-member block: first serve is that block's file off. */
+        g_iwl_slots[slot].off = start_off;
         cache_miss = 1;
     }
     g_iwl_slots[slot].lru = ++g_iwl_lru_tick;
@@ -3783,4 +4011,44 @@ s32 cellSpursLFQueueDetachLv2EventQueue(u64 queue_ea)
     static int _n = 0;
     if (_n++ < 8) printf("[cellSpurs] LFQueueDetachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
     return CELL_OK;
+}
+
+/* leavefe63: GFx stream Read (0068C770) lazy-inits zlib when +A8==0
+ * (stb at 68C9AC), which re-breaks CLR_A8_GFX and corrupts tag lengths on
+ * already-inflated PSARC members (GFX/FWS). Serve raw bytes from the
+ * full-member IWL cache instead; caller advances FIOS fh+0x44. */
+int acit_iwl_member_copy(uint32_t member_len, uint32_t off,
+                         uint32_t dst_ea, uint32_t size, uint32_t* out_n)
+{
+    int i;
+    uint32_t n, mag;
+    const uint8_t* d;
+    if (!vm_base || dst_ea < 0x10000u || size == 0u || size > 0x100000u ||
+        member_len < 8u || member_len > 0x400000u)
+        return 0;
+    for (i = 0; i < IWL_WIN_SLOTS; i++) {
+        if (!g_iwl_slots[i].data || g_iwl_slots[i].len != member_len)
+            continue;
+        d = g_iwl_slots[i].data;
+        mag = ((uint32_t)d[0] << 24) | ((uint32_t)d[1] << 16) |
+              ((uint32_t)d[2] << 8) | (uint32_t)d[3];
+        /* Uncompressed Scaleform/SWF only — CWS still needs guest zlib. */
+        if (mag != 0x47465808u && mag != 0x46575308u)
+            continue;
+        if (off >= g_iwl_slots[i].len) {
+            if (out_n)
+                *out_n = 0;
+            return 1;
+        }
+        n = g_iwl_slots[i].len - off;
+        if (n > size)
+            n = size;
+        memcpy(vm_base + dst_ea, d + off, n);
+        /* Keep window cursor in sync for any residual FIOS pin serves. */
+        g_iwl_slots[i].off = off + n;
+        if (out_n)
+            *out_n = n;
+        return 1;
+    }
+    return 0;
 }

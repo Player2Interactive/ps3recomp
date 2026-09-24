@@ -296,6 +296,10 @@ s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking);
 s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea);
 s32 cellSpursLFQueueDetachLv2EventQueue(u64 queue_ea);
 
+/* Raw copy from IWL full-member cache (GFX/FWS). Returns 1 on hit/EOF. */
+int acit_iwl_member_copy(uint32_t member_len, uint32_t off,
+                         uint32_t dst_ea, uint32_t size, uint32_t* out_n);
+
 s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits);
 s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
                            u32 mode);  /* guest EAs; bits is in/out BE u16 */
