@@ -3295,6 +3295,25 @@ static int iwl_commit_range(uint32_t ea, uint32_t size)
 #endif
 }
 
+/* puff rc==1 = output space exhausted. Guest FIOS often asks for a window
+ * (e.g. uncomp=0x2000) from a larger zlib/deflate block (64 KiB). puff fills
+ * dest then returns 1 without updating *destlen; the bytes written are valid.
+ * Treat that as success so the memcpy fallback cannot clobber GFX/IGHW with
+ * the packed source (leavefe26: mainmenu Read saw ECBD093C = deflate @+2). */
+static int iwl_inflate_ok(int rc, unsigned long destlen, uint32_t dlen,
+                          uint32_t* produced)
+{
+    if (rc == 0) {
+        if (produced) *produced = (uint32_t)destlen;
+        return 1;
+    }
+    if (rc == 1 && dlen) {
+        if (produced) *produced = dlen;
+        return 1;
+    }
+    return 0;
+}
+
 static int iwl_inflate(const uint8_t* src, uint32_t slen,
                        uint8_t* dst, uint32_t dlen, uint32_t* produced)
 {
@@ -3317,14 +3336,12 @@ static int iwl_inflate(const uint8_t* src, uint32_t slen,
     destlen = dlen;
     sourcelen = inlen;
     rc = puff(dst, &destlen, in, &sourcelen);
-    if (rc) {
-        destlen = dlen;
-        sourcelen = slen;
-        rc = puff(dst, &destlen, src, &sourcelen);
-        if (rc) return 0;
-    }
-    if (produced) *produced = (uint32_t)destlen;
-    return 1;
+    if (iwl_inflate_ok(rc, destlen, dlen, produced))
+        return 1;
+    destlen = dlen;
+    sourcelen = slen;
+    rc = puff(dst, &destlen, src, &sourcelen);
+    return iwl_inflate_ok(rc, destlen, dlen, produced);
 }
 
 /* Image-1 IWL slot: src, dst, packed, unpacked, (ctrEA|1), flagEA.
@@ -3333,6 +3350,72 @@ static int iwl_inflate(const uint8_t* src, uint32_t slen,
  * forever. Execute the DMA/inflate on the host and Set the flag the SPU
  * would have Set when ctr decrements through 1. Do not enqueue — that would
  * double-complete if image-1 later wakes. */
+/* Windowed FIOS IWL: guest asks for uncomp=0x2000 from a ~64 KiB PSARC
+ * zlib block. Serve successive slices from a host-side full inflate so
+ * identical PushBody retries (gfxfont type-2 open) advance instead of
+ * re-supplying bytes at offset 0 forever. */
+static struct {
+    uint32_t src;
+    uint32_t packed;
+    uint8_t* data;
+    uint32_t len;
+    uint32_t off;
+} g_iwl_window;
+
+static void iwl_window_reset(void)
+{
+    free(g_iwl_window.data);
+    g_iwl_window.src = 0;
+    g_iwl_window.packed = 0;
+    g_iwl_window.data = NULL;
+    g_iwl_window.len = 0;
+    g_iwl_window.off = 0;
+}
+
+static int iwl_window_serve(const uint8_t* in, uint32_t dma_sz,
+                            uint32_t dma_src, uint8_t* dst, uint32_t dest_sz,
+                            uint32_t* got)
+{
+    if (dest_sz == 0 || dest_sz >= 0x10000u || dma_sz == dest_sz)
+        return 0;
+
+    if (g_iwl_window.data &&
+        g_iwl_window.src == dma_src &&
+        g_iwl_window.packed == dma_sz &&
+        g_iwl_window.off < g_iwl_window.len) {
+        uint32_t n = g_iwl_window.len - g_iwl_window.off;
+        if (n > dest_sz) n = dest_sz;
+        memcpy(dst, g_iwl_window.data + g_iwl_window.off, n);
+        if (n < dest_sz)
+            memset(dst + n, 0, dest_sz - n);
+        g_iwl_window.off += n;
+        if (got) *got = n;
+        return 1;
+    }
+
+    {
+        uint32_t full = 0x10000u;
+        uint8_t* tmp = (uint8_t*)malloc(full);
+        uint32_t got_full = 0;
+        if (!tmp)
+            return 0;
+        if (!iwl_inflate(in, dma_sz, tmp, full, &got_full) || got_full < dest_sz) {
+            free(tmp);
+            return 0;
+        }
+        iwl_window_reset();
+        g_iwl_window.data = tmp;
+        g_iwl_window.len = got_full;
+        g_iwl_window.src = dma_src;
+        g_iwl_window.packed = dma_sz;
+        g_iwl_window.off = 0;
+        memcpy(dst, tmp, dest_sz);
+        g_iwl_window.off = dest_sz;
+        if (got) *got = dest_sz;
+        return 1;
+    }
+}
+
 static int iwl_host_execute(uint32_t cmd_ea)
 {
     uint32_t dma_src = vm_read32(cmd_ea + 0);
@@ -3373,14 +3456,19 @@ static int iwl_host_execute(uint32_t cmd_ea)
                 return 0;
             memcpy(snap, src, dma_sz);
             in = snap;
+            iwl_window_reset(); /* in-place path is self-contained */
         }
         zlibish = (dma_sz >= 2 && in[0] == 0x78);
         if (zlibish || dma_sz != dest_sz) {
-            inflated = iwl_inflate(in, dma_sz, dst, dest_sz, &got);
+            if (!overlap)
+                inflated = iwl_window_serve(in, dma_sz, dma_src, dst, dest_sz, &got);
+            if (!inflated)
+                inflated = iwl_inflate(in, dma_sz, dst, dest_sz, &got);
         }
-        if (!inflated && !overlap) {
-            memcpy(dst, in, dma_sz < dest_sz ? dma_sz : dest_sz);
-        } else if (!inflated && overlap && dma_sz == dest_sz) {
+        /* Raw copy only when sizes match (true DMA). Never memcpy packed
+         * over a failed/partial window inflate — that is how mainmenu.swf
+         * Read returned ECBD093C (deflate payload) instead of GFX\x08. */
+        if (!inflated && dma_sz == dest_sz) {
             memcpy(dst, in, dma_sz);
         }
         if (dma_sz >= 4u)
