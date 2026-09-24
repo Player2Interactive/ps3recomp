@@ -222,6 +222,13 @@ void rsx_raise_user_cmd(uint32_t arg)
           fprintf(stderr, "[usercmd] #%lu arg=0x%08X handlers=0x%X qid=%u\n",
                   n, arg, mask, s_isr_qid); fflush(stderr); } }
     vm_write32(RSX_DRIVER_INFO_EA + RSX_DI_USER_CMD_PARAM, arg);
+    if (!s_isr_qid) {
+        /* ACIT (and any title using HLE cellGcmInit) never allocates the
+         * sys_rsx ISR queue. Deliver through the HLE pump so the OPD
+         * installed by cellGcmSetUserHandler still runs. */
+        cellGcmQueueUserCommand(arg);
+        return;
+    }
     rsx_send_event(SYS_RSX_EVENT_USER_CMD);
 }
 

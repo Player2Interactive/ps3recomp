@@ -3,6 +3,8 @@
  *
  * Implements PPU fibers using Windows Fibers API or POSIX ucontext.
  * Each CellFiber maps to a native fiber for true cooperative switching.
+ * Bionic (Android) has no ucontext functions; there each fiber is a parked
+ * pthread handed a run token (runtime/platform/posix_fiber.h).
  */
 
 /* Darwin gates the ucontext routines AND the shape of ucontext_t itself on
@@ -22,8 +24,24 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__ANDROID__) || defined(__BIONIC__) || defined(PS3_FIBER_PTHREAD)
+/* Bionic's <ucontext.h> declares ucontext_t and none of getcontext /
+ * makecontext / swapcontext / setcontext. The same four operations come from
+ * a parked-thread-per-fiber implementation instead; see the header for what
+ * that does and does not preserve. PS3_FIBER_PTHREAD forces it elsewhere
+ * (that is how it is exercised on a glibc or Windows host). */
+#define PS3_FIBER_USE_PTHREAD 1
+#include "../../runtime/platform/posix_fiber.h"
+typedef ps3_fiber_ctx fiber_ctx_t;
+#define FCTX_GET(c)          ps3_fiber_getcontext(c)
+#define FCTX_SWAP(from, to)  ps3_fiber_swapcontext((from), (to))
+#define FCTX_SET(to)         ps3_fiber_setcontext(to)
 #else
 #include <ucontext.h>
+typedef ucontext_t fiber_ctx_t;
+#define FCTX_GET(c)          getcontext(c)
+#define FCTX_SWAP(from, to)  swapcontext((from), (to))
+#define FCTX_SET(to)         setcontext(to)
 
 #if defined(__APPLE__)
 /* getcontext() points uc_mcontext at ucontext_t's own __mcontext_data member
@@ -59,8 +77,8 @@ typedef struct FiberSlot {
 #ifdef _WIN32
     LPVOID     native_fiber;
 #else
-    ucontext_t context;
-    u8*        stack;
+    fiber_ctx_t context;
+    u8*        stack;       /* ucontext only; the pthread backend owns its stack */
 #endif
 } FiberSlot;
 
@@ -71,7 +89,7 @@ static s32 s_current_fiber = -1; /* index into s_fibers, or -1 for scheduler */
 #ifdef _WIN32
 static LPVOID s_scheduler_fiber = NULL;
 #else
-static ucontext_t s_scheduler_context;
+static fiber_ctx_t s_scheduler_context;
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -100,7 +118,7 @@ static void fiber_trampoline(int idx_lo, int idx_hi)
     f->entry(f->arg);
     f->state = CELL_FIBER_STATE_TERMINATED;
     s_current_fiber = -1;
-    setcontext(&s_scheduler_context);
+    FCTX_SET(&s_scheduler_context);
 }
 #endif
 
@@ -126,7 +144,7 @@ s32 cellFiberPpuInitialize(void)
         s_scheduler_fiber = GetCurrentFiber();
     }
 #else
-    getcontext(&s_scheduler_context);
+    FCTX_GET(&s_scheduler_context);
 #endif
 
     s_initialized = 1;
@@ -146,6 +164,9 @@ s32 cellFiberPpuFinalize(void)
             if (s_fibers[i].native_fiber)
                 DeleteFiber(s_fibers[i].native_fiber);
 #else
+#ifdef PS3_FIBER_USE_PTHREAD
+            ps3_fiber_destroy(&s_fibers[i].context);
+#endif
             free(s_fibers[i].stack);
 #endif
             s_fibers[i].in_use = 0;
@@ -155,6 +176,8 @@ s32 cellFiberPpuFinalize(void)
 #ifdef _WIN32
     ConvertFiberToThread();
     s_scheduler_fiber = NULL;
+#elif defined(PS3_FIBER_USE_PTHREAD)
+    ps3_fiber_destroy(&s_scheduler_context);
 #endif
 
     s_initialized = 0;
@@ -215,6 +238,14 @@ s32 cellFiberPpuCreateFiber(CellFiber* fiber, CellFiberEntry entry,
         f->in_use = 0;
         return (s32)CELL_FIBER_ERROR_NOMEM;
     }
+#elif defined(PS3_FIBER_USE_PTHREAD)
+    if (ps3_fiber_getcontext(&f->context) != 0 ||
+        ps3_fiber_makecontext(&f->context, f->stack_size, fiber_trampoline,
+                              (int)(idx & 0xFFFF), (int)(idx >> 16)) != 0) {
+        ps3_fiber_destroy(&f->context);
+        f->in_use = 0;
+        return (s32)CELL_FIBER_ERROR_NOMEM;
+    }
 #else
     f->stack = (u8*)malloc(f->stack_size);
     if (!f->stack) {
@@ -251,6 +282,9 @@ s32 cellFiberPpuDeleteFiber(CellFiber fiber)
     if (s_fibers[idx].native_fiber)
         DeleteFiber(s_fibers[idx].native_fiber);
 #else
+#ifdef PS3_FIBER_USE_PTHREAD
+    ps3_fiber_destroy(&s_fibers[idx].context);
+#endif
     free(s_fibers[idx].stack);
 #endif
 
@@ -297,10 +331,10 @@ s32 cellFiberPpuSwitchFiber(CellFiber fiber)
      * the scheduler resumed a fiber's stack instead of main's; and the
      * calling fiber's context was never updated, so switching back to it
      * restarted it from its entry point on the stack it was already using. */
-    ucontext_t* from = (prev >= 0 && prev != (s32)idx)
-                       ? &s_fibers[prev].context
-                       : &s_scheduler_context;
-    swapcontext(from, &s_fibers[idx].context);
+    fiber_ctx_t* from = (prev >= 0 && prev != (s32)idx)
+                        ? &s_fibers[prev].context
+                        : &s_scheduler_context;
+    FCTX_SWAP(from, &s_fibers[idx].context);
 #endif
 
     return CELL_OK;
@@ -318,7 +352,7 @@ s32 cellFiberPpuYieldFiber(void)
 #ifdef _WIN32
     SwitchToFiber(s_scheduler_fiber);
 #else
-    swapcontext(&s_fibers[prev].context, &s_scheduler_context);
+    FCTX_SWAP(&s_fibers[prev].context, &s_scheduler_context);
 #endif
     (void)prev;
 
@@ -336,7 +370,7 @@ s32 cellFiberPpuExitFiber(void)
 #ifdef _WIN32
     SwitchToFiber(s_scheduler_fiber);
 #else
-    setcontext(&s_scheduler_context);
+    FCTX_SET(&s_scheduler_context);
 #endif
 
     return CELL_OK; /* unreachable */
@@ -392,7 +426,7 @@ s32 cellFiberPpuSleep(void)
 #ifdef _WIN32
     SwitchToFiber(s_scheduler_fiber);
 #else
-    swapcontext(&s_fibers[prev].context, &s_scheduler_context);
+    FCTX_SWAP(&s_fibers[prev].context, &s_scheduler_context);
 #endif
     (void)prev;
 

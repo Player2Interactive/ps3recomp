@@ -24,6 +24,11 @@
  * YDKJ_CRI_RESUME poll-loop watches this to know real work arrived. */
 int g_cri_video_dma = 0;
 
+/* Image-1 WAIT_SIGNAL entries. Host IWL inflate only after the CreateTask
+ * consumer has parked for real work (boot cycles), not the first empty-queue
+ * park before FIOS has pushed. */
+volatile long g_spu_ws_enter_count = 0;
+
 /* ---- fingerprint ------------------------------------------------------- */
 
 uint64_t spu_workload_fingerprint(const void* data, size_t n)
@@ -192,6 +197,10 @@ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail)
 }
 
 /* ---- dispatch ---------------------------------------------------------- */
+
+/* No ACIT_ENABLE_SPU / per-image ifdef here: dispatch runs whatever the
+ * title registered. ACIT extra embedded ELFs (images 2/3) are compiled
+ * via game/CMakeLists.txt ACIT_SPU_IMAGE_ALLOWLIST, not this file. */
 
 int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
                           uint32_t args_ea)
@@ -970,8 +979,14 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     static _Thread_local unsigned long long s_wait_exit_ms;
     { extern unsigned long long ps3_ms_now(void);
       unsigned long long _now = ps3_ms_now();
-      static int _n = 0; if (_n++ < 200 || (_n % 500) == 0)
-        fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%d enter task=%u taskset=0x%08X ran=%llums\n",
+#ifdef _WIN32
+      if (taskset_ea == 0x209AA200u) InterlockedIncrement(&g_spu_ws_enter_count);
+#else
+      if (taskset_ea == 0x209AA200u) __sync_add_and_fetch(&g_spu_ws_enter_count, 1);
+#endif
+      long _n = g_spu_ws_enter_count;
+      if (_n <= 200 || (_n % 500) == 0)
+        fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%ld enter task=%u taskset=0x%08X ran=%llums\n",
                 _n, taskId, taskset_ea,
                 s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull); }
     /* If the LFQueue already has a slot, do not park: that is a lost host

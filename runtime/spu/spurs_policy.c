@@ -30,6 +30,102 @@
 
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 
+/* igPm (image 11) overlay-12 idle GETLLAR. Hang census reads these. */
+static spu_context* s_ovl12_ctx[6];
+
+/* Persistent PM context per (workload, virtual SPU). File-scope so the MFC
+ * LS-window can resolve peer lanes of the *issuing* workload. */
+enum { SPURS_PM_MAX_WKL = 16 };
+static spu_context* s_pm_ctx[SPURS_PM_MAX_WKL][6];
+
+spu_context* spurs_pm_lane_ctx(const spu_context* issuer, unsigned n)
+{
+    uint32_t wid;
+    unsigned k;
+    if (!issuer || !issuer->ls || n >= 6)
+        return NULL;
+    /* Kernel context wklCurrentId (BE u32 at LS 0x1DC). CollBroad/CollNarrow
+     * overlay LS 0x100, so this word is payload after the body GET — only
+     * trust it when the issuer actually lives in that row. */
+    {
+        const uint8_t* ls = issuer->ls;
+        wid = ((uint32_t)ls[0x1DC] << 24) | ((uint32_t)ls[0x1DD] << 16)
+            | ((uint32_t)ls[0x1DE] << 8) | ls[0x1DF];
+    }
+    if (wid < SPURS_PM_MAX_WKL) {
+        for (k = 0; k < 6; k++) {
+            if (s_pm_ctx[wid][k] == issuer)
+                return s_pm_ctx[wid][n];
+        }
+    }
+    /* Fallback: the table row the issuer itself lives in. */
+    for (wid = 0; wid < SPURS_PM_MAX_WKL; wid++) {
+        for (k = 0; k < 6; k++) {
+            if (s_pm_ctx[wid][k] == issuer)
+                return s_pm_ctx[wid][n];
+        }
+    }
+    /* Image-11 overlay lanes (same pointers as igPm's s_pm_ctx row). */
+    for (k = 0; k < 6; k++) {
+        if (s_ovl12_ctx[k] == issuer)
+            return s_ovl12_ctx[n];
+    }
+    return NULL;
+}
+
+int acit_ovl12_pm_snap(int spu, uint32_t* pc, uint32_t* resv_ea,
+                       int* resv_valid, uint32_t* evmask,
+                       uint32_t* evstat, uint32_t* lsA,
+                       uint32_t* lsB)
+{
+    if (spu < 0 || spu >= 6) return 0;
+    spu_context* c = s_ovl12_ctx[spu];
+    if (!c || !c->ls) return 0;
+    if (pc) *pc = (uint32_t)c->pc & SPU_LS_MASK;
+    if (resv_ea) *resv_ea = c->resv_ea;
+    if (resv_valid) *resv_valid = c->resv_valid;
+    if (evmask) *evmask = c->event_mask;
+    if (evstat) *evstat = c->event_status;
+    if (lsA)
+        *lsA = ((uint32_t)c->ls[0x3FE00] << 24) | ((uint32_t)c->ls[0x3FE01] << 16)
+             | ((uint32_t)c->ls[0x3FE02] << 8) | c->ls[0x3FE03];
+    if (lsB)
+        *lsB = ((uint32_t)c->ls[0x3FE80] << 24) | ((uint32_t)c->ls[0x3FE81] << 16)
+             | ((uint32_t)c->ls[0x3FE82] << 8) | c->ls[0x3FE83];
+    return 1;
+}
+
+static uint32_t ovl12_ls_be32(const spu_context* c, uint32_t lsa)
+{
+    const uint8_t* p = c->ls + (lsa & SPU_LS_MASK);
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+int acit_ovl12_dump_178(int spu)
+{
+    if (spu < 0 || spu >= 6) return 0;
+    spu_context* c = s_ovl12_ctx[spu];
+    if (!c || !c->ls) return 0;
+    fprintf(stderr,
+            "[ovl-178] snap spu=%d pc=0x%05X lr=0x%05X r3=%08X r12=%08X r80=%08X "
+            "owner0=%d@%05X resv=0x%08X ovl=%d img=%d "
+            "LS[158]=%08X LS[1F00]=%08X %08X %08X %08X %08X "
+            "LS[3FEA0]=%08X %08X %08X %08X\n",
+            spu, (uint32_t)c->pc & SPU_LS_MASK,
+            c->gpr[0]._u32[0] & SPU_LS_MASK,
+            c->gpr[3]._u32[0], c->gpr[12]._u32[0], c->gpr[80]._u32[0],
+            c->resident_code[0].image_id, c->resident_code[0].lsa,
+            c->resv_ea, c->resident_ovl, c->image_id,
+            ovl12_ls_be32(c, 0x158),
+            ovl12_ls_be32(c, 0x1F00), ovl12_ls_be32(c, 0x1F04),
+            ovl12_ls_be32(c, 0x1F08), ovl12_ls_be32(c, 0x1F0C),
+            ovl12_ls_be32(c, 0x1F10),
+            ovl12_ls_be32(c, 0x3FEA0), ovl12_ls_be32(c, 0x3FEA4),
+            ovl12_ls_be32(c, 0x3FEA8), ovl12_ls_be32(c, 0x3FEAC));
+    fflush(stderr);
+    return 1;
+}
+
 /* Counters the intercepts in spu_channels.c maintain for the CURRENT run
  * (single writer per run; reads are diagnostic). */
 volatile unsigned g_spurs_pm_polls = 0;   /* selectWorkload calls this run */
@@ -56,8 +152,6 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * never progress its claim/stage pipeline). Image + context init happen
      * once; re-entries keep LS and only refresh the entry registers and the
      * (possibly game-updated) kernel-context fields. */
-    enum { SPURS_PM_MAX_WKL = 16 };
-    static spu_context* s_pm_ctx[SPURS_PM_MAX_WKL][6];
     if (wid >= SPURS_PM_MAX_WKL || spu_num >= 6) return -1;
     spu_context* ctx = s_pm_ctx[wid][spu_num];
     int first = 0;
@@ -86,7 +180,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         s_pm_ctx[wid][spu_num] = ctx;
         first = 1;
         memset(ctx, 0, sizeof(*ctx));
-        spu_context_init(ctx, 0);
+        spu_context_init(ctx, spu_num);
     } else if (s_fresh || s_pm_data[wid][spu_num] != wkl_data) {
         if (!s_fresh) {
             static int _n = 0;
@@ -98,11 +192,13 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         }
         first = 1;
         memset(ctx, 0, sizeof(*ctx));
-        spu_context_init(ctx, 0);
+        spu_context_init(ctx, spu_num);
     }
     s_pm_data[wid][spu_num] = wkl_data;
     ctx->image_id    = image_id;
     ctx->policy_mode = 1;
+    if (image_id == 11 && spu_num < 6)
+        s_ovl12_ctx[spu_num] = ctx;
 
     /* PM image at its load base (first entry only -- LS persists). */
     if (first)
@@ -134,6 +230,20 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     KBE32(0x1E0, SPURS_PM_EXIT_TO_KERNEL_LS);
     KBE32(0x1E4, SPURS_PM_SELECT_WORKLOAD_LS);
 #undef KBE32
+    /* igPm (image 11) at LS 0xA58 does rdch SPU_RdSigNotify1 and uses that
+     * value as the virtual SPU index: occupancy EAs are overlay-param bases
+     * plus (snr1 << 7) → 00FC7B00/00FC7D80/20020600 + spu_num*0x80. The
+     * real SPURS kernel presents spuNum on SNR1 before module entry.
+     * Kernel context 0x1C8 is also spuNum, but igPm's 0xBB8 load of it is
+     * discarded; an empty SNR1 reads as 0, so both maxC=2 lanes GET slot 0
+     * (00FBE6F0 / 00B9B580) and CollNarrow never loads. */
+    ctx->spu_id = spu_num;
+    spu_channel_write(&ctx->ch_sig_notify[0], spu_num);
+    { static int _sn = 0;
+      if (_sn++ < 8) {
+          fprintf(stderr, "[spurs-pm] entry wid=%u spu=%u image=%d SNR1=%u\n",
+                  wid, spu_num, image_id, spu_num);
+          fflush(stderr); } }
 
     /* Entry registers per cellSpursModuleEntry. */
     ctx->gpr[0]._u32[0] = SPURS_PM_EXIT_TO_KERNEL_LS;  /* return-to-kernel link */

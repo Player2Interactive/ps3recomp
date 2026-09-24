@@ -15,6 +15,7 @@
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+#include "puff.h"           /* host IWL inflate (image-1 parked after job 39) */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
@@ -1479,9 +1480,14 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     int shadow_primed = 0;
     int watch = getenv("SPURS_KERN_WATCH") ? 1 : 0;
     int changes_logged = 0;
+    /* Per kernel-thread pass counter (not shared, not owned by wid 0). The
+     * "" instance parks inside image 10 forever, so a shared s_pass_no that
+     * only bumped on wid==0 starved every other instance's idle cadence. */
+    u32 pass = 0;
 
     for (;;) {
         Sleep(1);
+        pass++;
         u32 ea = si->ea;
         if (!ea || s_pm_off) continue;
 
@@ -1570,11 +1576,9 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              * it to every pass, so kick-driven latency is unchanged. */
             {
                 static u8 s_idle[CELL_SPURS_MAX_WORKLOAD];      /* idle streak (log2 cadence) */
-                static u32 s_pass_no;                            /* shared pass counter is fine */
-                if (wid == 0) s_pass_no++;
                 if (kicked) s_idle[wid] = 0;
                 u32 cad = 1u << (s_idle[wid] > 4 ? 4 : s_idle[wid]);
-                if (!kicked && (s_pass_no & (cad - 1)) != 0) continue;
+                if (!kicked && (pass & (cad - 1)) != 0) continue;
                 extern volatile unsigned g_spurs_pm_polls;
                 u32 polls_before = g_spurs_pm_polls;   /* heuristic only */
                 (void)polls_before;
@@ -1849,6 +1853,28 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits)
  * ppuWaitMask / ppuWaitSlotAndMode so an SPU Set can see the waiter; we
  * sleep on the host condvar (not a real LV2 eq) and also re-read EF_EVENTS
  * every 2 ms so a Set that only ORs bits still unblocks. */
+/* Image-1 IWL: PPU often PushBody's the whole batch while ctrEA is still 0,
+ * then stores the count and EventFlagWait's. Host-complete must not Set the
+ * flag while ctr is 0 (that woke the waiter after 3 of 16+ overlay inflates
+ * and skipped global_cached.psarc). Drain pending completes into ctr when
+ * it becomes non-zero, and Set only on decrement-through-1. */
+static uint32_t g_iwl_pending;
+static uint32_t g_iwl_ctr_ea;
+static uint32_t g_iwl_flag_ea;
+static DWORD    g_iwl_last_ms;
+
+static int iwl_drain_ctr(void)
+{
+    uint32_t c, n;
+    if (!g_iwl_pending || !g_iwl_ctr_ea) return 0;
+    c = vm_read32(g_iwl_ctr_ea);
+    if (!c) return 0;
+    n = g_iwl_pending < c ? g_iwl_pending : c;
+    g_iwl_pending -= n;
+    vm_write32(g_iwl_ctr_ea, c - n);
+    return (c - n) == 0;
+}
+
 static int ef_pattern_met(u16 events, u16 pattern, u32 mode)
 {
     u16 rel = (u16)(events & pattern);
@@ -1875,6 +1901,11 @@ static s32 spurs_ef_wait(uint32_t ea, uint32_t bits_ea, u32 mode, int block)
         return CELL_SPURS_TASK_ERROR_STAT;
 
     u16 pattern = vm_read16(bits_ea);
+
+    /* IWL waiter: apply host-completed slots now that the PPU is waiting
+     * (ctr is typically stored just before this call). */
+    if (g_iwl_flag_ea && ea == g_iwl_flag_ea && iwl_drain_ctr())
+        spurs_ef_set_from_spu(ea, 1);
 
     { static int _n = 0;
       if (_n++ < 16)
@@ -1974,6 +2005,20 @@ static s32 spurs_ef_wait(uint32_t ea, uint32_t bits_ea, u32 mode, int block)
         vm_write16(ea + EF_PPU_WAIT_MASK, pattern);
 
         if (!ef_wait_timed(sync, 2)) {
+            /* Another PPU thread may store ctr while we sleep. Host-completed
+             * slots with ctr still 0 (batch count stored after the pushes) Set
+             * once the producer has been quiet for ~10 ms. */
+            if (g_iwl_flag_ea && ea == g_iwl_flag_ea) {
+                if (iwl_drain_ctr()) {
+                    spurs_ef_set_locked(ea, 1);
+                    ef_broadcast(sync);
+                } else if (g_iwl_pending && g_iwl_last_ms &&
+                           (GetTickCount() - g_iwl_last_ms) >= 10u) {
+                    g_iwl_pending = 0;
+                    spurs_ef_set_locked(ea, 1);
+                    ef_broadcast(sync);
+                }
+            }
             if (++waits % 500 == 0) {
                 static int _n = 0;
                 if (_n < 24) { _n++;
@@ -3224,6 +3269,146 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
  * producer loses a published slot (boot: Push#1 h5=1, Push#2 h4=2/h5=2).
  * Publish under the lock-line lock and notify, matching PUTLLC. Do not
  * call vm_write16 while holding that lock — it is not recursive. */
+/* Commit guest pages for a host memcpy/inflate of an IWL DMA command. */
+static int iwl_commit_range(uint32_t ea, uint32_t size)
+{
+    if (!vm_base || !size) return 0;
+#ifdef _WIN32
+    uint32_t start = ea & ~0xFFFFu;
+    uint32_t end   = (ea + size - 1u) & ~0xFFFFu;
+    for (uint32_t p = start; ; p += 0x10000u) {
+        uint8_t* host = vm_base + p;
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(host, &mbi, sizeof mbi) == 0) return 0;
+        if (mbi.State != MEM_COMMIT) {
+            if (!VirtualAlloc(host, 0x10000, MEM_COMMIT, PAGE_READWRITE))
+                return 0;
+        } else if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
+            return 0;
+        }
+        if (p == end) break;
+    }
+    return 1;
+#else
+    (void)ea;
+    return 1;
+#endif
+}
+
+static int iwl_inflate(const uint8_t* src, uint32_t slen,
+                       uint8_t* dst, uint32_t dlen, uint32_t* produced)
+{
+    unsigned long destlen, sourcelen;
+    const uint8_t* in = src;
+    uint32_t inlen = slen;
+    int rc;
+
+    /* RFC 1950 zlib wrapper. CMF/FLG must be 31-check; FDICT skips 4 bytes. */
+    if (inlen >= 2 && in[0] == 0x78 && ((uint32_t)in[0] * 256u + in[1]) % 31u == 0) {
+        uint8_t flg = in[1];
+        in += 2;
+        inlen -= 2;
+        if (flg & 0x20) {
+            if (inlen < 4) return 0;
+            in += 4;
+            inlen -= 4;
+        }
+    }
+    destlen = dlen;
+    sourcelen = inlen;
+    rc = puff(dst, &destlen, in, &sourcelen);
+    if (rc) {
+        destlen = dlen;
+        sourcelen = slen;
+        rc = puff(dst, &destlen, src, &sourcelen);
+        if (rc) return 0;
+    }
+    if (produced) *produced = (uint32_t)destlen;
+    return 1;
+}
+
+/* Image-1 IWL slot: src, dst, packed, unpacked, (ctrEA|1), flagEA.
+ * CreateTask spu_0000 parks in WAIT_SIGNAL after job 39; later FIOS pushes
+ * (MainMenu texel.dat, 126 × 64 KiB zlib blocks) then cellSpursEventFlagWait
+ * forever. Execute the DMA/inflate on the host and Set the flag the SPU
+ * would have Set when ctr decrements through 1. Do not enqueue — that would
+ * double-complete if image-1 later wakes. */
+static int iwl_host_execute(uint32_t cmd_ea)
+{
+    uint32_t dma_src = vm_read32(cmd_ea + 0);
+    uint32_t dma_dst = vm_read32(cmd_ea + 4);
+    uint32_t dma_sz  = vm_read32(cmd_ea + 8);
+    uint32_t uncomp  = vm_read32(cmd_ea + 12);
+    uint32_t ctr_tag = vm_read32(cmd_ea + 16);
+    uint32_t flag_ea = vm_read32(cmd_ea + 20);
+    uint32_t ctr_ea  = ctr_tag & ~1u;
+    uint32_t dest_sz = uncomp ? uncomp : dma_sz;
+    const uint8_t* src;
+    uint8_t* dst;
+    int zlibish;
+
+    if (!dma_src || !dma_dst || !dma_sz || dma_sz > 0x1000000u || dest_sz > 0x1000000u)
+        return 0;
+    if (!iwl_commit_range(dma_src, dma_sz) || !iwl_commit_range(dma_dst, dest_sz))
+        return 0;
+
+    src = vm_base + dma_src;
+    dst = vm_base + dma_dst;
+
+    /* In-place IWL: packed sits in dest's tail (src = dst + gap). puff cannot
+     * inflate overlapping buffers; memcpy(dst, src) is also overlap-UB and
+     * left packed bytes where IGHW should be (flip8/10 005D5208 r3=0 on
+     * wad 0x22927100). Snapshot packed, inflate into dest. */
+    {
+        uintptr_t su = (uintptr_t)src, du = (uintptr_t)dst;
+        int overlap = (su < du + dest_sz) && (du < su + dma_sz);
+        uint8_t* snap = NULL;
+        const uint8_t* in = src;
+        int inflated = 0;
+        uint32_t got = 0, src0 = 0, dst0 = 0;
+
+        if (overlap) {
+            snap = (uint8_t*)malloc(dma_sz);
+            if (!snap)
+                return 0;
+            memcpy(snap, src, dma_sz);
+            in = snap;
+        }
+        zlibish = (dma_sz >= 2 && in[0] == 0x78);
+        if (zlibish || dma_sz != dest_sz) {
+            inflated = iwl_inflate(in, dma_sz, dst, dest_sz, &got);
+        }
+        if (!inflated && !overlap) {
+            memcpy(dst, in, dma_sz < dest_sz ? dma_sz : dest_sz);
+        } else if (!inflated && overlap && dma_sz == dest_sz) {
+            memcpy(dst, in, dma_sz);
+        }
+        if (dma_sz >= 4u)
+            src0 = ((uint32_t)in[0] << 24) | ((uint32_t)in[1] << 16) |
+                   ((uint32_t)in[2] << 8) | (uint32_t)in[3];
+        dst0 = ((uint32_t)dst[0] << 24) | ((uint32_t)dst[1] << 16) |
+               ((uint32_t)dst[2] << 8) | (uint32_t)dst[3];
+
+        if (ctr_ea) g_iwl_ctr_ea = ctr_ea;
+        if (flag_ea) g_iwl_flag_ea = flag_ea;
+        g_iwl_pending++;
+        g_iwl_last_ms = GetTickCount();
+        if (iwl_drain_ctr() && flag_ea)
+            spurs_ef_set_from_spu(flag_ea, 1);
+
+        { static int _n = 0;
+          if (_n++ < 400)
+            fprintf(stderr, "[iwl-host] #%d src=0x%08X dst=0x%08X packed=0x%X uncomp=0x%X "
+                            "ctrEA=0x%08X ctr=%u flagEA=0x%08X pend=%u "
+                            "src0=0x%08X dst0=0x%08X infl=%d ovl=%d zlib=%d\n",
+                    _n, dma_src, dma_dst, dma_sz, dest_sz, ctr_ea,
+                    ctr_ea ? vm_read32(ctr_ea) : 0, flag_ea, g_iwl_pending,
+                    src0, dst0, inflated, overlap, zlibish); }
+        free(snap);
+    }
+    return 1;
+}
+
 s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
 {
     if (!queue_ea || !data_ea)
@@ -3238,6 +3423,21 @@ s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
     uint32_t tsp = (uint32_t)vm_read64(q + 0x70);
     if (!sz || !dep || !buf || sz > 0x1000u || dep > 0x10000u)
         return (s32)(0x80410900u | 0x02u);   /* TASK_ERROR_INVAL */
+
+    /* After image-1's boot IWL cycles it parks in WAIT_SIGNAL and later
+     * FIOS pushes (MainMenu texel.dat) never run. Host-complete only then —
+     * the first empty-queue park must still enqueue so the SPU can run. */
+    if (sz == 32u) {
+        uint32_t flag_ea = vm_read32((uint32_t)data_ea + 20);
+        uint32_t ctr_ea  = vm_read32((uint32_t)data_ea + 16) & ~1u;
+        if (q == 0x00F7A880u || flag_ea == 0x00F7A800u || ctr_ea == 0x00F7AAACu) {
+            extern volatile long g_spu_ws_enter_count;
+            if (g_spu_ws_enter_count >= 8) {
+                iwl_host_execute((uint32_t)data_ea);
+                return CELL_OK;   /* do not enqueue: image-1 is idle-parked */
+            }
+        }
+    }
 
     int32_t mod = (int32_t)dep;
     int spins = 0;

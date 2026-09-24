@@ -158,6 +158,7 @@ static int spu_step(spu_context* ctx) {
     case SPU_andbi:DST = spu_andbi(A,I); break;
     case SPU_andhi:DST = spu_andhi(A,I); break;
     case SPU_orhi: DST = spu_orhi(A,I); break;
+    case SPU_orbi: DST = spu_orbi(A,I); break;
     case SPU_orx:  DST = spu_orx(A); break;
     /* compares */
     case SPU_ceq: DST = spu_ceq(A,B); break;

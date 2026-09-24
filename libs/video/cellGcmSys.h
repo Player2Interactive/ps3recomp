@@ -287,12 +287,20 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler);
  * title-screen state machine from the VBlank handler. */
 void cellGcmTickVBlank(void);
 void cellGcmTickFlip(void);
+/* Deliver pending vblank/flip/user handlers on the calling thread. */
+void ppu_gcm_pump(void);
+int      cellGcm_take_flip_pending(void);
+int      cellGcm_take_flip_pending_synced(void);
+unsigned cellGcm_flip_request_count(void);
+/* Current SetFlip target: local EA + RSX offset/pitch/size. 0 if unset. */
+int      cellGcm_scanout_info(u32* local_ea, u32* offset, u32* pitch, u32* w, u32* h);
 
 /* NID: 0xF9BFCDA3 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);
 
-/* NID: 0x0B4B62D5 */
+/* NID: 0x06EDEA9E (0x0B4B62D5 is SetPrepareFlip) */
 void cellGcmSetUserHandler(CellGcmUserHandler handler);
+u32 cellGcm_user_handler_opd(void);
 
 /* NID: 0x21AC3697 */
 u64 cellGcmGetLastFlipTime(void);

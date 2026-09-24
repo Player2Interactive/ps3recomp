@@ -94,6 +94,38 @@ static ppu_thread_info* find_thread(uint64_t thread_id)
     return t;
 }
 
+void ppu_dump_threads(const char* tag)
+{
+    static const char* const stn[] = { "FREE", "RUN", "FIN", "DET" };
+    int i;
+    if (!tag) tag = "?";
+    table_lock();
+    for (i = 0; i < PPU_THREAD_MAX; i++) {
+        ppu_thread_info* t = &g_ppu_threads[i];
+        if (t->state == PPU_THREAD_STATE_FREE) continue;
+        fprintf(stderr,
+                "[ice-thr] %s ppu[%d] state=%s name=\"%s\" entry=0x%08X "
+#ifdef _WIN32
+                "hosttid=%lu "
+#endif
+                "cia=0x%08X lr=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X "
+                "r31=0x%08X prof=0x%08X\n",
+                tag, i,
+                (t->state >= 0 && t->state <= 3) ? stn[t->state] : "?",
+                t->name[0] ? t->name : "",
+                (uint32_t)t->entry_addr,
+#ifdef _WIN32
+                (unsigned long)t->host_tid,
+#endif
+                (uint32_t)t->ctx.cia, (uint32_t)t->ctx.lr,
+                (uint32_t)t->ctx.gpr[3], (uint32_t)t->ctx.gpr[4],
+                (uint32_t)t->ctx.gpr[5], (uint32_t)t->ctx.gpr[31],
+                t->prof_pc);
+    }
+    table_unlock();
+    fflush(stderr);
+}
+
 /* ---------------------------------------------------------------------------
  * Host thread entry point
  * -----------------------------------------------------------------------*/
@@ -1108,6 +1140,17 @@ int64_t sys_ppu_thread_get_priority(ppu_context* ctx)
 #endif
         }
         return CELL_OK;
+    }
+
+    /* Joinable workers stay FINISHED until join. 00547730 (pad state 3/2)
+     * polls GET_PRIORITY and treats ESRCH as "thread reaped": it std -1 into
+     * the handle, then 005477F0 sees 0xFFFFFFFF and 0052D770 stores +0xD8=1.
+     * Returning OK for a zombie made 0052D584 spin (Check Thread already
+     * exited). Real lv2 reports ESRCH once the PPU thread is gone; keep the
+     * NULL workaround above for the never-created / main thread. */
+    if (t->state == PPU_THREAD_STATE_FINISHED) {
+        table_unlock();
+        return (int64_t)(int32_t)CELL_ESRCH;
     }
 
     if (prio_addr != 0) {

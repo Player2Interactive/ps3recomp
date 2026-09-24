@@ -53,6 +53,11 @@ void rsx_d3d12_backend_present(void);
 void rsx_d3d12_record_lock(void);
 void rsx_d3d12_record_unlock(void);
 
+/* Guest 2D blit into a display buffer: composite the matching offscreen RT
+ * (keyed by raw RSX offset) onto the swapchain. No-op if that RT was never
+ * drawn. Does not invent a blit the FIFO did not issue. */
+void rsx_d3d12_composite_from_offscreen(u32 raw_off);
+
 #ifdef __cplusplus
 }
 #endif

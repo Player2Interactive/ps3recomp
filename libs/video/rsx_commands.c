@@ -44,6 +44,15 @@ rsx_backend* rsx_get_backend(void)
     return s_backend;
 }
 
+/* Dump-only: 640x640 clip or any high AOFFSET (offscreen RT, not display
+ * 0x0 / 0x398000). Do not use as a compositor trigger. */
+static int rsx_hi_rt(const rsx_state* state)
+{
+    u32 off = state->surface_color_offset[0];
+    return (off >= 0x08000000u) ||
+           (state->surface_clip_w == 640 && state->surface_clip_h == 640);
+}
+
 /* ---------------------------------------------------------------------------
  * State initialization
  * -----------------------------------------------------------------------*/
@@ -106,9 +115,118 @@ void rsx_state_init(rsx_state* state)
     state->shader_dirty = 1;
 }
 
-/* ---------------------------------------------------------------------------
- * Method processing
- * -----------------------------------------------------------------------*/
+/* NV4097 inline-array / array-element state. Release builds used to drop
+ * these as unknown (the unknown log was NDEBUG-only), so a blit/quad that
+ * the guest submitted between SET_BEGIN_END never reached the backend. */
+#define RSX_INLINE_MAX  4096
+static u32 s_inline_words[RSX_INLINE_MAX];
+static u32 s_inline_n;
+static u32 s_elem_idx[RSX_INLINE_MAX];
+static u32 s_elem_n;
+/* High local-memory scratch: past display tiles and the 640x640 RT. */
+#define RSX_INLINE_SCRATCH  0x0F000000u
+
+static u32 rsx_attrib_packed_bytes(const rsx_vertex_attrib* a)
+{
+    u32 n = a->size;
+    if (!n) return 0;
+    switch (a->type) {
+    case 2: return n * 4u;                         /* float32 */
+    case 3: case 6: return (n * 2u + 3u) & ~3u;    /* half    */
+    case 1: case 5: return (n * 2u + 3u) & ~3u;    /* s16     */
+    case 4: case 7: return (n + 3u) & ~3u;         /* u8      */
+    default: return n * 4u;
+    }
+}
+
+static void rsx_flush_begin_end(rsx_state* state)
+{
+    extern u8* vm_base;
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
+    if (!s_backend) { s_inline_n = 0; s_elem_n = 0; return; }
+    if (s_inline_n) {
+        u32 packed = 0;
+        int any = 0;
+        for (int i = 0; i < RSX_MAX_VERTEX_ATTRIBS; i++)
+            if (state->vertex_attribs[i].enabled) {
+                packed += rsx_attrib_packed_bytes(&state->vertex_attribs[i]);
+                any = 1;
+            }
+        if (!packed) packed = 16;
+        u32 nbytes = s_inline_n * 4u;
+        u32 count = packed ? nbytes / packed : 0;
+        if (!count) { s_inline_n = 0; s_elem_n = 0; return; }
+        u32 ea = cellGcmResolveLocated(1, RSX_INLINE_SCRATCH);
+        { static int n = 0;
+          if (n++ < 16)
+              fprintf(stderr, "[RSX] INLINE_ARRAY prim=%u words=%u packed=%u count=%u surf=0x%08X clip=%ux%u%c",
+                      state->primitive_type, s_inline_n, packed, count,
+                      state->surface_color_offset[0],
+                      state->surface_clip_w, state->surface_clip_h, 10); }
+        if (vm_base && ea != 0xFFFFFFFFu) {
+            u8* p = vm_base + ea;
+            for (u32 i = 0; i < s_inline_n; i++) {
+                u32 w = s_inline_words[i];
+                p[i*4+0] = (u8)(w >> 24); p[i*4+1] = (u8)(w >> 16);
+                p[i*4+2] = (u8)(w >> 8);  p[i*4+3] = (u8)w;
+            }
+            rsx_vertex_attrib saved[RSX_MAX_VERTEX_ATTRIBS];
+            memcpy(saved, state->vertex_attribs, sizeof(saved));
+            if (!any) {
+                state->vertex_attribs[0].enabled = 1;
+                state->vertex_attribs[0].type = 2;
+                state->vertex_attribs[0].size = 4;
+                state->vertex_attribs[0].stride = 16;
+                state->vertex_attribs[0].offset = RSX_INLINE_SCRATCH;
+            } else {
+                u32 off = 0;
+                for (int i = 0; i < RSX_MAX_VERTEX_ATTRIBS; i++) {
+                    if (!state->vertex_attribs[i].enabled) continue;
+                    u32 b = rsx_attrib_packed_bytes(&state->vertex_attribs[i]);
+                    state->vertex_attribs[i].offset = RSX_INLINE_SCRATCH + off;
+                    state->vertex_attribs[i].stride = packed;
+                    off += b;
+                }
+            }
+            if (s_backend->set_vertex_attribs)
+                s_backend->set_vertex_attribs(s_backend->userdata, state);
+            if (s_backend->draw_arrays)
+                s_backend->draw_arrays(s_backend->userdata,
+                                        state->primitive_type, 0, count);
+            memcpy(state->vertex_attribs, saved, sizeof(saved));
+        } else if (ea == 0xFFFFFFFFu) {
+            { static int n = 0; if (n++ < 4)
+                fprintf(stderr, "[RSX] INLINE_ARRAY scratch resolve failed off=0x%08X%c",
+                        RSX_INLINE_SCRATCH, 10); }
+        }
+        s_inline_n = 0;
+    } else if (s_elem_n) {
+        u32 ea = cellGcmResolveLocated(1, RSX_INLINE_SCRATCH);
+        { static int n = 0;
+          if (n++ < 16)
+              fprintf(stderr, "[RSX] ARRAY_ELEMENT prim=%u count=%u surf=0x%08X clip=%ux%u%c",
+                      state->primitive_type, s_elem_n,
+                      state->surface_color_offset[0],
+                      state->surface_clip_w, state->surface_clip_h, 10); }
+        if (vm_base && ea != 0xFFFFFFFFu && s_backend->draw_indexed) {
+            u8* p = vm_base + ea;
+            for (u32 i = 0; i < s_elem_n; i++) {
+                u32 w = s_elem_idx[i];
+                p[i*4+0] = (u8)(w >> 24); p[i*4+1] = (u8)(w >> 16);
+                p[i*4+2] = (u8)(w >> 8);  p[i*4+3] = (u8)w;
+            }
+            u32 save_off = state->index_array_offset;
+            u32 save_dma = state->index_array_dma;
+            state->index_array_offset = RSX_INLINE_SCRATCH;
+            state->index_array_dma = 0; /* local, u32 indices */
+            s_backend->draw_indexed(s_backend->userdata,
+                                    state->primitive_type, 0, s_elem_n);
+            state->index_array_offset = save_off;
+            state->index_array_dma = save_dma;
+        }
+        s_elem_n = 0;
+    }
+}
 
 static int process_surface_method(rsx_state* state, u32 method, u32 data)
 {
@@ -129,11 +247,24 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         return 0;
     case NV4097_SET_SURFACE_COLOR_AOFFSET:
         state->surface_color_offset[0] = data;
-        { static int _s = -1; if (_s < 0) _s = getenv("SURFDBG") ? 1 : 0;
-          static unsigned _seen[32]; static int _n = 0;
-          if (_s) { int f = 0; for (int k = 0; k < _n; k++) if (_seen[k] == data) f = 1;
-              if (!f && _n < 32) { _seen[_n++] = data;
-                  fprintf(stderr, "[SURF] color offset -> 0x%08X%c", data, 10); } } }
+        { static unsigned _seen[32]; static int _n = 0;
+          static int after = 0, rec = 0; static u32 last = 0xFFFFFFFFu;
+          int f = 0; for (int k = 0; k < _n; k++) if (_seen[k] == data) f = 1;
+          if (data >= 0x08000000u ||
+              (state->surface_clip_w == 640 && state->surface_clip_h == 640))
+              after = 1;
+          if (!f && _n < 32) { _seen[_n++] = data;
+              fprintf(stderr, "[SURF] SET_SURFACE_COLOR_AOFFSET=0x%08X clip=%ux%u fmt=0x%X tgt=0x%X pitchA=%u zeta=0x%08X%c",
+                      data, state->surface_clip_w, state->surface_clip_h,
+                      state->surface_format, state->color_target,
+                      state->surface_color_pitch[0], state->surface_zeta_offset, 10); }
+          else if (after && data != last && rec < 24) {
+              rec++; last = data;
+              fprintf(stderr, "[SURF] SET_SURFACE_COLOR_AOFFSET=0x%08X clip=%ux%u fmt=0x%X tgt=0x%X pitchA=%u zeta=0x%08X (post-hi-rt)%c",
+                      data, state->surface_clip_w, state->surface_clip_h,
+                      state->surface_format, state->color_target,
+                      state->surface_color_pitch[0], state->surface_zeta_offset, 10); }
+          last = data; }
         state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_COLOR_BOFFSET:
@@ -205,6 +336,13 @@ static int process_texture_method(rsx_state* state, u32 method, u32 data)
     switch (reg) {
     case 0x00: /* TEXTURE_OFFSET */
         tex->offset = data;
+        { static int after = 0, n = 0;
+          if (data >= 0x08000000u || rsx_hi_rt(state)) after = 1;
+          if ((data >= 0x08000000u || after) && n < 16) {
+              n++;
+              fprintf(stderr, "[TEXOFF] unit=%u off=0x%08X rect=%ux%u fmt=0x%X surf=0x%08X%c",
+                      unit, data, tex->image_rect >> 16, tex->image_rect & 0xFFFF,
+                      tex->format, state->surface_color_offset[0], 10); } }
         break;
     case 0x04: /* TEXTURE_FORMAT */
         tex->format = data;
@@ -445,7 +583,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_CLEAR_SURFACE) {
-        { static int _c=0; if (_c++ < 12) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
+        { static int _c=0; if (_c++ < 12)
+            fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X surf=0x%08X clip=%ux%u tgt=0x%X\n",
+                    data, state->color_clear_value, state->surface_color_offset[0],
+                    state->surface_clip_w, state->surface_clip_h, state->color_target); }
         if (s_backend && s_backend->clear) {
             float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
             u8 stencil = state->zstencil_clear_value & 0xFF;
@@ -610,6 +751,17 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         u32 lane = ((method - 0x1C00u) >> 2) & 3;   /* x/y/z/w   */
         float f; memcpy(&f, &data, 4);
         state->vertex_data4f[idx][lane] = f;
+        /* Immediate-mode emit: NV4097 issues a vertex when the last component
+         * of position (attrib 0) is written inside BEGIN/END and the array is
+         * disabled. Without this, SET_VERTEX_DATA4F_M quads never reach draw. */
+        if (state->in_begin_end && idx == 0 && lane == 3 &&
+            !state->vertex_attribs[0].enabled &&
+            s_inline_n + 4u <= RSX_INLINE_MAX) {
+            for (int k = 0; k < 4; k++) {
+                u32 w; memcpy(&w, &state->vertex_data4f[0][k], 4);
+                s_inline_words[s_inline_n++] = w;
+            }
+        }
         { static int _d = -1; if (_d < 0) _d = getenv("VDATA_DBG") ? 1 : 0;
           static int _n = 0;
           if (_d && _n < 400) { _n++;
@@ -662,9 +814,17 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     /* Draw */
     if (method == NV4097_SET_BEGIN_END) {
         if (data != 0) {
+            s_inline_n = 0;
+            s_elem_n = 0;
             state->primitive_type = data;
             state->in_begin_end = 1;
             state->begin_epoch++;
+            { static int after = 0, n = 0;
+              if (rsx_hi_rt(state)) after = 1;
+              if (after && n++ < 16)
+                  fprintf(stderr, "[RSX] BEGIN_END prim=%u surf=0x%08X clip=%ux%u%c",
+                          data, state->surface_color_offset[0],
+                          state->surface_clip_w, state->surface_clip_h, 10); }
 
             /* Flush dirty state to backend before drawing */
             if (s_backend) {
@@ -707,15 +867,40 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
                 state->texture_dirty = 0;
             }
         } else {
+            rsx_flush_begin_end(state);
             state->in_begin_end = 0;
         }
+        return 0;
+    }
+
+    if (method == NV4097_INLINE_ARRAY) {
+        if (s_inline_n < RSX_INLINE_MAX)
+            s_inline_words[s_inline_n++] = data;
+        return 0;
+    }
+    if (method == NV4097_ARRAY_ELEMENT32) {
+        if (s_elem_n < RSX_INLINE_MAX)
+            s_elem_idx[s_elem_n++] = data;
+        return 0;
+    }
+    if (method == NV4097_ARRAY_ELEMENT16) {
+        if (s_elem_n < RSX_INLINE_MAX)
+            s_elem_idx[s_elem_n++] = data & 0xFFFFu;
+        if (s_elem_n < RSX_INLINE_MAX)
+            s_elem_idx[s_elem_n++] = data >> 16;
         return 0;
     }
 
     if (method == NV4097_DRAW_ARRAYS) {
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
-        { static int _d=0; if (_d++ < 32) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
+        { static int _d=0; static int after=0, rec=0;
+          if (rsx_hi_rt(state)) after = 1;
+          if (_d++ < 32 || (after && rec++ < 24))
+            fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u surf=0x%08X clip=%ux%u tgt=0x%X%s\n",
+                    state->primitive_type, first, count, state->surface_color_offset[0],
+                    state->surface_clip_w, state->surface_clip_h, state->color_target,
+                    after && _d > 32 ? " (post-hi-rt)" : ""); }
         { static int _sq=0; if (getenv("SEQ_DBG") && _sq++ < 500)
             fprintf(stderr, "[SEQ] DRAW surf0=0x%X c256.x=%.4f c257.y=%.4f\n",
                     state->surface_color_offset[0], state->vertex_constants[256][0],
@@ -759,7 +944,13 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         /* [23:0] first index, [31:24] count-1 (same packing as DRAW_ARRAYS). */
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
-        { static int _d=0; if (_d++ < 8) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
+        { static int _d=0; static int after=0, rec=0;
+          if (rsx_hi_rt(state)) after = 1;
+          if (_d++ < 8 || (after && rec++ < 16))
+            fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X surf=0x%08X%s\n",
+                    state->primitive_type, first, count, state->index_array_offset,
+                    state->index_array_dma, state->surface_color_offset[0],
+                    after && _d > 8 ? " (post-hi-rt)" : ""); }
         ps3_ms("rsx:draw_indexed");
         if (s_backend && s_backend->draw_indexed)
             s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
@@ -792,14 +983,16 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * The draw engine handles the actual present; suppress the unknown log. */
     if (method == 0xE920 || method == 0xE924) return 0;
 
-    /* Unrecognized method -- log in debug builds */
-#ifndef NDEBUG
-    static int s_unknown_count = 0;
-    if (s_unknown_count < 50) {
-        printf("[RSX] unknown method 0x%04X = 0x%08X\n", method, data);
-        s_unknown_count++;
-    }
-#endif
+    /* Unique unknown methods in every build. Release used to swallow these,
+     * so a 2D blit on the 3D subchannel (or INLINE_ARRAY before it was
+     * decoded) left no trace. */
+    { static u8 seen[2048];
+      u32 mi = (method >> 2) & 2047;
+      if (!seen[mi]) {
+          seen[mi] = 1;
+          fprintf(stderr, "[RSX] unknown method 0x%04X = 0x%08X surf=0x%08X%c",
+                  method, data, state->surface_color_offset[0], 10);
+      } }
 
     return -1;
 }

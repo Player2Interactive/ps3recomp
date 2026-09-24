@@ -21,6 +21,7 @@
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
+#include "cellGcmSys.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -3657,6 +3658,11 @@ static D3D12_PRIMITIVE_TOPOLOGY topo_to_d3d(u32 t)
 static u32 s_composite_src = 0;
 static int s_last_drawn_slot = -1;
 static u32 s_last_drawn_off  = 0;
+/* Display-buffer draws in the batch currently inside render_frame. */
+static int s_rf_had_display = 0;
+/* A display-targeted 3D draw has landed this run. Later offscreen-only
+ * batches must not CopyTexture the unused guest VRAM over that scanout. */
+static int s_ever_display_draw = 0;
 
 void rsx_d3d12_composite_from_offscreen(u32 raw_off) { s_composite_src = raw_off; }
 
@@ -3670,7 +3676,12 @@ static void composite_present(u32 fi)
     int i;
     if (want == 2u) { i = s_last_drawn_slot; want = s_last_drawn_off; }
     else            { i = off_rt_find(want); }
-    if (i < 0 || !s_d3d.off_rt[i].res) return;
+    if (i < 0 || !s_d3d.off_rt[i].res) {
+        { static int m = 0;
+          if (m++ < 8)
+              fprintf(stderr, "[COMPOSITE] no offscreen RT for src=0x%08X%c", want, 10); }
+        return;
+    }
     OffRT* r = &s_d3d.off_rt[i];
     /* Same-format copy only; a half-float source would need a converting draw. */
     if (r->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM) {
@@ -3684,8 +3695,9 @@ static void composite_present(u32 fi)
     u32 ch = r->h < s_d3d.height ? r->h : s_d3d.height;
     if (!cw || !ch) return;
     { static int n = 0;
-      if (n++ < 3) fprintf(stderr, "[COMPOSITE] RT 0x%08X %ux%u -> backbuffer%c",
-                           want, cw, ch, 10); }
+      if (n++ < 8 || (n % 60) == 0)
+          fprintf(stderr, "[COMPOSITE] RT 0x%08X %ux%u -> backbuffer%c",
+                  want, cw, ch, 10); }
 
     D3D12_RESOURCE_BARRIER b[2] = {0};
     b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3717,50 +3729,135 @@ static void composite_present(u32 fi)
 }
 
 
+/* NV40/RSX color tile: 256-byte columns by 16-line rows. Address is relative
+ * to the GCM tile region's offset, not the display-buffer origin. */
+static u32 gcm_tile_byte(u32 x_bytes, u32 y, u32 pitch)
+{
+    const u32 tw = 256u, th = 16u;
+    if (!pitch || (pitch % tw) != 0)
+        return y * pitch + x_bytes;
+    u32 tpr = pitch / tw;
+    u32 tx = x_bytes / tw, ty = y / th;
+    return (ty * tpr + tx) * (tw * th) + (y % th) * tw + (x_bytes % tw);
+}
+
+static const CellGcmTileInfo* gcm_tile_covering(u32 off)
+{
+    for (u8 i = 0; i < CELL_GCM_MAX_TILE_COUNT; i++) {
+        CellGcmTileInfo* t = cellGcmGetTileInfo(i);
+        if (!t || !t->size || !t->pitch) continue;
+        if (off >= t->offset && off < t->offset + t->size)
+            return t;
+    }
+    return NULL;
+}
+
 static void guest_fb_present(u32 fi)
 {
-    static int inited = 0;
-    static u32 off, gw, gh, gpitch, up_pitch;
+    static int mode = -1; /* 0=off, 1=explicit env, 2=auto current scanout */
+    static u32 off, gw, gh, gpitch, up_pitch, local_ea;
     static ID3D12Resource* up = NULL;
-    if (!inited) {
-        inited = 1;
+    static u32 up_bytes = 0;
+    if (mode < 0) {
         const char* e = getenv("GCM_GUEST_FB");
         unsigned a = 0, b = 0, c = 0, d = 0;
-        if (!e || sscanf(e, "%i,%u,%u,%u", &a, &b, &c, &d) != 4 || !b || !c) return;
-        off = a; gw = b; gh = c; gpitch = d;
-        up_pitch = (gw * 4u + 255u) & ~255u;      /* D3D12 wants 256-byte rows */
+        local_ea = 0xC0000000u;
+        if (e && (e[0] == '0') && e[1] == 0) {
+            mode = 0;
+            return;
+        }
+        if (e && sscanf(e, "%i,%u,%u,%u", &a, &b, &c, &d) == 4 && b && c) {
+            mode = 1;
+            off = a; gw = b; gh = c; gpitch = d;
+        } else {
+            mode = 2;
+        }
+    }
+    if (mode == 0) return;
+    if (mode == 2) {
+        /* D3D12 already rasterized a display-buffer draw; don't clobber it.
+         * A guest 2D blit into the display also owns the backbuffer via
+         * composite_present -- VRAM at that point is not the D3D RT.
+         * After the first display 3D draw, auto VRAM scanout would wipe the
+         * swapchain with tiled local memory the 3D path never wrote. */
+        if (s_rf_had_display) {
+            { static unsigned n = 0;
+              if (++n <= 8u || (n % 60u) == 0u)
+                  fprintf(stderr, "[present] scanout n=%u off=d3d display_draws=1%c",
+                          n, 10); }
+            return;
+        }
+        if (s_composite_src) return;
+        if (s_ever_display_draw) return;
+        u32 lea = 0, o = 0, p = 0, w = 0, h = 0;
+        if (!cellGcm_scanout_info(&lea, &o, &p, &w, &h) || !w || !h || !p)
+            return;
+        local_ea = lea; off = o; gw = w; gh = h; gpitch = p;
+    }
+    up_pitch = (gw * 4u + 255u) & ~255u;
+    u32 need = up_pitch * gh;
+    if (!up || up_bytes < need) {
+        if (up) { up->lpVtbl->Release(up); up = NULL; }
         D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC bd = {0};
         bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width  = (u64)up_pitch * gh; bd.Height = 1;
+        bd.Width  = (u64)need; bd.Height = 1;
         bd.DepthOrArraySize = 1; bd.MipLevels = 1;
         bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
         bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
                 s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &bd,
                 D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                &IID_ID3D12Resource, (void**)&up)))
+                &IID_ID3D12Resource, (void**)&up))) {
             up = NULL;
-        fprintf(stderr, "[GUESTFB] presenting guest 0x%08X %ux%u pitch %u -> backbuffer%c",
-                off, gw, gh, gpitch, 10);
+            return;
+        }
+        up_bytes = need;
+        fprintf(stderr, "[GUESTFB] presenting guest ea=0x%08X off=0x%08X %ux%u pitch %u -> backbuffer%c",
+                local_ea, off, gw, gh, gpitch, 10);
     }
-    if (!up) return;
     { extern u8* vm_base;
       if (!vm_base) return;
-      /* RSX local memory is mapped at guest 0xC0000000. */
-      const u8* srow = vm_base + 0xC0000000u + off;
+      const CellGcmTileInfo* tile = gcm_tile_covering(off);
+      const u8* tile_base = NULL;
+      u32 y0 = 0, tsize = 0, tpitch = gpitch;
+      if (tile && tile->pitch) {
+          tile_base = vm_base + local_ea + tile->offset;
+          y0 = (off - tile->offset) / tile->pitch;
+          tsize = tile->size;
+          tpitch = tile->pitch;
+          { static int once = 0;
+            if (!once) { once = 1;
+                fprintf(stderr, "[GUESTFB] detile off=0x%08X tile=0x%08X size=0x%X pitch=%u y0=%u%c",
+                        off, tile->offset, tile->size, tile->pitch, y0, 10); } }
+      }
+      const u8* srow = vm_base + local_ea + off;
       void* m = NULL; D3D12_RANGE nr = {0, 0};
       if (FAILED(up->lpVtbl->Map(up, 0, &nr, &m)) || !m) return;
       for (u32 y = 0; y < gh; y++) {
-          const u8* s = srow + (size_t)y * gpitch;
           u8* dp = (u8*)m + (size_t)y * up_pitch;
-          for (u32 x = 0; x < gw; x++) {   /* guest B,G,R,A -> backbuffer R,G,B,A */
-              dp[x*4+0] = s[x*4+2]; dp[x*4+1] = s[x*4+1];
-              dp[x*4+2] = s[x*4+0]; dp[x*4+3] = 0xFF;
+          if (!tile_base) {
+              const u8* s = srow + (size_t)y * gpitch;
+              for (u32 x = 0; x < gw; x++) {   /* guest B,G,R,A -> backbuffer R,G,B,A */
+                  dp[x*4+0] = s[x*4+2]; dp[x*4+1] = s[x*4+1];
+                  dp[x*4+2] = s[x*4+0]; dp[x*4+3] = 0xFF;
+              }
+              continue;
+          }
+          for (u32 x = 0; x < gw; x++) {
+              u32 ta = gcm_tile_byte(x * 4u, y0 + y, tpitch);
+              const u8* s = (ta + 4u <= tsize) ? (tile_base + ta)
+                                               : (srow + (size_t)y * gpitch + x * 4u);
+              dp[x*4+0] = s[2]; dp[x*4+1] = s[1];
+              dp[x*4+2] = s[0]; dp[x*4+3] = 0xFF;
           }
       }
-      D3D12_RANGE wr = {0, (SIZE_T)up_pitch * gh};
+      D3D12_RANGE wr = {0, (SIZE_T)need};
       up->lpVtbl->Unmap(up, 0, &wr); }
+    { static unsigned n = 0;
+      if (++n <= 8u || (n % 60u) == 0u)
+          fprintf(stderr, "[present] scanout n=%u off=0x%08X %ux%u display_draws=%d tiled=%d%c",
+                  n, off, gw, gh, s_rf_had_display, gcm_tile_covering(off) ? 1 : 0, 10); }
 
     D3D12_RESOURCE_BARRIER gb = {0};
     gb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3792,6 +3889,11 @@ static void render_frame(void)
 {
     double _rf0 = perf_on() ? perf_now() : 0.0;
     u32 fi = s_d3d.frame_index;
+    s_rf_had_display = 0;
+    for (u32 i = 0; i < s_d3d.draw_count && i < MAX_DRAWS; i++)
+        if (!s_d3d.draws[i].is_clear && s_d3d.draws[i].rt_off == 0)
+            s_rf_had_display = 1;
+    if (s_rf_had_display) s_ever_display_draw = 1;
 
     /* Drain the GPU before touching shared upload resources (vp_vb vertices,
      * vp_cb constants, per-frame texture staging): the previous frame's draws
@@ -4261,14 +4363,15 @@ static void render_frame(void)
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
-    /* Transition render target to RENDER_TARGET state */
+    /* Swapchain is FLIP_DISCARD: copying the previously presented buffer is
+     * undefined. Offscreen-only batches therefore leave the last Present()
+     * on the compositor and do not touch the backbuffer. */
+    s_present_this_frame = (s_rf_had_display || s_composite_src || !s_ever_display_draw);
+
     D3D12_RESOURCE_BARRIER barrier = {0};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = s_d3d.render_targets[fi];
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
 
     /* Get RTV handle for current frame */
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
@@ -4280,12 +4383,21 @@ static void render_frame(void)
     s_d3d.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.dsv_heap, &dsv_handle);
 
     if (perf_on()) s_perf_pre += perf_now() - _pre0;
-    /* Set render target + depth */
-    s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
-
-    /* Clear color and depth */
-    s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(
-        s_d3d.cmd_list, rtv_handle, s_d3d.clear_color, 0, NULL);
+    if (s_present_this_frame) {
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+        s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(
+            s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
+        s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(
+            s_d3d.cmd_list, rtv_handle, s_d3d.clear_color, 0, NULL);
+    } else {
+        s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(
+            s_d3d.cmd_list, 0, NULL, FALSE, &dsv_handle);
+        { static int n = 0;
+          if (n++ < 8)
+              fprintf(stderr, "[present] keep last display scanout (offscreen-only)%c", 10); }
+    }
     s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(
         s_d3d.cmd_list, dsv_handle,
         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
@@ -4882,54 +4994,57 @@ static void render_frame(void)
       if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
     if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
 skip_dump_consider: ;
-    guest_fb_present(fi);
-    composite_present(fi);
-    int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
+    int dumping = 0;
+    if (s_present_this_frame) {
+        guest_fb_present(fi);
+        composite_present(fi);
+        dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                    && s_d3d.dump_skip_left == 0);
-    { static int mind2 = -1;
-      if (mind2 < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
-                       mind2 = e ? atoi(e) : 0; }
-      if (mind2 > 0 && s_dbg_last_draws < (u32)mind2) dumping = 0; }
-    /* CELLMARK_DUMP_EVERY=N: after each dump, skip N-1 frames -- samples the whole
-     * run instead of one contiguous window, so a short burst of real content
-     * can't fall between the dumped frames. */
-    if (dumping) {
-        static int s_every = -1;
-        if (s_every < 0) { const char* e = getenv("CELLMARK_DUMP_EVERY");
-                           s_every = e ? atoi(e) : 0; }
-        if (s_every > 1) s_d3d.dump_skip_left = s_every - 1;
-    }
-    if (dumping) {
-        /* RT -> COPY_SOURCE, copy into the readback buffer, then -> PRESENT. */
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+        { static int mind2 = -1;
+          if (mind2 < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
+                           mind2 = e ? atoi(e) : 0; }
+          if (mind2 > 0 && s_dbg_last_draws < (u32)mind2) dumping = 0; }
+        /* CELLMARK_DUMP_EVERY=N: after each dump, skip N-1 frames -- samples the whole
+         * run instead of one contiguous window, so a short burst of real content
+         * can't fall between the dumped frames. */
+        if (dumping) {
+            static int s_every = -1;
+            if (s_every < 0) { const char* e = getenv("CELLMARK_DUMP_EVERY");
+                               s_every = e ? atoi(e) : 0; }
+            if (s_every > 1) s_d3d.dump_skip_left = s_every - 1;
+        }
+        if (dumping) {
+            /* RT -> COPY_SOURCE, copy into the readback buffer, then -> PRESENT. */
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
 
-        D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
-        dst.pResource = s_d3d.readback_buf;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint.Offset = 0;
-        dst.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8G8B8A8_UNORM;
-        dst.PlacedFootprint.Footprint.Width    = s_d3d.width;
-        dst.PlacedFootprint.Footprint.Height   = s_d3d.height;
-        dst.PlacedFootprint.Footprint.Depth    = 1;
-        dst.PlacedFootprint.Footprint.RowPitch = s_d3d.readback_pitch;
-        src.pResource = s_d3d.render_targets[fi];
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.SubresourceIndex = 0;
-        s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+            D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+            dst.pResource = s_d3d.readback_buf;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint.Offset = 0;
+            dst.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8G8B8A8_UNORM;
+            dst.PlacedFootprint.Footprint.Width    = s_d3d.width;
+            dst.PlacedFootprint.Footprint.Height   = s_d3d.height;
+            dst.PlacedFootprint.Footprint.Depth    = 1;
+            dst.PlacedFootprint.Footprint.RowPitch = s_d3d.readback_pitch;
+            src.pResource = s_d3d.render_targets[fi];
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = 0;
+            s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
 
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
-    } else {
-        /* End-of-frame fallback snapshot: used when the frame never contained a
-         * reduced-viewport pass to capture mid-frame. */
-        screen_copy_capture(fi);
-        /* Transition render target to PRESENT state */
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+            s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+        } else {
+            /* End-of-frame fallback snapshot: used when the frame never contained a
+             * reduced-viewport pass to capture mid-frame. */
+            screen_copy_capture(fi);
+            /* Transition render target to PRESENT state */
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+        }
     }
 
     /* Close and execute */
@@ -5250,6 +5365,16 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
         }
     if (!have_display_draws)
         return;   /* keep accumulating the in-progress frame */
+
+    /* Once the guest issues SetFlip, scanout belongs to the ticker
+     * (rsx_d3d12_backend_present). Presenting at a display clear used to
+     * increment s_clear_presents, after which the SetFlip consumer returned
+     * without a swapchain Present. */
+    {
+        extern unsigned cellGcm_flip_request_count(void);
+        if (cellGcm_flip_request_count() != 0)
+            return;
+    }
 
     /* A title that DOUBLE-BUFFERS the display (DeferredShading clears both
      * 0x0 and 0x440000 per frame, plus a HUD pass) issues several display
@@ -6725,16 +6850,9 @@ void rsx_d3d12_backend_present(void)
                s_d3d.draw_count, s_dbg_clears_since_present, s_clear_presents);
     s_dbg_clears_since_present = 0;
 
-    /* Once frame-boundary presents are active (d3d12_clear presents each
-     * completed frame as the drain crosses into the next one), the ticker
-     * present would only ever show the partially-accumulated NEXT frame --
-     * that partial present right after the FIFO ring recycle was the visible
-     * blink. Keep the ticker present solely as the boot-time fallback (before
-     * the first framed clear arrives). */
-    if (s_clear_presents > 0) {
-        rsx_d3d12_record_unlock();
-        return;
-    }
+    /* SetFlip ticker is the scanout consumer. An earlier clear-boundary present
+     * used to set s_clear_presents and this path then returned, so guest
+     * _cellGcmSetFlipCommand never reached IDXGISwapChain::Present. */
 
     /* Same display gate as d3d12_present: a batch of offscreen pass work only
      * (render-to-texture) keeps accumulating until its composite arrives.
@@ -6798,13 +6916,22 @@ void rsx_d3d12_backend_present(void)
      * has_display meant a render-to-texture pass -- every draw targeting an
      * offscreen surface -- was DISCARDED rather than deferred, so the texture
      * it produces was never written and whatever sampled it later read an
-     * empty resource. Only the Present needs onscreen content. */
-    if (s_d3d.initialized && (has_display || s_d3d.draw_count > 0)) {
+     * empty resource. SetFlip always Presents (cleared/trash is first-pixels). */
+    if (s_d3d.initialized && (has_display || s_d3d.draw_count > 0 ||
+                              cellGcm_flip_request_count() != 0)) {
         { extern void rsx_reset_upload_claims(void);
           static int remap = -1;
           if (remap < 0) { const char* e = getenv("TEX_REMAP"); remap = e ? atoi(e) : 0; }
           if (remap) rsx_reset_upload_claims(); }
-        s_present_this_frame = has_display;
+        s_present_this_frame = 1;
+        { static unsigned n = 0;
+          unsigned fc = cellGcm_flip_request_count();
+          u32 first_rt = 0;
+          for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++)
+              if (!s_d3d.draws[_i].is_clear) { first_rt = s_d3d.draws[_i].rt_off; break; }
+          if (++n <= 8u || (n % 60u) == 0u)
+              fprintf(stderr, "[present] d3d12 n=%u flip=%u draws=%u has_display=%d rt=0x%08X%c",
+                      n, fc, s_d3d.draw_count, has_display, first_rt, 10); }
         render_frame();
         s_present_this_frame = 1;
     }
@@ -6828,5 +6955,6 @@ int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
 void rsx_d3d12_record_lock(void) {}
 void rsx_d3d12_record_unlock(void) {}
+void rsx_d3d12_composite_from_offscreen(u32 raw_off) { (void)raw_off; }
 
 #endif /* _WIN32 */

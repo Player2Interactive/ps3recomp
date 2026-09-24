@@ -144,6 +144,11 @@ void spu_stop(spu_context* ctx)
      * A/B experiments (it makes the kernel terminate, which the game restarts). */
     static int s_halt = -1;
     if (s_halt < 0) s_halt = getenv("YDKJ_STOP_HALT") ? 1 : 0;
+    { static int _n = 0;
+      if (_n++ < 16)
+          fprintf(stderr, "[spu-stop] img=%d pc=0x%05X lr=0x%05X stop=0x%X\n",
+                  ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
+                  ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->stop_code); }
     ctx->status = SPU_STATUS_STOPPED_BY_STOP;
     if (s_halt) spu_halt(ctx);
 }
@@ -425,17 +430,23 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
      * policy computing a lock-line address from an incomplete instance context).
      * Same rationale as the DMA EA guard: a bad guest atomic must not segfault
      * the host. GETLLAR returns a zeroed line (no reservation); PUTLLC fails.
-     * Overlay-12 GETLLAR of IO 20020880: if the IO window is unmapped, the
-     * occupancy line is RAM 00FC7D80 -- reserve that twin instead of dropping. */
-    if (!mfc_ea_range_committed(ea, MFC_ATOMIC_LINE)) {
+     *
+     * Overlay-12 occupancy: cmd 00FBE6C0 stores both RAM (00FC7B00/00FC7D80)
+     * and IO (20020600/20020880) pointers. The IO window is committed GCM
+     * memory (BEBEBEBE/AAAAAAAA), not a hardware alias of the RAM cells.
+     * GETLLAR already copies the RAM twin into LS; PUTLLC/PUTLLUC must
+     * compare and commit that same twin. Otherwise liveA stays 0 and
+     * 006947E8 (W70) never sees occupancy ready after CollBroad/CollNarrow
+     * return. Prefer the RAM twin even when the IO EA itself is committed. */
+    {
         uint32_t ram = ovl12_io_to_ram((uint32_t)ea);
         if (ram && mfc_ea_range_committed(ram, MFC_ATOMIC_LINE)) {
             mem = vm_base + ram;
             { static int s_u = 0;
               if (s_u++ < 8)
-                  fprintf(stderr, "[ovl12-llar] uncommitted IO ea=0x%08X using ram=0x%08X\n",
-                          ea, ram); }
-        } else {
+                  fprintf(stderr, "[ovl12-llar] IO ea=0x%08X using ram=0x%08X cmd=0x%X pc=0x%05X\n",
+                          ea, ram, cmd, (uint32_t)ctx->pc & SPU_LS_MASK); }
+        } else if (!mfc_ea_range_committed(ea, MFC_ATOMIC_LINE)) {
             static int s_w = 0;
             if (s_w++ < 16)
                 fprintf(stderr, "[spu-atomic] cmd=0x%X ea=0x%08X pc=0x%05X img=%d uncommitted -- skipped\n",
@@ -500,6 +511,15 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       cmd == MFC_PUTLLC_CMD ? "PUTLLC" : "PUTLLUC",
                       ctx->image_id, (uint32_t)ctx->pc, ea);
       } }
+    {
+        uint32_t ppc = (uint32_t)ctx->pc & SPU_LS_MASK;
+        if (ppc >= 0x100u && ppc < 0x1F20u) {
+            static int _n = 0;
+            if (_n++ < 24)
+                fprintf(stderr, "[ovl-178] atom cmd=0x%02X ea=0x%08X pc=0x%05X lr=0x%05X img=%d\n",
+                        cmd, ea, ppc, ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->image_id);
+        }
+    }
     switch (cmd) {
     case MFC_GETLLAR_CMD:
         /* Lockstep tick: a guest GETLLAR..PUTLLC poll loop is intra-function
@@ -880,12 +900,15 @@ void spu_ch_wake(spu_context* ctx)
 /* Overlay-12 idle is `GETLLAR; GET liveB; ceq; rdch EventStat` with no
  * rchcnt. Hardware blocks on LR. yz_ch_block() is off unless a raw SPU
  * exists, so the wait used to return immediately, the PM quantum ended,
- * and Ice's 0055BF88 never redispatched igPm after packer stw liveB. */
+ * and Ice's 0055BF88 never redispatched igPm after packer stw liveB.
+ * CollBroad/CollNarrow park the same way on the manager lock-line, so
+ * any live LR reservation (not only the overlay-12 IO twin) blocks;
+ * spu_ch_wait re-polls every 10 ms via spu_resv_lost_poll. */
 static int spu_ch_wait_enabled(spu_context* ctx, uint32_t channel)
 {
     if (yz_ch_block()) return 1;
     if (channel == SPU_RdEventStat && (ctx->event_mask & SPU_EVENT_LR)
-        && ctx->resv_valid && ovl12_io_to_ram(ctx->resv_ea))
+        && ctx->resv_valid)
         return 1;
     return 0;
 }
@@ -1508,6 +1531,28 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
     }
 }
 
+/* igPm overlay-12 swap slot (LS 0x3F580). Job bodies live below this. */
+#define SPU_OVL12_SLOT_LS 0x3F580u
+
+/* A GET into an already-resident spanned job body (igPm helper / CollNarrow
+ * at LS 0x100+) is runtime .data, not a streamed overlay. CollNarrow fetches
+ * static tables to ~0x10D00; leftover 4×ila scans registered those EAs as
+ * jobmods, and claiming them stole resident_ovl so the branch at 0x10D30
+ * dispatched leftover image 140 instead of the live job. */
+static int spu_overlay_get_is_job_data(const spu_context* ctx, uint32_t lsa, uint32_t size)
+{
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        if (!ctx->resident_code[slot].image_id) continue;
+        uint32_t base = ctx->resident_code[slot].lsa;
+        uint32_t end  = base + ctx->resident_code[slot].size;
+        if (lsa < end && lsa + size > base)
+            return 1;
+        if (base <= 0x100u && lsa >= 0x100u && lsa < SPU_OVL12_SLOT_LS)
+            return 1;
+    }
+    return 0;
+}
+
 /* Called from the MFC GET path after the copy: ls points at the JUST-COPIED
  * bytes. EA match first (exact, cheap), then content signature for sizeable
  * chunks (overlay bodies are >= 0x500 bytes). */
@@ -1518,29 +1563,75 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
         uint32_t end = base + ctx->resident_code[slot].size;
+        /* Interior/tail GETs (tables) keep the live body; only a GET that
+         * covers the span from its base (or starts before it) is a swap. */
+        if (lsa > base && lsa < end)
+            continue;
         if (lsa < end && lsa + size > base &&
             (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)))
             ctx->resident_code[slot].image_id = 0;
     }
     for (int i = 0; i < s_ovl_src_count; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
-        int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
-                             : (o->src_ea == ea);
+        uint32_t claim_lsa = lsa, claim_ea = ea;
+        int hit = 0;
+        if (o->has_sig)
+            hit = (size >= 512 && memcmp(ls, o->sig, 16) == 0);
+        else if (o->src_ea == ea)
+            hit = 1;
+        else if (o->span && ea > o->src_ea && ea < o->src_ea + o->span) {
+            /* Overlay 12 splits bodies larger than the MFC 0x4000 GET max:
+             * GET(src, 0x4000) @ dest then GET(src+0x4000, tail) @ dest+0x4000.
+             * Image 182 entry 0x41B8 is 0xB8 past the first chunk; claiming
+             * only the first DMA size leaves it unowned. Treat a linear
+             * continuation as the same region (implied dest LS 0x100). */
+            uint32_t off = ea - o->src_ea;
+            if (lsa >= off) {
+                uint32_t dest = lsa - off;
+                if (dest == 0x100u && dest + o->span <= SPU_LS_SIZE) {
+                    hit = 1;
+                    claim_lsa = dest;
+                    claim_ea = o->src_ea;
+                }
+            }
+        }
         if (hit) {
             if (o->span) {
-                if (lsa + o->span > SPU_LS_SIZE) return;
+                if (claim_lsa + o->span > SPU_LS_SIZE) return;
                 for (unsigned slot = 0; slot < 4; ++slot) {
-                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
+                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != claim_lsa)
                         continue;
-                    ctx->resident_code[slot].lsa = lsa;
+                    ctx->resident_code[slot].lsa = claim_lsa;
                     ctx->resident_code[slot].size = o->span;
-                    ctx->resident_code[slot].source_ea = ea;
+                    ctx->resident_code[slot].source_ea = claim_ea;
                     ctx->resident_code[slot].image_id = o->image_id;
+                    { static int _n = 0;
+                      if (_n++ < 48)
+                          fprintf(stderr, "[spu-ovl] span claim img=%d src=0x%08X -> LS 0x%05X "
+                                  "span=0x%X -> code image %d pc=0x%05X size=%u\n",
+                                  ctx->image_id, claim_ea, claim_lsa, o->span, o->image_id,
+                                  (uint32_t)ctx->pc & SPU_LS_MASK, size);
+                      if (o->image_id == 178 || ea == 0x00B5FC80u) {
+                          const uint8_t* p = ctx->ls + 0x1F00;
+                          fprintf(stderr,
+                                  "[ovl-178] GET src=0x%08X lsa=0x%05X pc=0x%05X lr=0x%05X "
+                                  "LS[1F00]=%02X%02X%02X%02X %02X%02X%02X%02X "
+                                  "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                                  ea, lsa, (uint32_t)ctx->pc & SPU_LS_MASK,
+                                  ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                                  p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
+                                  p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15],
+                                  p[16],p[17],p[18],p[19]);
+                          fflush(stderr);
+                      }
+                    }
                     return;
                 }
                 fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
                 return;
             }
+            if (spu_overlay_get_is_job_data(ctx, lsa, size))
+                return;
             if (ctx->resident_ovl != o->image_id) {
                 ctx->resident_ovl = o->image_id;
                 { static int _n = 0; if (_n++ < 32)
@@ -1551,6 +1642,16 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
             }
             return;
         }
+    }
+    /* Dump-only: a wrap-sized GET into LS 0x100 that did not match a
+     * registered overlay is a secondary body (or a leftover). */
+    if (lsa == 0x100u && size >= 0x400u) {
+        static int _u = 0;
+        if (_u++ < 24)
+            fprintf(stderr, "[spu-ovl] unmatched body GET img=%d ea=0x%08X "
+                    "lsa=0x%05X size=0x%X pc=0x%05X\n",
+                    ctx->image_id, ea, lsa, size,
+                    (uint32_t)ctx->pc & SPU_LS_MASK);
     }
 }
 
@@ -2068,6 +2169,29 @@ void spu_indirect_branch(spu_context* ctx)
      * may also be registered (historical junk lifts) and must lose. */
     if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup(ctx->pc, ctx->resident_ovl);
     if (!code_owner && !fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    /* Dump-only: image-178 CRT / ctor bisl / main / GETLLAR helper. */
+    {
+        uint32_t p = (uint32_t)ctx->pc & SPU_LS_MASK;
+        if (p == 0x17A8u || p == 0x1830u || p == 0x1834u || p == 0x158u ||
+            p == 0x14A0u || p == 0x1AB0u || p == 0x230u ||
+            p == 0x810u || p == 0x89Cu || p == 0x1628u || p == 0x900u || p == 0x30D0u ||
+            p == 0x41B8u || p == 0x4B8u) {
+            static int _n = 0;
+            if (_n++ < 24) {
+                const uint8_t* t = ctx->ls + 0x1F00;
+                fprintf(stderr,
+                        "[ovl-178] disp pc=0x%05X lr=0x%05X owner=%d fn=%d img=%d ovl=%d "
+                        "r3=%08X r12=%08X LS[1F00]=%02X%02X%02X%02X %02X%02X%02X%02X "
+                        "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                        p, ctx->gpr[0]._u32[0] & SPU_LS_MASK, code_owner, fn ? 1 : 0,
+                        ctx->image_id, ctx->resident_ovl,
+                        ctx->gpr[3]._u32[0], ctx->gpr[12]._u32[0],
+                        t[0],t[1],t[2],t[3], t[4],t[5],t[6],t[7],
+                        t[8],t[9],t[10],t[11], t[12],t[13],t[14],t[15]);
+                fflush(stderr);
+            }
+        }
+    }
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second

@@ -144,6 +144,7 @@ typedef enum {
     SPU_or,
     SPU_orc,
     SPU_orhi,
+    SPU_orbi,
     SPU_ori,
     SPU_orx,
     SPU_rchcnt,
@@ -345,6 +346,7 @@ static const char* const spu_op_name[SPU_OP_COUNT] = {
     [SPU_or] = "or",
     [SPU_orc] = "orc",
     [SPU_orhi] = "orhi",
+    [SPU_orbi] = "orbi",
     [SPU_ori] = "ori",
     [SPU_orx] = "orx",
     [SPU_rchcnt] = "rchcnt",
@@ -451,6 +453,7 @@ static spu_op spu_dec_ri10(uint32_t op8) {
     switch (op8) {
     case 0x4: return SPU_ori;
     case 0x5: return SPU_orhi;
+    case 0x6: return SPU_orbi;
     case 0xC: return SPU_sfi;
     case 0xD: return SPU_sfhi;
     case 0x14: return SPU_andi;

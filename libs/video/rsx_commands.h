@@ -101,7 +101,10 @@ extern "C" {
 
 /* Draw commands */
 #define NV4097_SET_BEGIN_END                    0x00001808
+#define NV4097_ARRAY_ELEMENT16                 0x0000180C
+#define NV4097_ARRAY_ELEMENT32                 0x00001810
 #define NV4097_DRAW_ARRAYS                     0x00001814
+#define NV4097_INLINE_ARRAY                    0x00001818
 #define NV4097_SET_INDEX_ARRAY_ADDRESS         0x0000181C
 #define NV4097_SET_INDEX_ARRAY_DMA             0x00001820
 #define NV4097_DRAW_INDEX_ARRAY                0x00001824

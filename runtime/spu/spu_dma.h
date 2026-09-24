@@ -20,7 +20,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <stdio.h>
 #include "../platform/win32_compat.h"
 
 #ifdef __cplusplus
@@ -28,6 +27,10 @@ extern "C" {
 #endif
 
 extern uint8_t* vm_base;
+
+/* Peer SPU in the issuing context's SPURS workload (lane n of that wid).
+ * MFC LS-window EAs are 0xF0000000 + n*0x100000 + ls_off. */
+spu_context* spurs_pm_lane_ctx(const spu_context* issuer, unsigned n);
 
 /* Guard against a guest DMA whose effective address lands in reserved-but-
  * uncommitted guest memory (the 4 GB VM is MEM_RESERVE; only main mem / RSX /
@@ -207,9 +210,15 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
            * nothing useful and buries the real destinations in the histogram.
            * GETs from low EAs stay allowed: they only read garbage, and
            * LBP_SKIP_NULL_DMA already exists to test zeroing them instead. */
+          /* SPU-thread LS window (0xF0000000 + n*1MiB + off) is not guest
+           * RAM: 4-byte SNR writes at +0x1400C/+0x1401C are legal even when
+           * they fail the 16-byte MFC alignment rules that apply to MM. */
+          int ls_win = ((ea >> 32) == 0 &&
+                        (uint32_t)ea >= 0xF0000000u &&
+                        (uint32_t)ea < 0xF0000000u + 6u * 0x100000u);
           int malformed = (size == 0) || (size > 0x4000)
-                       || (size >= 16 && (size & 15))
-                       || (((lsa ^ (uint32_t)ea) & 15) != 0)
+                       || (!ls_win && size >= 16 && (size & 15))
+                       || (!ls_win && (((lsa ^ (uint32_t)ea) & 15) != 0))
                        || (mfc_is_put(cmd) && (uint32_t)ea < 0x10000u);
           if (malformed) {
               static int _n = 0;
@@ -357,6 +366,71 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * would corrupt host heap past spu->ls). */
     if ((uint64_t)lsa + (uint64_t)size > (uint64_t)SPU_LS_SIZE)
         return -1;
+
+    /* SPU-thread LS window: 0xF0000000 + thread_in_group*0x100000 + ls_off.
+     * CollNarrow GETs CollBroad's LS at 0xF0007700 this way. Peer is lane n
+     * of the *issuing* SPURS workload, never a global. PUT into peer LS is
+     * a plain memcpy (LS is not reservable). */
+    if ((ea >> 32) == 0 &&
+        (uint32_t)ea >= 0xF0000000u &&
+        (uint32_t)ea < 0xF0000000u + 6u * 0x100000u) {
+        uint32_t e = (uint32_t)ea;
+        unsigned n = (e - 0xF0000000u) >> 20;
+        uint32_t off = e & 0xFFFFFu;
+        spu_context* peer = spurs_pm_lane_ctx(spu, n);
+        if (!peer || !peer->ls) {
+            static int s_np = 0;
+            if (s_np++ < 1)
+                fprintf(stderr, "[spu-dma] LS-window no peer n=%u img=%d pc=0x%05X "
+                                "ea=0x%08X size=%u\n",
+                        n, spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, e, size);
+            return -1;
+        }
+        if ((off == 0x1400Cu || off == 0x1401Cu || off == 0x5400Cu || off == 0x5401Cu)
+            && size == 4u && mfc_is_put(cmd)) {
+            uint32_t v = ((uint32_t)spu->ls[lsa] << 24) | ((uint32_t)spu->ls[lsa + 1] << 16)
+                       | ((uint32_t)spu->ls[lsa + 2] << 8) | spu->ls[lsa + 3];
+            int idx = (off == 0x1401Cu || off == 0x5401Cu) ? 1 : 0;
+            if (peer->ch_sig_notify[idx].count)
+                peer->ch_sig_notify[idx].value |= v;
+            else
+                peer->ch_sig_notify[idx].value = v;
+            peer->ch_sig_notify[idx].count = 1;
+            spu_ch_wake(peer);
+            { static int s_sn = 0;
+              if (s_sn++ < 8)
+                  fprintf(stderr, "[spu-dma] LS-window SNR%u n=%u val=0x%08X img=%d\n",
+                          idx + 1, n, v, spu->image_id); }
+            return 0;
+        }
+        if (off + size <= (uint32_t)SPU_LS_SIZE) {
+            if (mfc_is_get(cmd))
+                memcpy(spu->ls + lsa, peer->ls + off, size);
+            else if (mfc_is_put(cmd))
+                memcpy(peer->ls + off, spu->ls + lsa, size);
+            else {
+                static int s_c = 0;
+                if (s_c++ < 4)
+                    fprintf(stderr, "[spu-dma] LS-window unhandled cmd=0x%X ea=0x%08X\n",
+                            cmd, e);
+                return -1;
+            }
+            { static int s_ok = 0;
+              if (s_ok++ < 16)
+                  fprintf(stderr, "[spu-dma] LS-window %s n=%u off=0x%05X size=%u "
+                                  "img=%d pc=0x%05X\n",
+                          mfc_is_get(cmd) ? "GET" : "PUT", n, off, size,
+                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK); }
+            return 0;
+        }
+        { static int s_bad = 0;
+          if (s_bad++ < 8)
+              fprintf(stderr, "[mfc] REJECTED LS-window transfer: img=%d pc=0x%05X"
+                              " cmd=0x%X lsa=0x%05X ea=0x%08X size=%u off=0x%X\n",
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd,
+                      lsa, e, size, off); }
+        return 0;
+    }
 
     /* Reject transfers whose main-memory range is not committed guest memory,
      * so a garbage EA (e.g. from an incomplete SPURS context) is a failed DMA
@@ -562,6 +636,39 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               lsa, (uint32_t)ea, size, (uint32_t)spu->pc, spu->image_id, "\n");
               }
           } }
+        /* igPm overlay cmd 00FBE6C0: the PM GETs this 0x30 box then GETs
+         * overlay-12 to LS 0x3F580. Dispatching while the box is still zero
+         * yields a size-0 overlay GET, synthesised stop at 3F580, and a
+         * sibling that did stream overlay parks so WaitForMultipleObjects
+         * never re-dispatches the dead lanes (CollBroad slot-0). Do not
+         * restart at 0xA00 (stale GPRs / GET ea=LSA). Wait for the live box
+         * and copy it; the next GET uses those bytes. */
+        if (spu->image_id == 11 && (uint32_t)ea == 0x00FBE6C0u && size == 0x30u) {
+            unsigned spins = 0;
+            while (spins < 30000u) {
+                uint32_t src = ((uint32_t)ea_ptr[0] << 24) | ((uint32_t)ea_ptr[1] << 16)
+                             | ((uint32_t)ea_ptr[2] << 8) | ea_ptr[3];
+                uint32_t sz  = ((uint32_t)ea_ptr[4] << 24) | ((uint32_t)ea_ptr[5] << 16)
+                             | ((uint32_t)ea_ptr[6] << 8) | ea_ptr[7];
+                if (src && sz)
+                    break;
+                Sleep(1);
+                spins++;
+            }
+            { static int _n = 0;
+              if (_n++ < 8) {
+                  uint32_t src = ((uint32_t)ea_ptr[0] << 24) | ((uint32_t)ea_ptr[1] << 16)
+                               | ((uint32_t)ea_ptr[2] << 8) | ea_ptr[3];
+                  uint32_t sz  = ((uint32_t)ea_ptr[4] << 24) | ((uint32_t)ea_ptr[5] << 16)
+                               | ((uint32_t)ea_ptr[6] << 8) | ea_ptr[7];
+                  fprintf(stderr,
+                          "[spu-ovl] igPm cmd 00FBE6C0 waited %ums src=0x%08X "
+                          "size=0x%X spu=%u\n",
+                          spins, src, sz, spu->spu_id);
+                  fflush(stderr);
+              }
+            }
+        }
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
@@ -1344,11 +1451,15 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * sequence is exactly what the pipeline diagnosis needs. */
         extern uint32_t g_barrier_sync_watch;
         static int _post = 0;
-        int open = (_pn < 96) || (g_barrier_sync_watch && _post < 256);
+        int leftover = ((uint32_t)ea >= 0x00B5D000u && (uint32_t)ea < 0x00B65000u) ||
+                       ((uint32_t)ea >= 0x00DBA000u && (uint32_t)ea < 0x00DBC000u) ||
+                       (lsa == 0x100u && size >= 0x400u);
+        int open = leftover || (_pn < 96) || (g_barrier_sync_watch && _post < 256);
         if (open) {
-            if (_pn >= 96) _post++;
-            fprintf(stderr, "[spurs-pm] DMA cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
-                    cmd, lsa, (unsigned long long)ea, size, tag);
+            if (_pn >= 96 && !leftover) _post++;
+            fprintf(stderr, "[spurs-pm] DMA cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u pc=0x%05X\n",
+                    cmd, lsa, (unsigned long long)ea, size, tag,
+                    (uint32_t)spu->pc & SPU_LS_MASK);
         } else if (_pn == 96)
             fprintf(stderr, "[spurs-pm] DMA trace suppressed from here\n");
         _pn++;
@@ -1364,13 +1475,34 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * they are easy to miss entirely while diagnosing a pipeline that
          * never fills. Always report the issue: the DESTINATION lsa is the
          * value the whole transfer hangs on. */
-        { static int _l = 0; if (_l++ < 32)
+        { static int _l = 0; if (_l++ < 32) {
+            uint32_t list_lsa = (uint32_t)ea & SPU_LS_MASK;
             fprintf(stderr, "[mfc-list] ISSUE img=%d cmd=0x%02X dest_lsa=0x%05X "
                     "list\n0x%05X size=0x%X (%u elems) tag=%u\n",
-                    spu->image_id, cmd, lsa, (uint32_t)ea & SPU_LS_MASK,
-                    size, size / 8, tag); }
+                    spu->image_id, cmd, lsa, list_lsa,
+                    size, size / 8, tag);
+            if (size >= 8u) {
+                uint32_t szf = spu_ls_read32(spu, list_lsa);
+                uint32_t eal = spu_ls_read32(spu, list_lsa + 4);
+                fprintf(stderr, "[mfc-list] ELEM0 img=%d list=0x%05X "
+                        "size_flags=0x%08X xfer=%u eal=0x%08X\n",
+                        spu->image_id, list_lsa, szf, szf & 0x7FFFu, eal);
+            }
+        } }
         rc = mfc_do_list_transfer(spu, (uint32_t)ea & SPU_LS_MASK,
                                   ea & 0xFFFFFFFF00000000ull, size, cmd);
+        if (spu->image_id == 11 && lsa == 0x25280u && size >= 8u) {
+            static int _d = 0;
+            if (_d++ < 4) {
+                unsigned i;
+                fprintf(stderr, "[mfc-list] DEST img=11 lsa=0x25280:");
+                for (i = 0; i < 48u; i += 4u) {
+                    uint32_t w = spu_ls_read32(spu, 0x25280u + i);
+                    fprintf(stderr, " %08X", w);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
     } else {
         rc = mfc_do_transfer(spu, lsa, ea, size, cmd);
     }
@@ -1552,10 +1684,9 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
         return m;
     }
     case MFC_RdAtomicStat:
-        /* Result of the last atomic line op (GETLLAR/PUTLLC/PUTLLUC), set by
-         * spu_mfc_atomic(): 0 = PUTLLC_SUCCESS, 1 = PUTLLC_FAILURE (line moved,
-         * SPU must retry). Honoring this is what keeps the SPURS lock-free queue
-         * consistent across concurrent SPU kernel threads. */
+        /* Result of the last atomic line op, set by spu_mfc_atomic():
+         * GETLLAR -> 4 (MFC_GETLLAR_SUCCESS), PUTLLC -> 0 commit / 1 lost.
+         * Honoring GETLLAR=4 is what lets a `rdch; brz` lock-line loop leave. */
         return spu->atomic_stat;
     default:
         return 0;

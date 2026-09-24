@@ -310,6 +310,28 @@ s32 sceNpManagerRequestTicket(const SceNpId* npId, const char* serviceId,
     return CELL_OK;
 }
 
+s32 sceNpDrmIsAvailable2(const void* k_licensee, const char* drm_path)
+{
+    (void)k_licensee;
+
+    /* RPCS3: NULL path is SCE_NP_DRM_ERROR_INVALID_PARAM; k_licensee optional.
+     * Firmware blocks until the kernel has the key; we do not — cellFsOpen
+     * already decrypts NPD/EDAT through edat_resolve. */
+    if (!drm_path)
+        return (s32)SCE_NP_DRM_ERROR_INVALID_PARAM;
+
+    {
+        const char* path = GUEST_PTR(drm_path, const char*);
+        static int nlog;
+        if (nlog < 8) {
+            printf("[sceNp] DrmIsAvailable2(path=\"%s\") -> CELL_OK\n",
+                   path ? path : "");
+            nlog++;
+        }
+    }
+    return CELL_OK;
+}
+
 s32 sceNpBasicGetFriendPresenceByIndex(u32 index, SceNpUserInfo* user,
                                        void* pres, u32 options)
 {

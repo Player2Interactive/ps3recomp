@@ -29,6 +29,17 @@ static u32 s_gcm_context_ea = 0;
 #include <windows.h>
 #else
 #include <time.h>
+#include <stdatomic.h>
+#endif
+
+/* Full fence between a guest-visible store and the next one that publishes
+ * it (label after GET, GET after the FIFO words). x86 program order hides a
+ * missing one; arm64 does not: the PPU thread can see the label before the
+ * GET it is about to snapshot, and the loc_005CB1BC wait never leaves. */
+#ifdef _WIN32
+#  define GCM_PUBLISH_FENCE() MemoryBarrier()
+#else
+#  define GCM_PUBLISH_FENCE() atomic_thread_fence(memory_order_seq_cst)
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -738,6 +749,32 @@ void ppu_gcm_pump(void)
         u32 cmd = (u32)user;
         if (s_user_handler_opd && g_ps3_guest_caller)
             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
+        else {
+            static int once;
+            if (once++ < 4)
+                fprintf(stderr, "[gcm-pump] USER_CMD 0x%08X dropped (opd=0x%08X caller=%p)\n",
+                        cmd, s_user_handler_opd, (void*)g_ps3_guest_caller);
+        }
+    } else if (s_user_handler_opd && g_ps3_guest_caller) {
+        /* Insomniac job doorbell at mailbox+0x130 (0x00F3CF30): OR 0x180.
+         * On Cell the libgcm interrupt / SMT sibling consumes it. HLE never
+         * created that thread; ppu_gcm_pump is the stand-in. func_005C4B58
+         * (SetUserHandler OPD 0x00D12490) treats r3 as an OPD — pass the
+         * last USER_COMMAND argument, not the wake bits. */
+        u32 wake = vm_read32(0x00F3CF30u);
+        if (wake & 0x180u) {
+            u32 cmd = (u32)s_user_command;
+            static unsigned long wk;
+            if (cmd && g_ps3_guest_caller) {
+                if (wk++ < 6 || (wk % 256) == 0)
+                    fprintf(stderr, "[gcm-pump] wake=0x%08X user-opd=0x%08X cmd=0x%08X\n",
+                            wake, s_user_handler_opd, cmd);
+                g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
+            } else if (wk++ < 4) {
+                fprintf(stderr, "[gcm-pump] wake=0x%08X user-opd=0x%08X no USER_CMD arg\n",
+                        wake, s_user_handler_opd);
+            }
+        }
     }
     GCM_PUMP_LEAVE();
 }
@@ -788,7 +825,9 @@ unsigned long long ps3_ms_now(void)
 #ifdef _WIN32
     return (unsigned long long)GetTickCount64();
 #else
-    return 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
 #endif
 }
 
@@ -802,16 +841,32 @@ static u32 gcm_sema_backend_swap(u32 arg)
 }
 static u32 s_sema_last_off, s_sema_last_val, s_sema_last_ea;
 static const char* s_sema_last_tag = "";
+/* Guest GET must be current before a label is visible. func_005CB084 waits
+ * on label 0x41, then loc_005CB1BC snapshots GET and spins until PUT equals
+ * that snapshot. Hardware advances GET as it parses RELEASE; we used to
+ * write the label mid-drain and only publish GET at tick end, so the PPU
+ * saw a match with a stale GET (HOTREAD r29=0x1020 vs put=0x10B20) and
+ * never left the 132 KB default ring. */
+static void gcm_sema_publish_get(u32 after)
+{
+    u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    u32 ge = after;
+    if (after > put)
+        ge = put;
+    else if (put >= after && put - after <= 0x40u)
+        ge = put;
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, ge);
+    GCM_PUBLISH_FENCE();
+}
 static void gcm_sema_store(u32 offset, u32 value, const char* tag)
 {
     /* index*0x10 byte offset. Labels occupy 4 KB at GetLabelAddress base.
      * vm_write32 stores big-endian for guest lwz. */
     u32 off = offset & 0x00FFFFFCu;
     u32 ea = GCM_LABEL_GUEST_BASE + off;
+    gcm_sema_publish_get(s_fifo_getoff);
     vm_write32(ea, value);
-#ifdef _WIN32
-    MemoryBarrier();
-#endif
+    GCM_PUBLISH_FENCE();
     s_sema_last_off = off;
     s_sema_last_val = value;
     s_sema_last_ea = ea;
@@ -900,6 +955,7 @@ static u32 s_fifo_calloff = 0;
  * its texture-size constants -> UVs scaled by 0 -> uniform output).
  * -----------------------------------------------------------------------*/
 extern u32 cellGcmResolveLocated(int local, u32 offset);
+int cellGcmOffsetIsDisplay(u32 offset);
 
 static struct {
     u32 dst_dma;      /* NV3062 0x0188 SET_CONTEXT_DMA_IMAGE_DESTIN */
@@ -930,6 +986,134 @@ static struct {
                      * flag made 5's NV308A POINT (also 0x0304) be swallowed as
                      * an NV309E offset, breaking every inline transfer. */
 } s_nv309e;
+
+/* Per-subchannel bound object. Reset matches RPCS3/libgcm:
+ *   0 NV4097 0x31337000, 1 NV0039 0x31337303, 2/3 NV3062 0x313371C3,
+ *   4 NV309E 0x31337A73, 5 NV308A 0x31337808, 6 NV3089 0x3137AF00.
+ * Treating subchannel 1 as 3D (GCM_SUBCH1_3D default in an older split)
+ * dropped NV0039 m2mf: OFFSET_IN 0x030C aliased NV4097_SET_ALPHA_REF. */
+enum {
+    GCM_CLS_3D    = 0,
+    GCM_CLS_M2MF  = 1,
+    GCM_CLS_SURF2D= 2,
+    GCM_CLS_SWZ   = 3,
+    GCM_CLS_IFC   = 4,
+    GCM_CLS_SIFM  = 5
+};
+static int s_subch_cls[8] = {
+    GCM_CLS_3D, GCM_CLS_M2MF, GCM_CLS_SURF2D, GCM_CLS_SURF2D,
+    GCM_CLS_SWZ, GCM_CLS_IFC, GCM_CLS_SIFM, GCM_CLS_SIFM
+};
+
+static int gcm_obj_class(u32 handle)
+{
+    switch (handle) {
+    case 0x31337000u: return GCM_CLS_3D;     /* NV4097 */
+    case 0x31337303u: return GCM_CLS_M2MF;   /* NV0039 */
+    case 0x313371C3u: return GCM_CLS_SURF2D; /* NV3062 */
+    case 0x31337A73u: return GCM_CLS_SWZ;    /* NV309E */
+    case 0x31337808u: return GCM_CLS_IFC;    /* NV308A */
+    case 0x3137AF00u: return GCM_CLS_SIFM;   /* NV3089 */
+    default: break;
+    }
+    switch (handle & 0xFFFFu) {
+    case 0x4097u: case 0x406Eu: return GCM_CLS_3D;
+    case 0x0039u: return GCM_CLS_M2MF;
+    case 0x3062u: return GCM_CLS_SURF2D;
+    case 0x309Eu: return GCM_CLS_SWZ;
+    case 0x308Au: return GCM_CLS_IFC;
+    case 0x3089u: return GCM_CLS_SIFM;
+    default: return -1;
+    }
+}
+
+static int gcm_subch_class(u32 subch)
+{
+    static int s1_2d = -1, s1_3d = -1;
+    if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
+    if (s1_3d < 0) { const char* e = getenv("GCM_SUBCH1_3D"); s1_3d = e ? atoi(e) : 0; }
+    if (subch >= 8) return GCM_CLS_3D;
+    if (subch == 1 && s1_3d) return GCM_CLS_3D;
+    if (subch == 1 && s1_2d) return GCM_CLS_M2MF;
+    return s_subch_cls[subch];
+}
+
+static void gcm_set_object(u32 subch, u32 handle)
+{
+    if (subch >= 8) return;
+    int cls = gcm_obj_class(handle);
+    if (cls >= 0) s_subch_cls[subch] = cls;
+    { static u32 seen[8]; static int have[8];
+      if (!have[subch] || seen[subch] != handle) {
+          have[subch] = 1; seen[subch] = handle;
+          fprintf(stderr, "[GCM-OBJ] subch=%u SET_OBJECT handle=0x%08X cls=%d%c",
+                  subch, handle, cls, 10);
+      } }
+}
+
+static struct {
+    u32 dma_in, dma_out;
+    u32 off_in, off_out;
+    u32 pitch_in, pitch_out;
+    u32 line_len, line_count;
+    u32 format;
+} s_nv0039;
+
+/* If the guest 2D-blits into a registered display buffer, composite the
+ * matching offscreen D3D RT (same raw offset the 3D path rendered into).
+ * Guest VRAM is not the D3D resource, so a CPU copy of the source would
+ * move zeros. This is that blit, not a made-up compositor. */
+static void gcm_blit_to_display(u32 src_off, u32 dst_off, u32 w, u32 h,
+                                const char* eng)
+{
+    int disp = cellGcmOffsetIsDisplay(dst_off);
+    { static int n = 0;
+      if (n++ < 32)
+          fprintf(stderr, "[%s] %ux%u src=0x%08X -> dst=0x%08X display=%d%c",
+                  eng, w, h, src_off, dst_off, disp, 10); }
+    if (disp && src_off) {
+        extern void rsx_d3d12_composite_from_offscreen(u32);
+        rsx_d3d12_composite_from_offscreen(src_off);
+    }
+}
+
+static void nv0039_copy(void)
+{
+    u32 line_len = s_nv0039.line_len;
+    u32 rows = s_nv0039.line_count;
+    u8 in_fmt = (u8)(s_nv0039.format & 0xFFu);
+    u8 out_fmt = (u8)((s_nv0039.format >> 8) & 0xFFu);
+    if (!in_fmt) in_fmt = 1;
+    if (!out_fmt) out_fmt = 1;
+    if (!line_len || !rows || in_fmt > 4 || out_fmt > 4) return;
+    s32 in_pitch = (s32)s_nv0039.pitch_in;
+    s32 out_pitch = (s32)s_nv0039.pitch_out;
+    if (!in_pitch) in_pitch = (s32)(line_len * in_fmt);
+    if (!out_pitch) out_pitch = (s32)(line_len * out_fmt);
+    int src_local = (s_nv0039.dma_in != 0xFEED0001u);
+    int dst_local = (s_nv0039.dma_out != 0xFEED0001u);
+    u32 src = cellGcmResolveLocated(src_local, s_nv0039.off_in);
+    u32 dst = cellGcmResolveLocated(dst_local, s_nv0039.off_out);
+    extern u8* vm_base;
+    if (!vm_base || src == 0xFFFFFFFFu || dst == 0xFFFFFFFFu) return;
+    u8* d = vm_base + dst;
+    const u8* s = vm_base + src;
+    u32 width = line_len * in_fmt;
+    if (in_fmt == 1 && out_fmt == 1) {
+        for (u32 row = 0; row < rows; row++)
+            memcpy(d + (size_t)row * (u32)out_pitch,
+                   s + (size_t)row * (u32)in_pitch, width);
+    } else {
+        for (u32 row = 0; row < rows; row++) {
+            const u8* sr = s + (size_t)row * (u32)in_pitch;
+            u8* dr = d + (size_t)row * (u32)out_pitch;
+            for (u32 col = 0; col < line_len; col++)
+                dr[col * out_fmt] = sr[col * in_fmt];
+        }
+    }
+    gcm_blit_to_display(s_nv0039.off_in, s_nv0039.off_out,
+                        line_len, rows, "NV0039");
+}
 
 /* Execute one NV3089 blit into the currently-bound NV3062 destination surface.
  * Point-sampled: ds/dx and dt/dy are 20.12 fixed point and are 0x100000 (1.0)
@@ -1050,6 +1234,7 @@ static void nv3089_blit(void)
       if (cap && _n < cap) { _n++;
         printf("[NV3089] %ux%u fmt=0x%X src=0x%08X(pitch %u) -> dst=0x%08X(pitch %u) at %u,%u\n",
                out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
+    gcm_blit_to_display(s_nv3089.in_off, s_gcm2d.dst_offset, out_w, out_h, "NV3089");
 }
 
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
@@ -1078,20 +1263,24 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
               printf("---%c", 10);
           }
       } }
-    /* Subchannel bindings are libgcm-version-specific (SET_OBJECT binds are
-     * not tracked): demosaic's SDK emits dest-surface on sub 3 and image-from-
-     * CPU on sub 5 (cellGcmSetInlineTransfer: 0x4630C / 0xCA304 / 0xA400
-     * headers); other versions use the classic 2 / 4. Accept both. */
-    if (subch == 2 || subch == 3) {         /* NV3062 context surface 2D */
+    /* Subchannel bindings are libgcm-version-specific. SET_OBJECT (method 0)
+     * names the engine; class, not slot number, picks the decoder. */
+    int cls = gcm_subch_class(subch);
+    if (cls == GCM_CLS_SURF2D) {         /* NV3062 context surface 2D */
         switch (method) {
         case 0x0184: case 0x0188: s_gcm2d.dst_dma = data; return;
         case 0x0300: s_gcm2d.color_fmt  = data; return;
         case 0x0304: s_gcm2d.pitch      = data; return;
-        case 0x030C: s_gcm2d.dst_offset = data; return;
+        case 0x030C: s_gcm2d.dst_offset = data;
+            { static u32 last = 0xFFFFFFFFu; static int n = 0;
+              if (data != last && n < 16) { last = data; n++;
+                  fprintf(stderr, "[NV3062] SET_OFFSET_DESTIN=0x%08X pitch=%u dma=0x%08X%c",
+                          data, s_gcm2d.pitch >> 16, s_gcm2d.dst_dma, 10); } }
+            return;
         }
         return;
     }
-    if (subch == 4 || subch == 5) {         /* NV308A image-from-CPU, or NV309E */
+    if (cls == GCM_CLS_SWZ || cls == GCM_CLS_IFC) {
         /* NV309E swizzled-surface state. SET_FORMAT (0x0300) does not exist on
          * NV308A, so seeing it identifies the object bound here. */
         if (method == 0x0300) { s_nv309e.fmt = data; s_nv309e.active = 1;
@@ -1138,7 +1327,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
      * point/size, 0x0310/0x0314 out point/size, 0x0318/0x031C ds/dx dt/dy in
      * 20.12 fixed point, 0x0400 in size, 0x0404 (origin<<16)|pitch, 0x0408 in
      * offset, 0x040C in u/v start -- which is also the trigger. */
-    if (subch == 6 || subch == 7) {
+    if (cls == GCM_CLS_SIFM) {
         switch (method) {
         case 0x0184: s_nv3089.src_dma   = data; return;
         case 0x0198: s_nv3089.dst_surf  = data; return;
@@ -1157,13 +1346,28 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         }
         return;
     }
-    /* NV0039 / NV309E: not implemented yet -- log first sightings. */
-    /* GCM2D_DBG=<N> raises the cap and adds the data word: the fixed 8 showed
-     * only that SOMETHING was unhandled, not enough to implement it. */
+    if (cls == GCM_CLS_M2MF) {
+        switch (method) {
+        case 0x0180: return; /* NOTIFIES */
+        case 0x0184: s_nv0039.dma_in     = data; return;
+        case 0x0188: s_nv0039.dma_out    = data; return;
+        case 0x030C: s_nv0039.off_in     = data; return;
+        case 0x0310: s_nv0039.off_out    = data; return;
+        case 0x0314: s_nv0039.pitch_in   = data; return;
+        case 0x0318: s_nv0039.pitch_out  = data; return;
+        case 0x031C: s_nv0039.line_len   = data; return;
+        case 0x0320: s_nv0039.line_count = data; return;
+        case 0x0324: s_nv0039.format     = data; return;
+        case 0x0328: nv0039_copy(); return;
+        }
+        return;
+    }
+    /* Unhandled 2D class/method. */
     static int warned = 0, wcap = -1;
     if (wcap < 0) { const char* e = getenv("GCM2D_DBG"); wcap = e ? atoi(e) : 8; }
     if (warned < wcap) { warned++;
-        printf("[GCM2D-UNH] subch %u method 0x%04X data=0x%08X\n", subch, method, data); }
+        printf("[GCM2D-UNH] subch %u cls=%d method 0x%04X data=0x%08X\n",
+               subch, cls, method, data); }
     if (0)
         printf("[cellGcmSys] FIFO subch %u method 0x%04X (unhandled 2D engine)\n",
                subch, method);
@@ -1262,12 +1466,16 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
         if (rescued) { static int m = 0; if (m++ < 8)
             fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) from"
                     " 0x%08X..0x%08X\n", rescued, from, put); }
-        gcm_fifo_scan_sema(from, put);
     }
+    /* GET = PUT before labels, or loc_005CB1BC snapshots the old GET. */
+    *getoff = put;
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, put);
+    GCM_PUBLISH_FENCE();
+    if (from < put)
+        gcm_fifo_scan_sema(from, put);
     /* Do not replay put-0x80 on wrap. That applies ring-head next-gen
      * RELEASE (0x30000000 / 0x90000000) the walker has not reached yet
      * and clobbers the current done cookie the waiter still holds. */
-    *getoff = put;
 }
 
 static void gcm_fifo_dump_around(u32 getoff)
@@ -1598,22 +1806,23 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
     }
 
-    /* Hardware RSX keeps fetching at GET while put==get. A JUMP patched to a
-     * mapped non-self target must be followed; methods past PUT are the write
-     * head and must not be decoded. */
+    /* put==get: FIFO empty. The word at GET is the write head, not a
+     * submitted command. Hardware stops; it does not take a JUMP there.
+     * Following one (ACIT 0x0161AF20 ⇄ default 0x3C780) teleports GET
+     * while PUT stays. loc_005CB1BC then snapshots GET ahead of PUT
+     * (`r29=0x01B1C6DC` vs `put=0x01B1AF20`) and spins on PUT forever.
+     * A real JUMP is submitted with PUT past it and is followed below. */
     if (s_fifo_getoff == put) {
         u32 pea = gcm_io2ea(s_fifo_getoff);
         if (pea) {
             u32 pw = vm_read32(pea);
             if ((pw >> 29) == 1) {
                 u32 tgt = pw & 0x1FFFFFFCu;
-                if (tgt != s_fifo_getoff && gcm_io2ea(tgt)) {
-                    static int n = 0;
-                    if (n++ < 8)
-                        fprintf(stderr, "[cellGcmSys] idle JUMP %08X -> %08X "
-                                "(put=get; patched park)\n", s_fifo_getoff, tgt);
-                    s_fifo_getoff = tgt;
-                }
+                static int n = 0;
+                if (n++ < 8)
+                    fprintf(stderr, "[cellGcmSys] idle JUMP %08X -> %08X "
+                            "not taken (put=get; write head)\n",
+                            s_fifo_getoff, tgt);
             }
         }
     }
@@ -1815,13 +2024,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * Any subchannel: ACIT encodes 0x00040064 (subch 0). */
             if (method == 0x64u || method == 0x68u || method == 0x6Cu ||
                 method == 0x1D6Cu || method == 0x1D70u || method == 0x1D74u) {
+                u32 sema_at = s_fifo_getoff;
+                u32 next = sema_at + 4 + count * 4;
+                /* GET first, then the label (gcm_sema_store). loc_005CB1BC
+                 * snapshots GET after the label matches. */
+                s_fifo_getoff = next;
+                gcm_sema_publish_get(next);
                 for (u32 i = 0; i < count; i++) {
-                    u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                    u32 dea = gcm_io2ea(sema_at + 4 + i * 4);
                     if (!dea) break;
                     u32 m = (type == 0) ? method + i * 4 : method;
                     gcm_sema_method(m, vm_read32(dea));
                 }
-                s_fifo_getoff += 4 + count * 4;
                 continue;
             }
             /* NV4097_GET_REPORT (0x1800): RSX writes CellGcmReportData
@@ -1852,6 +2066,48 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
+                /* After a 640x640 clip or any high AOFFSET (offscreen RT,
+                 * not the 0x0/0x398000 display buffers), log unique methods
+                 * plus a draw/blit census. Dump-only: do not composite. */
+                { static int after = 0;
+                  static u32 clip_w = 0, clip_h = 0;
+                  u32 dval = vm_read32(dea);
+                  if (m == 0x208u) clip_w = dval >> 16;
+                  if (m == 0x20Cu) clip_h = dval >> 16;
+                  if ((m == 0x210u && dval >= 0x08000000u) ||
+                      (clip_w == 640u && clip_h == 640u))
+                      after = 1;
+                  if (after) {
+                      static u8 seen[8][2048];
+                      static u64 n = 0, c_be = 0, c_da = 0, c_ia = 0, c_e16 = 0,
+                                 c_e32 = 0, c_di = 0, c_clr = 0, c_tex = 0,
+                                 c_v4 = 0, c_040c = 0, c_0328 = 0, c_obj = 0;
+                      u32 mi = (m >> 2) & 2047;
+                      if (subch < 8 && !seen[subch][mi]) {
+                          seen[subch][mi] = 1;
+                          fprintf(stderr, "[FIFO-METH] subch=%u method=0x%04X data=0x%08X cls=%d%c",
+                                  subch, m, dval, gcm_subch_class(subch), 10);
+                      }
+                      n++;
+                      if      (m == 0x1808u) c_be++;
+                      else if (m == 0x1814u) c_da++;
+                      else if (m == 0x1818u) c_ia++;
+                      else if (m == 0x180Cu) c_e16++;
+                      else if (m == 0x1810u) c_e32++;
+                      else if (m == 0x1824u) c_di++;
+                      else if (m == 0x1D94u) c_clr++;
+                      else if (m == 0x040Cu) c_040c++;
+                      else if (m == 0x0328u) c_0328++;
+                      else if (m == 0)       c_obj++;
+                      else if (m >= 0x1A00u && m < 0x1C00u && (m & 0x1Fu) == 0) c_tex++;
+                      else if (m >= 0x1C00u && m < 0x1D00u) c_v4++;
+                      if (n == 1 || n == 2000 || n == 20000 || (n % 200000ull) == 0ull)
+                          fprintf(stderr, "[FIFO-METH] n=%llu BEGIN=%llu DRAW_A=%llu INLINE=%llu "
+                                  "E16=%llu E32=%llu DRAW_I=%llu CLEAR=%llu TEXOFF=%llu V4F=%llu "
+                                  "040C=%llu 0328=%llu OBJ=%llu%c",
+                                  n, c_be, c_da, c_ia, c_e16, c_e32, c_di, c_clr, c_tex, c_v4,
+                                  c_040c, c_0328, c_obj, 10);
+                  } }
                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
                  * splits into subchannel 7 / method 0x0B00 -- so it was landing
                  * in the 2D engine path and being dropped as unrecognised. It
@@ -1864,8 +2120,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
                               m, vm_read32(dea)); }
                 if (subch == 7 && m == 0x0B00u) {
+                    /* Title-linked libgcm's ISR thread is never created under
+                     * HLE cellGcmInit (no sys_rsx context). Raise for the
+                     * sys_rsx queue if it exists, and always queue the HLE
+                     * pump so SetUserHandler's OPD still runs. */
+                    u32 uarg = vm_read32(dea);
                     extern void rsx_raise_user_cmd(u32 arg);
-                    rsx_raise_user_cmd(vm_read32(dea));
+                    rsx_raise_user_cmd(uarg);
+                    cellGcmQueueUserCommand(uarg);
                     continue;
                 }
                 /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
@@ -1874,36 +2136,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * discards whatever it does not recognise, so that state never
                  * reaches the renderer. SET_OBJECT binds are not tracked, which
                  * is what makes the subchannel-to-engine mapping a guess. */
-                /* GCM_OBJDBG=1: log every SET_OBJECT (method 0). The handle a
-                 * title binds to a subchannel is what says which engine that
-                 * subchannel drives; comparing subchannel 1 against subchannel 0
-                 * turns the routing below from a guess into a reading. */
-                { static int od = -1;
-                  if (od < 0) { const char* e = getenv("GCM_OBJDBG"); od = e ? 1 : 0; }
-                  if (od && m == 0) {
-                      static unsigned seen[8]; static int have[8];
-                      const unsigned h = vm_read32(dea);
-                      if (subch < 8 && (!have[subch] || seen[subch] != h)) {
-                          have[subch] = 1; seen[subch] = h;
-                          printf("[GCM-OBJ] subch=%u SET_OBJECT handle=0x%08X%c",
-                                 subch, h, 10); fflush(stdout);
-                      } } }
-                /* The subchannel is a binding slot, not an engine selector: a
-                 * title may bind NV4097 to something other than subchannel 0.
-                 * Twisted Metal uses subchannel 1, and caner (canersaka) hit
-                 * the same thing in Yakuza Dead Souls, where SPU-built command
-                 * lists bind NV4097 elsewhere -- his rsx_live_draw.c masks the
-                 * subchannel out of the method for exactly this reason.
-                 *
-                 * gcm_2d_method only ever handles subchannels 2..7 (NV3062,
-                 * NV308A/NV309E, NV3089), so anything arriving on 1 was being
-                 * dropped on the floor -- for this title that included
-                 * SET_SHADER_PROGRAM, leaving one stale fragment program bound
-                 * for every draw in the game. Treat the subchannels the 2D path
-                 * does not claim as 3D. GCM_SUBCH1_2D=1 restores the old split.
-                 */
-                static int s1_2d = -1;
-                if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
+                /* SET_OBJECT binds the engine for this subchannel. Always
+                 * tracked: NV0039 vs NV4097 share method numbers (0x030C is
+                 * OFFSET_IN on m2mf and ALPHA_REF on 3D). */
+                if (m == 0)
+                    gcm_set_object(subch, vm_read32(dea));
+                /* The subchannel is a binding slot, not an engine selector.
+                 * Default + SET_OBJECT pick the class; GCM_SUBCH1_3D=1 forces
+                 * NV4097 on slot 1 (Twisted Metal). */
                 /* Mirror the whole method stream into the live NV4097->D3D12
                  * engine (caner / canersaka). Inert unless RSX_LIVE_DRAW is set.
                  * It wants the raw method with its subchannel bits -- it
@@ -1945,7 +2185,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     cellGcmQueueUserCommand(vm_read32(dea));
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
-                } else if (subch == 0 || (subch == 1 && !s1_2d)) {
+                } else if (gcm_subch_class(subch) == GCM_CLS_3D) {
                     rsx_process_method(&s_state, m, vm_read32(dea));
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
@@ -2111,11 +2351,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
     }
 
-    /* Idle FIFO: last NV406E OFFSET/RELEASE may sit just behind PUT after a
-     * wrap. Replaying them is idempotent and unblocks GetLabelAddress waiters
-     * if the walker skipped the pair. Do not move GET. */
-    if (s_fifo_getoff == put && put >= 0x40u)
-        gcm_fifo_scan_sema(put - 0x40u, put);
+    /* Hardware GET never passes PUT. Overshoot (write-head leftovers)
+     * lets loc_005CB1BC snapshot GET ahead and wait for PUT to catch it —
+     * deadlock, because that waiter is the producer. Wrap is GET < PUT. */
+    if (s_fifo_getoff > put)
+        s_fifo_getoff = put;
 
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
@@ -2127,6 +2367,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
     { static int eq = -1;
       if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
       vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
+    GCM_PUBLISH_FENCE();
+    /* Idle FIFO: last NV406E OFFSET/RELEASE may sit just behind PUT after a
+     * wrap. Replay after GET is published so loc_005CB1BC cannot snapshot a
+     * stale GET. Do not move GET. */
+    if (s_fifo_getoff == put && put >= 0x40u)
+        gcm_fifo_scan_sema(put - 0x40u, put);
 
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
     gcm_ref_publish_one();
@@ -2261,9 +2507,13 @@ s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
  * offscreen render-to-texture passes. */
 int cellGcmOffsetIsDisplay(u32 offset)
 {
-    for (int i = 0; i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; i++)
-        if (s_display_buffer_set[i] && s_display_buffers[i].offset == offset)
-            return 1;
+    for (int i = 0; i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; i++) {
+        if (!s_display_buffer_set[i]) continue;
+        u32 o = s_display_buffers[i].offset;
+        if (o == offset) return 1;
+        u32 bytes = s_display_buffers[i].pitch * s_display_buffers[i].height;
+        if (bytes && offset >= o && offset < o + bytes) return 1;
+    }
     return 0;
 }
 
@@ -2295,8 +2545,11 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
           unsigned long long now = ps3_ms_now();
           if (!t0) t0 = now;
           ++n;
+          int set = (bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
+                    ? s_display_buffer_set[bufferId] : -1;
           if (n <= 400ull || (n % 10ull) == 0)
-              fprintf(stderr, "[flip] %llu at %llu ms%c", n, now - t0, 10);
+              fprintf(stderr, "[flip] %llu at %llu ms buf=%u set=%d%c",
+                      n, now - t0, bufferId, set, 10);
       } }
 
     /* GCM_FLIP_BT=<n>: dump the flipping thread's guest stack for the flips
@@ -2325,18 +2578,27 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     { static int _n=0; if (getenv("FLIP_DBG") && _n++ < 20)
         fprintf(stderr, "[FLIP] SetFlipCommand(buf=%u) set=%d\n",
                 bufferId, bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM ? s_display_buffer_set[bufferId] : -1); }
-    if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
+    if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM) {
+        static int n = 0;
+        if (n++ < 8)
+            fprintf(stderr, "[flip] REJECT buf=%u (id >= %u)\n",
+                    bufferId, CELL_GCM_MAX_DISPLAY_BUFFER_NUM);
         return CELL_GCM_ERROR_INVALID_VALUE;
+    }
 
-    if (!s_display_buffer_set[bufferId])
+    if (!s_display_buffer_set[bufferId]) {
+        static int n = 0;
+        if (n++ < 8)
+            fprintf(stderr, "[flip] REJECT buf=%u not registered\n", bufferId);
         return CELL_GCM_ERROR_INVALID_VALUE;
+    }
 
 
     s_current_display_buffer_id = bufferId;
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
-    s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
+    s_flip_pending = 1;   /* ticker: drain, then present this scanout */
     s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
 
@@ -2428,7 +2690,13 @@ void cellGcmSetFlipHandler(CellGcmFlipHandler handler)
     printf("[cellGcmSys] SetFlipHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
     s_flip_handler_opd = (u32)(size_t)handler;
     s_flip_handler = handler;
-    { u32 c = s_flip_handler_opd ? vm_read32(s_flip_handler_opd) : 0; if (c) s_flip_handler_code = c; }
+    { u32 c = s_flip_handler_opd ? vm_read32(s_flip_handler_opd) : 0;
+      u32 t = s_flip_handler_opd ? vm_read32(s_flip_handler_opd + 4) : 0;
+      if (c) {
+          s_flip_handler_code = c;
+          extern void ppu_register_opd_fixup(u32, u32, u32);
+          ppu_register_opd_fixup(s_flip_handler_opd, c, t);
+      } }
     gcm_update_handler_mask();
 }
 
@@ -2438,7 +2706,18 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler)
     printf("[cellGcmSys] SetVBlankHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
     s_vblank_handler_opd = (u32)(size_t)handler;
     s_vblank_handler = handler;
-    { u32 c = s_vblank_handler_opd ? vm_read32(s_vblank_handler_opd) : 0; if (c) s_vblank_handler_code = c; }
+    /* Capture {code,toc} while the ELF OPD is still valid. Guest later
+     * clobbers 00D177D0 to code=0x30; ppu_guest_call uses this fixup.
+     * Do not host-store the OPD word. */
+    { u32 c = s_vblank_handler_opd ? vm_read32(s_vblank_handler_opd) : 0;
+      u32 t = s_vblank_handler_opd ? vm_read32(s_vblank_handler_opd + 4) : 0;
+      if (c) {
+          s_vblank_handler_code = c;
+          extern void ppu_register_opd_fixup(u32, u32, u32);
+          ppu_register_opd_fixup(s_vblank_handler_opd, c, t);
+          fprintf(stderr, "[cellGcmSys] VBlankHandler code=0x%08X toc=0x%08X\n",
+                  (unsigned)c, (unsigned)t);
+      } }
     gcm_update_handler_mask();
 }
 
@@ -2458,6 +2737,8 @@ void cellGcmSetUserHandler(CellGcmUserHandler handler)
     s_user_handler = handler;
     gcm_update_handler_mask();
 }
+
+u32 cellGcm_user_handler_opd(void) { return s_user_handler_opd; }
 
 /* NID: 0x21AC3697 */
 u64 cellGcmGetLastFlipTime(void)
@@ -2821,7 +3102,9 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
     s_tiles[index].format = comp;
     s_tiles[index].base   = base;
     s_tiles[index].bank   = bank;
-    s_tiles[index].bound  = 0;
+    /* Old SDK SetTile writes the tile registers (binds). SetTileInfo + BindTile
+     * is the split; this function is the combined one ACIT calls. */
+    s_tiles[index].bound  = 1;
 
     /* Build tile register value (simplified) */
     s_tiles[index].tile  = (location << 0) | (pitch << 8);
@@ -2976,8 +3259,18 @@ u64 cellGcmGetTimeStampLocation(u32 index, u32 location)
 s32 cellGcmSetTileInfo(u8 index, u8 location, u32 offset, u32 size,
                        u32 pitch, u8 comp, u16 base, u8 bank)
 {
-    /* Delegates to existing SetTile */
-    return cellGcmSetTile(index, location, offset, size, pitch, comp, base, bank);
+    if (index >= CELL_GCM_MAX_TILE_COUNT)
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    s_tiles[index].offset = offset;
+    s_tiles[index].size   = size;
+    s_tiles[index].pitch  = pitch;
+    s_tiles[index].format = comp;
+    s_tiles[index].base   = base;
+    s_tiles[index].bank   = bank;
+    s_tiles[index].bound  = 0;
+    s_tiles[index].tile  = (location << 0) | (pitch << 8);
+    s_tiles[index].limit = offset + size - 1;
+    return CELL_OK;
 }
 
 /* Default FIFO size — configures command buffer size before init */
@@ -3187,6 +3480,19 @@ CellGcmDisplayInfo* cellGcmGetDisplayInfo(u32 index)
         return NULL;
     }
     return &s_display_buffers[index];
+}
+
+int cellGcm_scanout_info(u32* local_ea, u32* offset, u32* pitch, u32* w, u32* h)
+{
+    u32 id = s_current_display_buffer_id;
+    if (id >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM || !s_display_buffer_set[id])
+        return 0;
+    if (local_ea) *local_ea = s_config.localAddress;
+    if (offset)   *offset   = s_display_buffers[id].offset;
+    if (pitch)    *pitch    = s_display_buffers[id].pitch;
+    if (w)        *w        = s_display_buffers[id].width;
+    if (h)        *h        = s_display_buffers[id].height;
+    return 1;
 }
 
 /* Set default FIFO mode (before init) */
