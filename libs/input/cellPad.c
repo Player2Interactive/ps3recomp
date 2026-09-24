@@ -114,25 +114,23 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
     return (u8)val;
 }
 
-/* Keyboard fallback for port 0.
+/* Keyboard OR-in for port 0.
  *
- * The only backend here is XInput, so on a machine with no controller plugged
- * in a title gets a pad that is reported present and never presses anything --
- * it can be watched but not played. That is what The Simpsons Arcade Game hit:
- * it reached its attract loop and no input existed to start a game.
- *
- * Only fills in for port 0, only when XInput found nothing there, so a real
- * controller always wins and nothing changes for a port that has one. Keys are
- * read only while a window of THIS process is in the foreground, so typing in
- * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
- * disable it entirely.
+ * XInput alone leaves a title with a connected pad that never presses
+ * anything when the only host input is a keyboard (or when an idle
+ * controller owns the slot). Keys are read only while a window of THIS
+ * process is in the foreground. Set PAD_NO_KEYBOARD=1 to disable.
  *
  * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
- * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
- * so a title that reads the stick instead is playable too. */
+ * 1/2 = L2/R2, Enter = START, Tab = SELECT. */
 #ifdef _WIN32
 static int pad_host_window_focused(void)
 {
+    static int allow_unfocused = -1;
+    if (allow_unfocused < 0)
+        allow_unfocused = getenv("ACIT_PAD_UNFOCUSED") ? 1 : 0;
+    if (allow_unfocused) return 1;
+
     HWND fg = GetForegroundWindow();
     if (!fg) return 0;
     DWORD pid = 0;
@@ -148,12 +146,14 @@ static void pad_poll_keyboard(void)
 
     PadHostState* hs = &s_host_state[0];
     if (!pad_host_window_focused()) {
-        /* Release everything on focus loss, or a key held while alt-tabbing
-         * would stay down forever. */
-        hs->buttons = 0;
-        hs->analog_lx = hs->analog_ly = 128;
-        hs->analog_rx = hs->analog_ry = 128;
-        hs->connected = 1;
+        /* XInput already wrote this tick. If nothing is connected, clear
+         * leftover keyboard bits so a released Enter does not stick. */
+        if (!hs->connected) {
+            hs->buttons = 0;
+            hs->analog_lx = hs->analog_ly = 128;
+            hs->analog_rx = hs->analog_ry = 128;
+            hs->trigger_l2 = hs->trigger_r2 = 0;
+        }
         return;
     }
 
@@ -167,23 +167,39 @@ static void pad_poll_keyboard(void)
         { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
     };
 
-    u16 btns = 0;
+    u16 kb = 0;
     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
-        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
+        if (GetAsyncKeyState(map[i].vk) & 0x8000) kb |= map[i].btn;
 
-    hs->buttons   = btns;
+    /* OR into port 0 even when an idle XInput pad owns the slot. An empty
+     * connected controller previously blocked the keyboard entirely, so
+     * MainMenu never saw Start/Cross from Enter/Z. */
+    hs->buttons   = (u16)(hs->buttons | kb);
     hs->connected = 1;
-    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
-                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
-    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
-                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
-    hs->analog_rx = hs->analog_ry = 128;
-    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
-    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
+    if (kb & (CELL_PAD_CTRL_LEFT | CELL_PAD_CTRL_RIGHT)) {
+        hs->analog_lx = (u8)((kb & CELL_PAD_CTRL_LEFT) ? 0 :
+                             (kb & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
+    }
+    if (kb & (CELL_PAD_CTRL_UP | CELL_PAD_CTRL_DOWN)) {
+        hs->analog_ly = (u8)((kb & CELL_PAD_CTRL_UP) ? 0 :
+                             (kb & CELL_PAD_CTRL_DOWN) ? 255 : 128);
+    }
+    if (kb & CELL_PAD_CTRL_L2) hs->trigger_l2 = 255;
+    if (kb & CELL_PAD_CTRL_R2) hs->trigger_r2 = 255;
+    if (kb & CELL_PAD_CTRL_CROSS)    hs->press_cross    = 255;
+    if (kb & CELL_PAD_CTRL_CIRCLE)   hs->press_circle   = 255;
+    if (kb & CELL_PAD_CTRL_SQUARE)   hs->press_square   = 255;
+    if (kb & CELL_PAD_CTRL_TRIANGLE) hs->press_triangle = 255;
+    if (kb & CELL_PAD_CTRL_L1)       hs->press_l1       = 255;
+    if (kb & CELL_PAD_CTRL_R1)       hs->press_r1       = 255;
+    if (kb & CELL_PAD_CTRL_UP)       hs->press_up       = 255;
+    if (kb & CELL_PAD_CTRL_DOWN)     hs->press_down     = 255;
+    if (kb & CELL_PAD_CTRL_LEFT)     hs->press_left     = 255;
+    if (kb & CELL_PAD_CTRL_RIGHT)    hs->press_right    = 255;
 
     { static int said = 0;
-      if (!said && btns) { said = 1;
-          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
+      if (!said && kb) { said = 1;
+          printf("[cellPad] keyboard OR-in active on port 0 (Enter=START Z=CROSS)\n");
           fflush(stdout); } }
 }
 #endif
@@ -440,8 +456,52 @@ static void pad_poll_backend(void)
     pad_poll_sdl2();
 #endif
 #ifdef _WIN32
-    if (!s_host_state[0].connected) pad_poll_keyboard();
+    /* Always sample keyboard on focus: OR into port 0. An idle XInput
+     * device used to set connected=1 and skip the keyboard entirely. */
+    pad_poll_keyboard();
 #endif
+    /* PAD_FILE: OR held mask into port 0 once per host poll (fresh report). */
+    {
+        static int s_pf = -1; static char pf_path[512];
+        static unsigned held_mask = 0; static int held_n = 0;
+        if (s_pf < 0) {
+            const char* e = getenv("PAD_FILE");
+            s_pf = (e && *e) ? 1 : 0;
+            if (s_pf) {
+                strncpy(pf_path, e, sizeof pf_path - 1);
+                pf_path[sizeof pf_path - 1] = 0;
+            }
+        }
+        if (s_pf) {
+            if (held_n <= 0) {
+                FILE* f = fopen(pf_path, "rb");
+                if (f) {
+                    char buf[64]; buf[0] = 0;
+                    if (fgets(buf, sizeof buf, f)) {
+                        unsigned m = (unsigned)strtoul(buf, 0, 0);
+                        if (m) {
+                            held_mask = m; held_n = 40;
+                            printf("[cellPad] PAD_FILE press 0x%04X\n", m);
+                            fflush(stdout);
+                            fprintf(stderr, "[cellPad] PAD_FILE press 0x%04X\n", m);
+                            fflush(stderr);
+                        }
+                    }
+                    fclose(f);
+                    if (held_n > 0) {
+                        FILE* w = fopen(pf_path, "wb");
+                        if (w) fclose(w);
+                    }
+                }
+            }
+            if (held_n > 0) {
+                held_n--;
+                s_host_state[0].buttons =
+                    (u16)(s_host_state[0].buttons | (u16)held_mask);
+                s_host_state[0].connected = 1;
+            }
+        }
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -650,39 +710,9 @@ skip_inject: ;
           }
       } }
 
-    /* PAD_FILE=<path> -- closed-loop input. Each poll, if the file holds a
-     * button mask (same encoding as PAD_SCRIPT), press it for a fixed number
-     * of polls and empty the file. A driver outside the process can then look
-     * at the log or a frame dump, decide which screen the title is on, and
-     * write the next button -- which a fixed time schedule cannot do, because
-     * a menu system with several screens wanders when driven blind.
-     *
-     *   echo 0x0008 > pad.txt    # START
-     *   echo 0x4000 > pad.txt    # CROSS
-     */
-    { static int s_pf = -1; static char pf_path[512];
-      static unsigned held_mask = 0; static int held_n = 0;
-      if (s_pf < 0) { const char* e = getenv("PAD_FILE");
-                      s_pf = (e && *e) ? 1 : 0;
-                      if (s_pf) { strncpy(pf_path, e, sizeof pf_path - 1); pf_path[sizeof pf_path - 1] = 0; } }
-      if (s_pf && port_no == 0) {
-          if (held_n <= 0) {
-              FILE* f = fopen(pf_path, "rb");
-              if (f) {
-                  char buf[64]; buf[0] = 0;
-                  if (fgets(buf, sizeof buf, f)) {
-                      unsigned m = (unsigned)strtoul(buf, 0, 0);
-                      if (m) { held_mask = m; held_n = 40;
-                               printf("[cellPad] PAD_FILE press 0x%04X\n", m); fflush(stdout); }
-                  }
-                  fclose(f);
-                  if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
-              }
-          }
-          if (held_n > 0) { held_n--;
-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
-              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
-      } }
+    /* PAD_FILE is applied in pad_poll_backend so each fresh host report
+     * already carries the held mask in hs->buttons (and emit len stays
+     * coherent). See pad_poll_backend. */
 
     /* Analog sticks */
     /* PAD_STICK="lx,ly,rx,ry" (0-255, 128 = centred): hold the analog sticks at
