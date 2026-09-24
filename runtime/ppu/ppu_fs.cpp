@@ -952,29 +952,11 @@ static void cellFsStat(ppu_context* ctx)
         fflush(stderr);
     }
     if (stat(hpath, &st) != 0) {
-        /* ACIT leave-FE (004C5558 @ 004C55FC): after vt+0x14 confirm, requires
-         * cellFsStat("<usrdir>/packed")==0. Disc boots set usrdir to
-         * /dev_hdd0/game/<id>/USRDIR even when content lives on /dev_bdvd.
-         * Seed the hdd0 packed directory when the bdvd copy exists so the
-         * gate observes a real dir without planting guest state or faking
-         * file contents (FIOS still ENOENT-falls-back to bdvd for members). */
-        const char* usr_packed = strstr(gpath, "/USRDIR/packed");
-        if (usr_packed && usr_packed[14] == '\0' &&
-            strncmp(gpath, "/dev_hdd0/", 10) == 0) {
-            char bdvd_guest[1024], bdvd_host[1100];
-            snprintf(bdvd_guest, sizeof bdvd_guest, "/dev_bdvd/PS3_GAME/USRDIR/packed");
-            host_path(bdvd_host, sizeof bdvd_host, bdvd_guest);
-            struct stat bst;
-            if (stat(bdvd_host, &bst) == 0 && (bst.st_mode & S_IFDIR)) {
-                if (host_mkdir_p(hpath) == 0 && stat(hpath, &st) == 0) {
-                    fprintf(stderr,
-                            "[leave-fe] seeded hdd0 packed dir '%s' (bdvd present)\n",
-                            hpath);
-                    fflush(stderr);
-                    goto stat_ok;
-                }
-            }
-        }
+        /* Leave-FE note: do NOT invent an hdd0 USRDIR/packed dir or Stat-OK
+         * overlay here. C5558 treats packed-present + savedata-missing as
+         * inconsistent install and returns 1 → 004C3B48(1) → msg 0xEE
+         * ("Game data has become corrupted"). Real leave needs C5558==0 so
+         * 004C8898 falls through 004C8D70 → 004C3B48(0) → 00937A90(0x8CB). */
         if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
         note_stat(gpath, (int32_t)CELL_FS_ENOENT);
         if (leave_stat) {
@@ -984,7 +966,6 @@ static void cellFsStat(ppu_context* ctx)
         }
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
-stat_ok:
     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
     note_stat(gpath, CELL_OK);
     if (leave_stat) {
