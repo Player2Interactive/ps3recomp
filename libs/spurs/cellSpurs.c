@@ -3350,10 +3350,12 @@ static int iwl_inflate(const uint8_t* src, uint32_t slen,
  * forever. Execute the DMA/inflate on the host and Set the flag the SPU
  * would have Set when ctr decrements through 1. Do not enqueue — that would
  * double-complete if image-1 later wakes. */
-/* Windowed FIOS IWL: guest asks for uncomp=0x2000 from a ~64 KiB PSARC
- * zlib block. Serve successive slices from a host-side full inflate so
- * identical PushBody retries (gfxfont type-2 open) advance instead of
- * re-supplying bytes at offset 0 forever. */
+/* Windowed FIOS IWL: guest asks for uncomp=0x2000 from a PSARC zlib
+ * member. Cache the full inflate (grow past 64 KiB) and serve successive
+ * slices. Type-2 (FWS) streams forward; type-3 (GFX) Seeks(0) after the
+ * magic peek — arm a one-shot rewind on a GFX@0 serve so the next window
+ * of that src restarts at offset 0 (leavefe27: mid-file bytes were parsed
+ * as a GFX length → runaway memcpy at 0068C9F0). */
 static struct {
     uint32_t src;
     uint32_t packed;
@@ -3372,34 +3374,88 @@ static void iwl_window_reset(void)
     g_iwl_window.off = 0;
 }
 
+/* Grow until puff completes (rc==0). rc==1 = need a bigger dest. */
+static int iwl_inflate_member(const uint8_t* src, uint32_t slen,
+                              uint8_t** out, uint32_t* out_len)
+{
+    uint32_t cap = 0x10000u;
+    while (cap <= 0x400000u) {
+        uint8_t* tmp = (uint8_t*)malloc(cap);
+        const uint8_t* in = src;
+        uint32_t inlen = slen;
+        unsigned long destlen, sourcelen;
+        int rc;
+        if (!tmp)
+            return 0;
+        if (inlen >= 2 && in[0] == 0x78 &&
+            ((uint32_t)in[0] * 256u + in[1]) % 31u == 0) {
+            uint8_t flg = in[1];
+            in += 2;
+            inlen -= 2;
+            if (flg & 0x20) {
+                if (inlen < 4) { free(tmp); return 0; }
+                in += 4;
+                inlen -= 4;
+            }
+        }
+        destlen = cap;
+        sourcelen = inlen;
+        rc = puff(tmp, &destlen, in, &sourcelen);
+        if (rc == 0) {
+            *out = tmp;
+            *out_len = (uint32_t)destlen;
+            return 1;
+        }
+        if (rc == 1) {
+            free(tmp);
+            cap <<= 1;
+            continue;
+        }
+        /* Raw deflate retry (no zlib header). */
+        destlen = cap;
+        sourcelen = slen;
+        rc = puff(tmp, &destlen, src, &sourcelen);
+        if (rc == 0) {
+            *out = tmp;
+            *out_len = (uint32_t)destlen;
+            return 1;
+        }
+        if (rc == 1) {
+            free(tmp);
+            cap <<= 1;
+            continue;
+        }
+        free(tmp);
+        return 0;
+    }
+    return 0;
+}
+
+/* FIOS fh magic 'FIOS'/'fh  '; +0x44 = file position, +0x4C = size,
+ * +0x10 = media base. At IWL fill time pos equals the window base. */
+/* Type-3 (GFX) open Seeks to 0 after the magic peek and re-reads the
+ * member from the start. Type-2 (FWS) keeps streaming. Remember a GFX
+ * header serve so the next window of the same src rewinds once. */
+static uint32_t g_iwl_gfx_rewind_src;
+
 static int iwl_window_serve(const uint8_t* in, uint32_t dma_sz,
                             uint32_t dma_src, uint8_t* dst, uint32_t dest_sz,
                             uint32_t* got)
 {
+    uint32_t use_off;
+    uint32_t n;
+    uint32_t dst0;
+
     if (dest_sz == 0 || dest_sz >= 0x10000u || dma_sz == dest_sz)
         return 0;
 
-    if (g_iwl_window.data &&
-        g_iwl_window.src == dma_src &&
-        g_iwl_window.packed == dma_sz &&
-        g_iwl_window.off < g_iwl_window.len) {
-        uint32_t n = g_iwl_window.len - g_iwl_window.off;
-        if (n > dest_sz) n = dest_sz;
-        memcpy(dst, g_iwl_window.data + g_iwl_window.off, n);
-        if (n < dest_sz)
-            memset(dst + n, 0, dest_sz - n);
-        g_iwl_window.off += n;
-        if (got) *got = n;
-        return 1;
-    }
-
-    {
-        uint32_t full = 0x10000u;
-        uint8_t* tmp = (uint8_t*)malloc(full);
+    if (!(g_iwl_window.data &&
+          g_iwl_window.src == dma_src &&
+          g_iwl_window.packed == dma_sz)) {
+        uint8_t* tmp = NULL;
         uint32_t got_full = 0;
-        if (!tmp)
-            return 0;
-        if (!iwl_inflate(in, dma_sz, tmp, full, &got_full) || got_full < dest_sz) {
+        if (!iwl_inflate_member(in, dma_sz, &tmp, &got_full) ||
+            got_full < dest_sz) {
             free(tmp);
             return 0;
         }
@@ -3409,11 +3465,44 @@ static int iwl_window_serve(const uint8_t* in, uint32_t dma_sz,
         g_iwl_window.src = dma_src;
         g_iwl_window.packed = dma_sz;
         g_iwl_window.off = 0;
-        memcpy(dst, tmp, dest_sz);
-        g_iwl_window.off = dest_sz;
-        if (got) *got = dest_sz;
-        return 1;
     }
+
+    use_off = g_iwl_window.off;
+    {
+        int did_rewind = 0;
+        if (g_iwl_gfx_rewind_src == dma_src && use_off > 0u) {
+            use_off = 0;
+            g_iwl_gfx_rewind_src = 0;
+            did_rewind = 1;
+        }
+
+        if (use_off >= g_iwl_window.len)
+            return 0;
+
+        n = g_iwl_window.len - use_off;
+        if (n > dest_sz)
+            n = dest_sz;
+        memcpy(dst, g_iwl_window.data + use_off, n);
+        if (n < dest_sz)
+            memset(dst + n, 0, dest_sz - n);
+        g_iwl_window.off = use_off + n;
+        dst0 = ((uint32_t)dst[0] << 24) | ((uint32_t)dst[1] << 16) |
+               ((uint32_t)dst[2] << 8) | (uint32_t)dst[3];
+        /* Magic peek served GFX at offset 0 — next PushBody for this src is
+         * the type-3 reload after Seek(0). FWS (type-2) must keep advancing.
+         * Do not re-arm after the rewind serve itself. */
+        if (!did_rewind && use_off == 0u && n >= 4u && dst0 == 0x47465808u)
+            g_iwl_gfx_rewind_src = dma_src;
+    }
+    if (got)
+        *got = n;
+    { static int _wn = 0;
+      if (_wn++ < 80)
+        fprintf(stderr, "[iwl-win] #%d src=0x%08X use=0x%X n=0x%X "
+                        "len=0x%X dst0=0x%08X gfxrw=0x%08X\n",
+                _wn, dma_src, use_off, n, g_iwl_window.len, dst0,
+                g_iwl_gfx_rewind_src); }
+    return 1;
 }
 
 static int iwl_host_execute(uint32_t cmd_ea)
