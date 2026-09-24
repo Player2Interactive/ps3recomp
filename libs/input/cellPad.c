@@ -460,7 +460,9 @@ static void pad_poll_backend(void)
      * device used to set connected=1 and skip the keyboard entirely. */
     pad_poll_keyboard();
 #endif
-    /* PAD_FILE: OR held mask into port 0 once per host poll (fresh report). */
+    /* PAD_FILE: OR held mask into port 0 once per host poll (fresh report).
+     * Accepts a CELL_PAD_CTRL_* hex/dec mask OR a button name (START, CROSS,
+     * …). Workbench scripts write names; strtoul-only left those as no-ops. */
     {
         static int s_pf = -1; static char pf_path[512];
         static unsigned held_mask = 0; static int held_n = 0;
@@ -478,7 +480,52 @@ static void pad_poll_backend(void)
                 if (f) {
                     char buf[64]; buf[0] = 0;
                     if (fgets(buf, sizeof buf, f)) {
-                        unsigned m = (unsigned)strtoul(buf, 0, 0);
+                        char* p = buf;
+                        while (*p == ' ' || *p == '\t') p++;
+                        for (char* q = p; *q; q++) {
+                            if (*q == '\r' || *q == '\n') { *q = 0; break; }
+                        }
+                        unsigned m = 0;
+                        if (*p) {
+                            char* end = 0;
+                            m = (unsigned)strtoul(p, &end, 0);
+                            if (end == p || (end && *end)) {
+                                /* Non-numeric (or trailing junk): button name. */
+                                static const struct { const char* n; unsigned m; } names[] = {
+                                    { "SELECT",   CELL_PAD_CTRL_SELECT },
+                                    { "L3",       CELL_PAD_CTRL_L3 },
+                                    { "R3",       CELL_PAD_CTRL_R3 },
+                                    { "START",    CELL_PAD_CTRL_START },
+                                    { "UP",       CELL_PAD_CTRL_UP },
+                                    { "RIGHT",    CELL_PAD_CTRL_RIGHT },
+                                    { "DOWN",     CELL_PAD_CTRL_DOWN },
+                                    { "LEFT",     CELL_PAD_CTRL_LEFT },
+                                    { "L2",       CELL_PAD_CTRL_L2 },
+                                    { "R2",       CELL_PAD_CTRL_R2 },
+                                    { "L1",       CELL_PAD_CTRL_L1 },
+                                    { "R1",       CELL_PAD_CTRL_R1 },
+                                    { "TRIANGLE", CELL_PAD_CTRL_TRIANGLE },
+                                    { "CIRCLE",   CELL_PAD_CTRL_CIRCLE },
+                                    { "CROSS",    CELL_PAD_CTRL_CROSS },
+                                    { "SQUARE",   CELL_PAD_CTRL_SQUARE },
+                                    { "X",        CELL_PAD_CTRL_CROSS },
+                                };
+                                m = 0;
+                                for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) {
+                                    const char* a = p;
+                                    const char* b = names[i].n;
+                                    int ok = 1;
+                                    while (*a && *b) {
+                                        char ca = *a, cb = *b;
+                                        if (ca >= 'a' && ca <= 'z') ca = (char)(ca - 32);
+                                        if (cb >= 'a' && cb <= 'z') cb = (char)(cb - 32);
+                                        if (ca != cb) { ok = 0; break; }
+                                        a++; b++;
+                                    }
+                                    if (ok && !*a && !*b) { m = names[i].m; break; }
+                                }
+                            }
+                        }
                         if (m) {
                             held_mask = m; held_n = 40;
                             printf("[cellPad] PAD_FILE press 0x%04X\n", m);
@@ -499,6 +546,19 @@ static void pad_poll_backend(void)
                 s_host_state[0].buttons =
                     (u16)(s_host_state[0].buttons | (u16)held_mask);
                 s_host_state[0].connected = 1;
+                /* Mirror XInput/keyboard: face/dpad pressure for remappers. */
+                if (held_mask & CELL_PAD_CTRL_CROSS)    s_host_state[0].press_cross = 255;
+                if (held_mask & CELL_PAD_CTRL_CIRCLE)   s_host_state[0].press_circle = 255;
+                if (held_mask & CELL_PAD_CTRL_SQUARE)   s_host_state[0].press_square = 255;
+                if (held_mask & CELL_PAD_CTRL_TRIANGLE) s_host_state[0].press_triangle = 255;
+                if (held_mask & CELL_PAD_CTRL_UP)       s_host_state[0].press_up = 255;
+                if (held_mask & CELL_PAD_CTRL_DOWN)     s_host_state[0].press_down = 255;
+                if (held_mask & CELL_PAD_CTRL_LEFT)     s_host_state[0].press_left = 255;
+                if (held_mask & CELL_PAD_CTRL_RIGHT)    s_host_state[0].press_right = 255;
+                if (held_mask & CELL_PAD_CTRL_L1)       s_host_state[0].press_l1 = 255;
+                if (held_mask & CELL_PAD_CTRL_R1)       s_host_state[0].press_r1 = 255;
+                if (held_mask & CELL_PAD_CTRL_L2)       s_host_state[0].trigger_l2 = 255;
+                if (held_mask & CELL_PAD_CTRL_R2)       s_host_state[0].trigger_r2 = 255;
             }
         }
     }
