@@ -75,12 +75,29 @@ typedef struct {
     u8   press_r1;
 } PadHostState;
 
+/* Idle report: no buttons, centred sticks, zero pressure. Every poll starts
+ * a port here when no host controller owns it; the keyboard and PAD_FILE
+ * layers then OR their current state in. Before this, a disconnected slot
+ * kept its previous report, so a bit ORed in once (Cross from PAD_FILE or
+ * Enter) stayed set forever: the guest remapper saw the button held, never
+ * a release, and later presses produced no rising edge. */
+static void pad_host_state_idle(PadHostState* hs)
+{
+    int was = hs->connected;
+    memset(hs, 0, sizeof *hs);
+    hs->connected = was;
+    hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
+}
+
 static int           s_pad_initialized = 0;
 static u32           s_max_connect = 0;
 static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
+/* Port-0 reports actually handed to the guest; PAD_FILE holds a press until
+ * the guest has read it, not just until host time has passed. */
+static unsigned s_pf_reads = 0;
 
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
@@ -145,17 +162,10 @@ static void pad_poll_keyboard(void)
     if (off) return;
 
     PadHostState* hs = &s_host_state[0];
-    if (!pad_host_window_focused()) {
-        /* XInput already wrote this tick. If nothing is connected, clear
-         * leftover keyboard bits so a released Enter does not stick. */
-        if (!hs->connected) {
-            hs->buttons = 0;
-            hs->analog_lx = hs->analog_ly = 128;
-            hs->analog_rx = hs->analog_ry = 128;
-            hs->trigger_l2 = hs->trigger_r2 = 0;
-        }
-        return;
-    }
+    /* The backend already rebuilt this port for the tick (fresh XInput
+     * report, or the idle report when nothing is plugged in), so a key
+     * that is no longer down simply is not ORed back in. */
+    if (!pad_host_window_focused()) return;
 
     static const struct { int vk; u16 btn; } map[] = {
         { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
@@ -213,6 +223,7 @@ static void pad_poll_xinput(void)
         DWORD result = XInputGetState((DWORD)i, &state);
         if (result != ERROR_SUCCESS) {
             s_host_state[i].connected = 0;
+            pad_host_state_idle(&s_host_state[i]);
             continue;
         }
 
@@ -318,6 +329,7 @@ static void pad_poll_sdl2(void)
         SDL_GameController* gc = s_sdl_controllers[i];
         if (!gc || !SDL_GameControllerGetAttached(gc)) {
             s_host_state[i].connected = 0;
+            pad_host_state_idle(&s_host_state[i]);
             if (gc) {
                 SDL_GameControllerClose(gc);
                 s_sdl_controllers[i] = NULL;
@@ -454,6 +466,9 @@ static void pad_poll_backend(void)
     pad_poll_xinput();
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
+#else
+    for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++)
+        pad_host_state_idle(&s_host_state[_i]);
 #endif
 #ifdef _WIN32
     /* Always sample keyboard on focus: OR into port 0. An idle XInput
@@ -462,10 +477,17 @@ static void pad_poll_backend(void)
 #endif
     /* PAD_FILE: OR held mask into port 0 once per host poll (fresh report).
      * Accepts a CELL_PAD_CTRL_* hex/dec mask OR a button name (START, CROSS,
-     * …). Workbench scripts write names; strtoul-only left those as no-ops. */
+     * …). Workbench scripts write names; strtoul-only left those as no-ops.
+     *
+     * A press is a timed pulse: held for PAD_FILE_HOLD_MS of host time, then
+     * the file is not re-read for PAD_FILE_GAP_MS so the guest sees a real
+     * release between two writes of the same button. Counting guest polls
+     * instead made the hold span seconds at workbench frame rates. */
     {
+        enum { PAD_FILE_HOLD_MS = 120, PAD_FILE_GAP_MS = 160 };
         static int s_pf = -1; static char pf_path[512];
-        static unsigned held_mask = 0; static int held_n = 0;
+        static unsigned held_mask = 0, reads_at_press = 0;
+        static unsigned long long held_until = 0, idle_until = 0;
         if (s_pf < 0) {
             const char* e = getenv("PAD_FILE");
             s_pf = (e && *e) ? 1 : 0;
@@ -475,7 +497,14 @@ static void pad_poll_backend(void)
             }
         }
         if (s_pf) {
-            if (held_n <= 0) {
+            /* Held while the hold time runs OR until the guest has consumed
+             * at least two reports carrying it (a slow frame must not swallow
+             * the pulse). Release then lasts at least PAD_FILE_GAP_MS. */
+            int held_n = held_mask &&
+                         (now < held_until || s_pf_reads - reads_at_press < 2u);
+            if (held_n && now >= held_until) idle_until = now + PAD_FILE_GAP_MS;
+            if (!held_n) held_mask = 0;
+            if (!held_n && now >= idle_until) {
                 FILE* f = fopen(pf_path, "rb");
                 if (f) {
                     char buf[64]; buf[0] = 0;
@@ -542,10 +571,13 @@ static void pad_poll_backend(void)
                             }
                         }
                         if (m) {
-                            held_mask = m; held_n = 40;
-                            printf("[cellPad] PAD_FILE press 0x%04X\n", m);
+                            held_mask = m; held_n = 1;
+                            reads_at_press = s_pf_reads;
+                            held_until = now + PAD_FILE_HOLD_MS;
+                            idle_until = held_until + PAD_FILE_GAP_MS;
+                            printf("[cellPad] PAD_FILE press 0x%04X ('%s')\n", m, p);
                             fflush(stdout);
-                            fprintf(stderr, "[cellPad] PAD_FILE press 0x%04X\n", m);
+                            fprintf(stderr, "[cellPad] PAD_FILE press 0x%04X ('%s')\n", m, p);
                             fflush(stderr);
                         }
                     }
@@ -557,7 +589,6 @@ static void pad_poll_backend(void)
                 }
             }
             if (held_n > 0) {
-                held_n--;
                 s_host_state[0].buttons =
                     (u16)(s_host_state[0].buttons | (u16)held_mask);
                 s_host_state[0].connected = 1;
@@ -894,7 +925,10 @@ emit:
         if (always < 0) always = getenv("PAD_ALWAYS_CHANGE") ? 1 : 0;
         if (!always && port_no < PAD_MAX_HOST_PORTS && data->len) {
             if (!s_data_fresh[port_no]) data->len = 0;   /* nothing new: end the drain */
-            else                        s_data_fresh[port_no] = 0;
+            else {
+                s_data_fresh[port_no] = 0;
+                if (port_no == 0) s_pf_reads++;          /* a report the guest saw */
+            }
         }
     }
     {
