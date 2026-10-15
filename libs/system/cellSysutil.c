@@ -186,9 +186,11 @@ s32 cellSysutilRegisterCallback(s32 slot, CellSysutilCallback func, void* userda
     return CELL_OK;
 }
 
+extern unsigned int ppu_active_lr(void);
+
 s32 cellSysutilUnregisterCallback(s32 slot)
 {
-    printf("[cellSysutil] UnregisterCallback(slot=%d)\n", slot);
+    printf("[cellSysutil] UnregisterCallback(slot=%d) lr=0x%08X\n", slot, ppu_active_lr());
 
     if (slot < 0 || slot >= CELL_SYSUTIL_MAX_CALLBACKS)
         return CELL_SYSUTIL_ERROR_NUM;

@@ -156,9 +156,13 @@ s32 cellMsgDialogClose(float delayMs)
     return CELL_OK;
 }
 
+extern unsigned int ppu_active_lr(void);
+
 s32 cellMsgDialogAbort(void)
 {
-    printf("[cellMsgDialog] Abort()\n");
+    /* Titles call this on their way out of the game; the caller LR names
+     * the exit path (diagnostic only). */
+    printf("[cellMsgDialog] Abort() lr=0x%08X\n", ppu_active_lr());
 
     if (!s_dialog_open) {
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
