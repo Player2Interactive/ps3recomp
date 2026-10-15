@@ -955,8 +955,9 @@ static void cellFsStat(ppu_context* ctx)
         /* Leave-FE note: do NOT invent an hdd0 USRDIR/packed dir or Stat-OK
          * overlay here. C5558 treats packed-present + savedata-missing as
          * inconsistent install and returns 1 → 004C3B48(1) → msg 0xEE
-         * ("Game data has become corrupted"). Real leave needs C5558==0 so
-         * 004C8898 falls through 004C8D70 → 004C3B48(0) → 00937A90(0x8CB). */
+         * ("Game data has become corrupted"). C5558==0 + ample free takes
+         * 004C8E4C → C38F0(3) → Scaleform "install"; free < FMV budget
+         * takes 004C3B48(0) → 00937A90(0x8CB) NOSPACE dialog — not planet load. */
         if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
         note_stat(gpath, (int32_t)CELL_FS_ENOENT);
         if (leave_stat) {

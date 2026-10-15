@@ -489,7 +489,20 @@ static void pad_poll_backend(void)
                         if (*p) {
                             char* end = 0;
                             m = (unsigned)strtoul(p, &end, 0);
-                            if (end == p || (end && *end)) {
+                            /* Bare decimal Flash Key codes are NOT CELL_PAD
+                             * masks. Workbench docs say "key 13" = Return =
+                             * CROSS; strtoul("13") was injecting 0x000D
+                             * (SELECT|R3|START) so remapped +0x50 never got
+                             * Return bit 0x4 and 68D1A0 never HandleEvent'd. */
+                            if (end != p && (!end || !*end)) {
+                                if (m == 13u) /* Key.ENTER / Return */
+                                    m = CELL_PAD_CTRL_CROSS;
+                                else if (m == 8u) /* Key.BACKSPACE */
+                                    m = CELL_PAD_CTRL_CIRCLE;
+                                else if (m == 36u) /* docs: START */
+                                    m = CELL_PAD_CTRL_START;
+                                /* else keep as raw CELL_PAD mask (0x40, 0x4000, …) */
+                            } else if (end == p || (end && *end)) {
                                 /* Non-numeric (or trailing junk): button name. */
                                 static const struct { const char* n; unsigned m; } names[] = {
                                     { "SELECT",   CELL_PAD_CTRL_SELECT },
@@ -509,6 +522,8 @@ static void pad_poll_backend(void)
                                     { "CROSS",    CELL_PAD_CTRL_CROSS },
                                     { "SQUARE",   CELL_PAD_CTRL_SQUARE },
                                     { "X",        CELL_PAD_CTRL_CROSS },
+                                    { "RETURN",   CELL_PAD_CTRL_CROSS },
+                                    { "ENTER",    CELL_PAD_CTRL_CROSS },
                                 };
                                 m = 0;
                                 for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) {

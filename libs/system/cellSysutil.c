@@ -270,6 +270,7 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
         v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
+        printf("[cellSysutil] GetSystemParamInt(ENTER_BUTTON_ASSIGN) -> CROSS (1)\n");
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:    v = 0; break; /* YYYYMMDD */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:    v = 0; break; /* 24-hour */
