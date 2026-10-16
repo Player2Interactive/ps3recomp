@@ -10,6 +10,7 @@
  */
 
 #include "cellSaveData.h"
+#include "cellSysutil.h"
 #include "ps3emu/guest_call.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../runtime/memory/vm.h"
@@ -965,6 +966,26 @@ static s32 savedata_execute(const char* dirName, int is_save,
             printf("[cellSaveData] post mgr vt=0x%08X +D8=%u +E4=0x%04X +EC=%d\n",
                    vm_read32(mgr), (unsigned)vm_read16(mgr + 0xD8),
                    (unsigned)vm_read16(mgr + 0xE4), (s32)vm_read32(mgr + 0xEC));
+    }
+    /* Retail ListSave2/Load2 block in the XMB dialog. ACIT 004C6F6C only
+     * invokes GFx ReturnFromSave while save-mgr type != idle (this thread is
+     * still inside the HLE). Instant return races the FE tick so New Game
+     * never FSCommand StartGame. Sleep on this PPU host thread so main can
+     * tick; DRAWING_* matches RPCS3's save dialog sysutil events. */
+    {
+        int slot, i;
+        for (slot = 0; slot < CELL_SYSUTIL_MAX_CALLBACKS; ++slot)
+            cellSysutilQueueEvent(slot, CELL_SYSUTIL_DRAWING_BEGIN, 0);
+        printf("[cellSaveData] holding XMB dialog so FE can observe type!=idle\n");
+        for (i = 0; i < 8; ++i) {
+#ifdef _WIN32
+            Sleep(16);
+#else
+            usleep(16000);
+#endif
+        }
+        for (slot = 0; slot < CELL_SYSUTIL_MAX_CALLBACKS; ++slot)
+            cellSysutilQueueEvent(slot, CELL_SYSUTIL_DRAWING_END, 0);
     }
     return CELL_OK;
 }
