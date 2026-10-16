@@ -153,6 +153,12 @@ int main(void)
         rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
         check("tex_sample", hlsl, "rsx_tex[3].Sample(rsx_samp[3]");
         check("tex_coord",  hlsl, "input.tc0");
+        { int ts = rsx_fp_apply_runtime_texscale(hlsl, sizeof hlsl);
+          check_true("texscale_patched", ts == 1);
+          check("texscale_mul", hlsl, " * rsx_texscale[3].xy");
+          check("texscale_cb", hlsl, "float4 rsx_texscale[4];");
+          check_absent("texscale_no_double", hlsl,
+                       "rsx_texscale[3].xy * rsx_texscale"); }
     }
 
     /* Test 5: negate + abs on a source (MOV r0, -|r1|). */

@@ -303,6 +303,7 @@ typedef struct {
     int                   vp_ready;             /* VS+PSO compiled ok            */
     u32                   vp_compiled_bytes;    /* ucode size when last compiled */
     ID3DBlob*             vp_vs_blob;           /* kept for guest-FP PSO builds  */
+    ID3DBlob*             ice_blit_vs;          /* 2S window-pixel FMV blit VS   */
     u32                   vp_gen;               /* bumped per VP recompile       */
     int                   vp_uses_c03;          /* VS references vp_c[0..3]      */
     VPTexSlot             vp_tex[VP_TEX_SLOTS]; /* per-frame VP texture slots    */
@@ -1306,6 +1307,7 @@ static void move_to_next_frame(void)
 /* Name prefix for the next readback dump: lets the same writer emit the
  * backbuffer and the screen-copy texture under different filenames. */
 static const char* s_dump_name = NULL;
+static char s_dump_dir_buf[260];
 
 static void dump_backbuffer_bmp(void)
 {
@@ -1317,9 +1319,10 @@ static void dump_backbuffer_bmp(void)
 
     static int idx = 0;
     char path[512];
-    const char* dir = getenv("CELLMARK_DUMP_DIR");   /* default: current dir */
+    const char* dir = getenv("CELLMARK_DUMP_DIR");
+    if (!dir || !dir[0]) dir = s_dump_dir_buf[0] ? s_dump_dir_buf : NULL;
     snprintf(path, sizeof(path), "%s%s%s_%03d.bmp",
-             dir ? dir : "", dir ? "/" : "", s_dump_name ? s_dump_name : "frame", idx++);
+             dir ? dir : "", dir ? "\\" : "", s_dump_name ? s_dump_name : "frame", idx++);
     FILE* f = fopen(path, "wb");
     if (f) {
         u32 w = s_d3d.width, h = s_d3d.height;
@@ -1350,7 +1353,21 @@ static void dump_backbuffer_bmp(void)
             free(row);
         }
         fclose(f);
-        printf("[D3D12] dumped %s (%ux%u)\n", path, s_d3d.width, s_d3d.height);
+        { u32 nz = 0, n = 0, sum = 0, mn = 255, mx = 0, x, y;
+          for (y = 0; y < h; y += 8) {
+              const u8* src = (const u8*)mapped + (u64)y * s_d3d.readback_pitch;
+              for (x = 0; x < w; x += 8) {
+                  u32 L = ((u32)src[x*4+0] * 54u + (u32)src[x*4+1] * 183u
+                           + (u32)src[x*4+2] * 19u) >> 8;
+                  n++; sum += L;
+                  if (L < mn) mn = L; if (L > mx) mx = L;
+                  if (src[x*4+0] | src[x*4+1] | src[x*4+2]) nz++;
+              }
+          }
+          fprintf(stderr, "[D3D12] dumped %s (%ux%u) nz=%u/%u luma %u..%u mean=%u%c",
+                  path, w, h, nz, n, mn, mx, n ? sum / n : 0, 10);
+          printf("[D3D12] dumped %s (%ux%u) nz=%u/%u luma %u..%u mean=%u\n",
+                 path, w, h, nz, n, mn, mx, n ? sum / n : 0); }
     }
     D3D12_RANGE wr = {0, 0};
     s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf, 0, &wr);
@@ -1982,9 +1999,75 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
     return m;
 }
 
+/* Ice wrap-183 FMV: SET_VERTEX_DATA2S writes window pixels in attrib0 and
+ * matching texel UVs in attrib1. Guest VPs for that blit have been seen
+ * writing o[0].w = -1 (clip-discard) or leaving pixels in clip with the
+ * identity XY epilogue. One VS maps pixels -> NDC using vp_posscale
+ * (filled as 2/w,-2/h,-1,1 for this path) and forwards attrib1 as TEX0. */
+static ID3DBlob* ice_blit_vs_blob(void)
+{
+    if (s_d3d.ice_blit_vs) return s_d3d.ice_blit_vs;
+    static const char hlsl[] =
+        "struct VSInput { float4 a0:ATTR0; float4 a1:ATTR1; float4 a3:ATTR3; };\n"
+        "struct VSOutput {\n"
+        "    float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1;\n"
+        "    float4 fog:FOG;\n"
+        "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
+        "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
+        "};\n"
+        "cbuffer VPConst : register(b0) {\n"
+        "    float4 vp_c[512];\n"
+        "    float4 vp_posscale;\n"
+        "    float4 vp_posoffset;\n"
+        "};\n"
+        "VSOutput main(VSInput input) {\n"
+        "    VSOutput Out;\n"
+        "    float4 _p = float4(input.a0.xy, 0.0, 1.0);\n"
+        "    Out.pos = float4(_p.xyz * vp_posscale.xyz + vp_posoffset.xyz, 1.0);\n"
+        "    Out.col0 = float4(1,1,1,1); Out.col1 = float4(1,1,1,1);\n"
+        "    Out.fog = float4(0,0,0,0);\n"
+        "    Out.t0 = input.a1;\n"
+        /* Ice YUV FP: h0 <- tc1 (desat colour, w=full-chroma lerp);
+         * RGB *= tc2.x; gamma = exp2(tc2.y * log2(c)). Unwritten tc1 is
+         * (0,0,0,1). Attrib 3 is SET_VERTEX_DATA2F (1,1) inside BEGIN_END. */
+        "    Out.t1 = float4(0,0,0,1);\n"
+        "    float2 _g = input.a3.xy; if (_g.x == 0 && _g.y == 0) _g = float2(1,1);\n"
+        "    Out.t2 = float4(_g, 0.0, 1.0);\n"
+        "    Out.t3 = float4(0,0,0,0); Out.t4 = float4(0,0,0,0);\n"
+        "    Out.t5 = float4(0,0,0,0); Out.t6 = float4(0,0,0,0);\n"
+        "    Out.t7 = float4(0,0,0,0);\n"
+        "    return Out;\n"
+        "}\n";
+    ID3DBlob *vb = NULL, *err = NULL;
+    HRESULT hr = D3DCompile(hlsl, sizeof hlsl - 1, "ice_blit_vs", NULL, NULL,
+                            "main", "vs_5_0", 0, 0, &vb, &err);
+    if (FAILED(hr) || !vb) {
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, "[bink-quad] ice blit VS compile FAIL: %s%c",
+                    err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?", 10);
+        }
+        if (err) err->lpVtbl->Release(err);
+        return NULL;
+    }
+    if (err) err->lpVtbl->Release(err);
+    s_d3d.ice_blit_vs = vb;
+    fprintf(stderr, "[bink-quad] ice blit VS ready%c", 10);
+    return vb;
+}
+
+static int dr_ice_fmv_blit(const D3D12DrawRecord* dr)
+{
+    return dr && dr->tex[0].set &&
+           (dr->tex[0].fmt & 0x9Fu) == 0x81u &&
+           dr->tex[0].w == 1280u && dr->tex[0].h == 720u &&
+           dr->tex[0].off >= 0x20000000u && dr->tex[0].off < 0xC0000000u;
+}
+
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
-                                          u32 cube_mask)
+                                          u32 cube_mask, int ice_blit)
 {
     if (nrt < 1) nrt = 1; if (nrt > 4) nrt = 4;
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1992,9 +2075,17 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     extern u32 cellGcmResolveOffset(u32);
     if (!fp_addr || !vm_base) return NULL;
     { static int _off=-1; if(_off<0)_off=getenv("FP_OFF")?1:0; if(_off) return NULL; }
-    /* Resolve the VS: the draw's cached per-VP blob, else the primary. */
+    /* Resolve the VS: the draw's cached per-VP blob, else the primary.
+     * Ice FMV 2S quads use a dedicated window-pixel blit VS (w=1, UV=a1). */
     ID3DBlob* vsb = NULL; u32 vs_hash = 0;
-    if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n) {
+    if (ice_blit) {
+        vsb = ice_blit_vs_blob();
+        if (vsb) {
+            vs_hash = 0x49434543u; /* 'ICEC' */
+            vs_idx = -2;
+        }
+    }
+    if (!vsb && vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n) {
         vsb = s_d3d.vp_vs[vs_idx].vs; vs_hash = s_d3d.vp_vs[vs_idx].hash;
     }
     if (!vsb) { vsb = s_d3d.vp_vs_blob; vs_idx = -1; }
@@ -2086,9 +2177,35 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     /* Signature changed when the newer decompiler was adopted: the third
      * parameter is now SET_SHADER_CONTROL, not an exports-32 flag. This
      * backend does not track that register, so let the decompiler infer it. */
-    (void)exp32;
-    int n = rsx_fp_decompile(vm_base + off, 4096, RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
+    /* Honour SET_SHADER_CONTROL bit 0x40. AUTO treated r0 scratch as the
+     * export, so Ice YUV (colour in h0) presented log2 temporaries. Ice's
+     * control word is 16-bit exports; the method is often never rewritten
+     * from the HLE 32-bit default, so force h0 for that program. */
+    u32 fp_ctrl = exp32 ? 0x40u : 0u;
+    if (fp_addr == 0x01903701u)
+        fp_ctrl = 0;
+    int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
+    /* SET_VERTEX_DATA2S / UNNORM textures address in texels (Ice FMV 0..1280
+     * on a 1280x720 MAIN plane). D3D Sample is 0..1; b1.rsx_texscale is 1/size
+     * for UN units (vp_record_cb) and 1.0 otherwise. */
+    { int ts = rsx_fp_apply_runtime_texscale(hlsl, (u32)sizeof hlsl);
+      static int _tsn = 0;
+      if (ts > 0 && (_tsn++ < 32 || fp_addr == 0x01903701u))
+          fprintf(stderr, "[FP] texscale patched %d Sample sites fp=0x%X%c",
+                  ts, fp_addr, 10);
+      if (fp_addr == 0x01903701u) {
+          const char* t = getenv("TEMP");
+          char path[260];
+          snprintf(path, sizeof path, "%s\\ice_fp.hlsl", t ? t : ".");
+          FILE* f = fopen(path, "w");
+          if (f) {
+              fprintf(f, "/* fp=0x%08X ctrl=0x%X exp32=%d texscale=%d */\n",
+                      fp_addr, fp_ctrl, exp32, ts);
+              fputs(hlsl, f); fclose(f);
+              fprintf(stderr, "[FP] wrote %s (%u bytes, ctrl=0x%X texscale=%d)%c",
+                      path, (unsigned)strlen(hlsl), fp_ctrl, ts, 10); }
+      } }
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
@@ -2375,10 +2492,12 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
     pb->lpVtbl->Release(pb);
     if (FAILED(hr)) {
-        static int _e3=0; if (_e3++<16) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
+        static int _e3=0; if (_e3++<16 || ice_blit)
+            printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX ice=%d)\n", fp_addr, hr, ice_blit);
         return NULL;
     }
-    { static int _ok=0; if (_ok++<32) printf("[FP] guest FP pipeline ready (fp=0x%08X)\n", fp_addr); }
+    { static int _ok=0; if (_ok++<32 || ice_blit)
+          printf("[FP] guest FP pipeline ready (fp=0x%08X ice=%d)\n", fp_addr, ice_blit); }
 
     /* insert (evict oldest when full) */
     if (s_d3d.vp_fp_n >= VP_FP_CACHE) {
@@ -3086,6 +3205,14 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                 sy = 1.0f / (float)dr->tex[_u].h;
             }
             ts[_u*4+0] = sx; ts[_u*4+1] = sy; ts[_u*4+2] = 0.0f; ts[_u*4+3] = 0.0f;
+            { static int _n = 0;
+                  if (dr && dr->tex[_u].set && (dr->tex[_u].fmt & 0x40) &&
+                  dr->tex[_u].w >= 640u && _n++ < 32)
+                  fprintf(stderr,
+                          "[texscale] u=%u %ux%u fmt=0x%02X UN sx=%.6f sy=%.6f "
+                          "raw=0x%08X off=0x%08X%c",
+                          _u, dr->tex[_u].w, dr->tex[_u].h, dr->tex[_u].fmt,
+                          sx, sy, dr->tex[_u].raw, dr->tex[_u].off, 10); }
         }
         /* rsx_alphatest (b1[4]): x=enable, y=ref/255, z=func-0x200. D3D12
          * has no fixed alpha test; guest FPs discard on it dynamically
@@ -3186,6 +3313,30 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
     vpx[4] = vpx[5] = vpx[7] = 0.0f;
     if (vs_[2] != 0.0f) { vpx[2] = vs_[2]; vpx[6] = vo_[2]; }
     else                { vpx[2] = 1.0f;   vpx[6] = 0.0f;   }
+    /* Ice FMV (wrap-183): SET_VERTEX_DATA2S positions are window pixels
+     * (0,0)..(1280,720) and the VP passes them through. Identity XY + a
+     * 640/-360 GCM viewport left those coords in D3D clip, so the quad
+     * clipped to a sliver (present dumps nz~27/14400). Map pixels -> NDC:
+     * x' = 2*x/w - 1, y' = 1 - 2*y/h (RSX origin top-left, D3D Y-up). */
+    if (dr && dr->tex[0].set &&
+        (dr->tex[0].fmt & 0x9Fu) == 0x81u &&
+        dr->tex[0].w == 1280u && dr->tex[0].h == 720u &&
+        dr->tex[0].off >= 0x20000000u && dr->tex[0].off < 0xC0000000u) {
+        float vw = dr->vp_w ? (float)dr->vp_w : 1280.0f;
+        float vh = dr->vp_h ? (float)dr->vp_h : 720.0f;
+        if (vw >= 16.0f && vh >= 16.0f) {
+            vpx[0] =  2.0f / vw;
+            vpx[1] = -2.0f / vh;
+            vpx[4] = -1.0f;
+            vpx[5] =  1.0f;
+            { static unsigned n = 0;
+              if (n++ < 8u)
+                  fprintf(stderr,
+                          "[bink-quad] pixel-ndc scale=%.5f,%.5f off=%.1f,%.1f "
+                          "vp_scale=%.1f,%.1f%c",
+                          vpx[0], vpx[1], vpx[4], vpx[5], vs_[0], vs_[1], 10); }
+        }
+    }
     /* DBG_ZOOM=<k> with DBG_CENTER="cx,cy": a debug camera applied in CLIP space,
      * not a framebuffer crop -- the geometry is re-rasterized at full resolution.
      * The shader epilogue already computes
@@ -4094,6 +4245,23 @@ static void render_frame(void)
         compile_vp();
     /* Per-draw VP constants are snapshotted at record time (vp_record_cb). */
 
+    /* Ice FMV 2S quads: dump the D3D present, not GCM-local scanout. */
+    { extern int g_rsx_ice_present_dump;
+      if (g_rsx_ice_present_dump > 0) {
+          if (s_d3d.dump_frames_left < g_rsx_ice_present_dump)
+              s_d3d.dump_frames_left = g_rsx_ice_present_dump;
+          s_d3d.dump_skip_left = 0;
+          g_rsx_ice_present_dump = 0;
+          if (!s_dump_dir_buf[0] && !(getenv("CELLMARK_DUMP_DIR") &&
+                                      getenv("CELLMARK_DUMP_DIR")[0])) {
+              const char* t = getenv("TEMP");
+              if (!t) t = ".";
+              snprintf(s_dump_dir_buf, sizeof s_dump_dir_buf, "%s\\acit_ice_frames", t);
+              CreateDirectoryA(s_dump_dir_buf, NULL);
+              fprintf(stderr, "[D3D12] Ice present dump -> %s (%d frames)%c",
+                      s_dump_dir_buf, s_d3d.dump_frames_left, 10);
+          }
+      } }
     /* Lazily create the readback buffer the first time a dump is requested. */
     if (s_d3d.dump_frames_left > 0 && !s_d3d.readback_buf) {
         s_d3d.readback_pitch = (s_d3d.width * 4 + 255) & ~255u;
@@ -4441,12 +4609,30 @@ static void render_frame(void)
         for (int _u = 0; _u < 4; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * 4 + (u32)_u;
             dr->tex_rt[_u] = -1;
-            /* Display-sized sampler source -> the rendered frame. */
+            /* Display-sized sampler source -> the rendered frame.
+             * Size-only matching stole Ice FMV: wrap-183 PUTs a 1280x720 MAIN
+             * B8 Y plane (TEXOFF 0x01B4DD00 / 0x01C9F500) and composites it
+             * with a 2S quad. That is not the GCM scanout; pointing the
+             * sampler at s_screen_copy (empty D3D RT / RGBA8) made the intro
+             * sample black. MAIN (IO 0x20xxxxxx, Ice bit 31) keeps the guest
+             * upload. LOCAL RGBA8 display-sized units still take the copy. */
             if (dr->tex[_u].set && s_screen_copy &&
                 dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height) {
                 static int en = -1;
                 if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
-                if (en) {
+                int main_mem = ((dr->tex[_u].raw & 0x80000000u) != 0) ||
+                               (dr->tex[_u].off >= 0x20000000u &&
+                                dr->tex[_u].off <  0xC0000000u);
+                if (en && main_mem) {
+                    { static unsigned n = 0;
+                      extern unsigned g_ovl183_put_n;
+                      if (g_ovl183_put_n && n++ < 16u)
+                          fprintf(stderr,
+                                  "[SCREENTEX] skip-copy unit=%d raw=0x%08X ea=0x%08X "
+                                  "fmt=0x%02X %ux%u (MAIN guest)%c",
+                                  _u, dr->tex[_u].raw, dr->tex[_u].off,
+                                  dr->tex[_u].fmt, dr->tex[_u].w, dr->tex[_u].h, 10); }
+                } else if (en) {
                     { static int _n = 0; if (_n++ < 3)
                         fprintf(stderr, "[SCREENTEX] bound frame copy at unit %d for"
                                         " fp=0x%X (%ux%u)%c", _u, dr->fp_addr,
@@ -4535,7 +4721,8 @@ static void render_frame(void)
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                       dr->fp_exp32, dr->cmask, dr->cull, dr_cube_mask(dr));
+                                       dr->fp_exp32, dr->cmask, dr->cull, dr_cube_mask(dr),
+                                       dr_ice_fmv_blit(dr));
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
@@ -4886,9 +5073,12 @@ static void render_frame(void)
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
                                                 dr->fp_exp32, dr->cmask, dr->cull,
-                                                dr_cube_mask(dr)) : NULL;
+                                                dr_cube_mask(dr),
+                                                dr_ice_fmv_blit(dr)) : NULL;
+                /* Atlas PS discards coverage<=0.5; Ice B8 Y is 16-235 so that
+                 * fallback paints nothing. Skip it for the FMV blit. */
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
-                                                         dpso ? dpso : vpso);
+                    dpso ? dpso : (dr_ice_fmv_blit(dr) ? s_d3d.pipeline_state_vp_color : vpso));
                 /* Per-draw viewport: the guest rect when sane, else the
                  * full target. Scissor tracks the same rect. */
                 {
@@ -6419,6 +6609,37 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
                 dr->cb_slot = s_d3d.draw_count;
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
+                { static unsigned n = 0;
+                  extern unsigned g_ovl183_put_n;
+                  const rsx_state* st = s_d3d.current_rsx_state;
+                  if (g_ovl183_put_n && st &&
+                      st->surface_clip_w == 1280u && st->surface_clip_h == 720u &&
+                      n++ < 16u) {
+                      float a0x = 0.f, a0y = 0.f, a1x = 0.f, a1y = 0.f;
+                      float a3x = 0.f, a3y = 0.f;
+                      float b0x = 0.f, b0y = 0.f, c0x = 0.f, c0y = 0.f;
+                      if (s_d3d.vp_vb_mapped) {
+                          const float* v = (const float*)((const u8*)s_d3d.vp_vb_mapped
+                              + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE
+                              + rec);
+                          a0x = v[0]; a0y = v[1];
+                          a1x = v[4]; a1y = v[5];
+                          b0x = v[64]; b0y = v[65];
+                          c0x = v[128]; c0y = v[129];
+                          a3x = v[12]; a3y = v[13];
+                      }
+                      fprintf(stderr,
+                              "[bink-quad] vs=%d fp=0x%08X verts=%u t0 raw=0x%08X ea=0x%08X "
+                              "fmt=0x%02X %ux%u a0=(%.1f,%.1f) a1=(%.1f,%.1f) a3=(%.1f,%.1f) "
+                              "v1=(%.1f,%.1f) v2=(%.1f,%.1f) "
+                              "vp_scale=(%.1f,%.1f) vp=%ux%u surf=0x%08X%c",
+                              dr->vs_idx, dr->fp_addr, emitted,
+                              dr->tex[0].raw, dr->tex[0].off, dr->tex[0].fmt,
+                              dr->tex[0].w, dr->tex[0].h, a0x, a0y, a1x, a1y, a3x, a3y,
+                              b0x, b0y, c0x, c0y,
+                              st->viewport_scale[0], st->viewport_scale[1],
+                              dr->vp_w, dr->vp_h, st->surface_color_offset[0], 10);
+                  } }
                 s_d3d.draw_count++;
             }
             return;
@@ -6810,6 +7031,30 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].raw = offset;
         s_d3d.cur_texs[unit].w = width; s_d3d.cur_texs[unit].h = height;
         s_d3d.cur_texs[unit].fmt = format;   /* full byte: LN(0x20)/UN(0x40) kept */
+        { extern unsigned g_ovl183_put_n;
+          if (g_ovl183_put_n && unit < 4 &&
+              (width >= 640u || (format & 0x40))) {
+              static unsigned n;
+              if (n++ < 24u) {
+                  u32 span = width * height;
+                  if (span > 4096u) span = 4096u;
+                  u32 nz = 0, i;
+                  u32 ea = s_d3d.cur_texs[unit].off;
+                  if (vm_base && ea && ea != 0xFFFFFFFFu)
+                      for (i = 0; i < span; i += 17u)
+                          if (vm_base[ea + i]) nz++;
+                  fprintf(stderr,
+                          "[TEXBIND] u=%u off=0x%08X ea=0x%08X %ux%u fmt=0x%02X "
+                          "%s%s wrapS=%u wrapT=%u surf=0x%08X nz=%u/%u%c",
+                          unit, offset, ea, width, height, format,
+                          (format & 0x20) ? "LN" : "SZ",
+                          (format & 0x40) ? ",UN" : ",NR",
+                          tex->address & 0xFu, (tex->address >> 8) & 0xFu,
+                          s_d3d.current_rsx_state
+                              ? s_d3d.current_rsx_state->surface_color_offset[0] : 0,
+                          nz, span ? (span + 16u) / 17u : 0, 10);
+              }
+          } }
         s_d3d.cur_texs[unit].ctrl1 = tex->control1;
         s_d3d.cur_texs[unit].cube  = (tex->format & 4) ? 1 : 0;
         s_d3d.cur_texs[unit].mips  = (tex->format >> 16) & 0xFFFFu;

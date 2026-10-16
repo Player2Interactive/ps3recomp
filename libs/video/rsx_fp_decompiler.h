@@ -87,6 +87,13 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
 int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
                               const u32 dim[][2], u32 cube_mask);
 
+/* D3D12 live path: multiply 2D Sample coords by b1.rsx_texscale[u].xy and
+ * declare that cbuffer if missing. rsx_texscale is 1/size for UNNORM units
+ * and 1.0 otherwise (filled per draw). Cube Sample(.xyz) is left alone.
+ * Do not combine with rsx_fp_apply_unnorm_scale (that bakes 1/size literals).
+ * Returns Sample sites patched, or -1 on overflow. */
+int rsx_fp_apply_runtime_texscale(char* hlsl, u32 hlsl_size);
+
 /* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
  * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
  * half float and X32/W32Z32Y32X32 use a 32-bit float. */

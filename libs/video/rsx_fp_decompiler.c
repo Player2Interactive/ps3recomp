@@ -1175,3 +1175,71 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
     }
     return patched;
 }
+
+int rsx_fp_apply_runtime_texscale(char* hlsl, u32 hlsl_size)
+{
+    if (!hlsl) return -1;
+    int patched = 0;
+
+    /* b1 layout matches D3D12 VP_FPCB: texscale[4], alphatest, fp_k[64]. */
+    if (!strstr(hlsl, "rsx_texscale")) {
+        char* at = strstr(hlsl, "SamplerState rsx_samp");
+        char* nl = at ? strchr(at, '\n') : NULL;
+        if (nl) {
+            static const char cb[] =
+                "cbuffer cb1 : register(b1) {\n"
+                "    float4 rsx_texscale[4];\n"
+                "    float4 rsx_alphatest;\n"
+                "    float4 fp_k[64];\n"
+                "};\n";
+            u32 slen = (u32)strlen(cb);
+            u32 used = (u32)strlen(hlsl);
+            if (used + slen + 1 > hlsl_size) return -1;
+            memmove(nl + 1 + slen, nl + 1, used - (u32)(nl + 1 - hlsl) + 1);
+            memcpy(nl + 1, cb, slen);
+        }
+    }
+
+    for (u32 u = 0; u < 4; u++) {
+        char needles[2][48];
+        snprintf(needles[0], sizeof needles[0],
+                 "rsx_tex[%u].Sample(rsx_samp[%u],", u, u);
+        snprintf(needles[1], sizeof needles[1],
+                 "rsx_tex%u.Sample(rsx_samp[%u],", u, u);
+        for (int nidx = 0; nidx < 2; nidx++) {
+            const char* needle = needles[nidx];
+            const u32 nlen = (u32)strlen(needle);
+            for (;;) {
+                char* at = strstr(hlsl, needle);
+                if (!at) break;
+                char* open = at + nlen - 1;
+                while (open > at && *open != '(') open--;
+                if (*open != '(') break;
+                int depth = 0;
+                char* p = open;
+                for (; *p; p++) {
+                    if (*p == '(') depth++;
+                    else if (*p == ')') { depth--; if (!depth) break; }
+                }
+                if (*p != ')') break;
+                /* Cube lookups pass a float3 direction. */
+                if (p >= open + 4 && memcmp(p - 4, ".xyz", 4) == 0) {
+                    memcpy(at, "rsx_TEX", 7);
+                    continue;
+                }
+                char scale[40];
+                snprintf(scale, sizeof scale, " * rsx_texscale[%u].xy", u);
+                const u32 slen = (u32)strlen(scale);
+                const u32 used = (u32)strlen(hlsl);
+                if (used + slen + 1 > hlsl_size) return -1;
+                memmove(p + slen, p, used - (u32)(p - hlsl) + 1);
+                memcpy(p, scale, slen);
+                patched++;
+                memcpy(at, "rsx_TEX", 7);
+            }
+        }
+        for (char* q = hlsl; (q = strstr(q, "rsx_TEX")) != NULL; )
+            memcpy(q, "rsx_tex", 7);
+    }
+    return patched;
+}

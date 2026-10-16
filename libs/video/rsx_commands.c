@@ -33,6 +33,8 @@ static rsx_backend* s_backend = NULL;
  * reports it as reached; cellGcmSys mirrors this into the guest control
  * register after each drain so those waits (cellGcmFinish / wait-label) unblock. */
 u32 g_rsx_last_reference = 0;
+/* Arm D3D present dumps after Ice FMV 2S quads (display 1280x720). */
+int g_rsx_ice_present_dump = 0;
 
 void rsx_set_backend(rsx_backend* backend)
 {
@@ -144,12 +146,14 @@ static void rsx_imm_emit_attr0(rsx_state* state)
         s_inline_words[s_inline_n++] = w;
     }
     s_inline_imm = 1;
-    { static unsigned n;
+    { static unsigned n, ice_n;
       extern unsigned g_ovl183_put_n;
-      if (n++ < 16u)
+      unsigned* pn = g_ovl183_put_n ? &ice_n : &n;
+      unsigned lim = g_ovl183_put_n ? 48u : 16u;
+      if ((*pn)++ < lim)
           fprintf(stderr,
                   "[RSX] IMM-VTX n=%u pos=%.1f,%.1f uv=%.1f,%.1f words=%u bink=%u%c",
-                  n, state->vertex_data4f[0][0], state->vertex_data4f[0][1],
+                  *pn, state->vertex_data4f[0][0], state->vertex_data4f[0][1],
                   state->vertex_data4f[1][0], state->vertex_data4f[1][1],
                   s_inline_n, g_ovl183_put_n, 10); }
 }
@@ -194,8 +198,31 @@ static void rsx_flush_begin_end(rsx_state* state)
         u32 count = packed ? nbytes / packed : 0;
         if (!count) { s_inline_n = 0; s_elem_n = 0; return; }
         u32 ea = cellGcmResolveLocated(1, RSX_INLINE_SCRATCH);
-        { static int n = 0;
-          if (n++ < 16)
+        { static int n = 0, ice_n = 0;
+          extern unsigned g_ovl183_put_n;
+          int ice = imm && g_ovl183_put_n &&
+                    state->surface_clip_w == 1280u && state->surface_clip_h == 720u;
+          if (ice) {
+              if (ice_n++ < 24)
+                  fprintf(stderr, "[RSX] INLINE_ARRAY prim=%u words=%u packed=%u count=%u surf=0x%08X clip=%ux%u%s fp=0x%08X t0=0x%08X/%ux%u/0x%X (ice)%c",
+                          state->primitive_type, s_inline_n, packed, count,
+                          state->surface_color_offset[0],
+                          state->surface_clip_w, state->surface_clip_h,
+                          imm ? " (imm)" : "",
+                          state->shader_program,
+                          state->textures[0].offset,
+                          (state->textures[0].image_rect >> 16) & 0xFFFFu,
+                          state->textures[0].image_rect & 0xFFFFu,
+                          state->textures[0].format, 10);
+              /* Arm the D3D present dump once. Present consumes the flag;
+               * a sticky static stops every later Ice quad from re-arming
+               * (that filled C: with 1.3 GB of BMPs). */
+              { static int dump_armed;
+                if (!dump_armed) {
+                    dump_armed = 1;
+                    g_rsx_ice_present_dump = 8;
+                } }
+          } else if (n++ < 16)
               fprintf(stderr, "[RSX] INLINE_ARRAY prim=%u words=%u packed=%u count=%u surf=0x%08X clip=%ux%u%s%c",
                       state->primitive_type, s_inline_n, packed, count,
                       state->surface_color_offset[0],
@@ -945,10 +972,16 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
               if (rsx_hi_rt(state)) after = 1;
               if ((after && n < 16) || (g_ovl183_put_n && disp && n < 40)) {
                   n++;
-                  fprintf(stderr, "[RSX] BEGIN_END prim=%u surf=0x%08X clip=%ux%u%s%c",
+                  fprintf(stderr, "[RSX] BEGIN_END prim=%u surf=0x%08X clip=%ux%u%s "
+                          "vp_scale=%.1f,%.1f vp_off=%.1f,%.1f t0=0x%08X fmt=0x%X %ux%u%c",
                           data, state->surface_color_offset[0],
                           state->surface_clip_w, state->surface_clip_h,
-                          (g_ovl183_put_n && disp) ? " (bink-disp)" : "", 10); } }
+                          (g_ovl183_put_n && disp) ? " (bink-disp)" : "",
+                          state->viewport_scale[0], state->viewport_scale[1],
+                          state->viewport_offset[0], state->viewport_offset[1],
+                          state->textures[0].offset, state->textures[0].format,
+                          (state->textures[0].image_rect >> 16) & 0xFFFFu,
+                          state->textures[0].image_rect & 0xFFFFu, 10); } }
 
             /* Flush dirty state to backend before drawing */
             if (s_backend) {
