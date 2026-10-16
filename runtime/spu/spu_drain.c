@@ -367,23 +367,35 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
     }
     if ((ctx->pc & SPU_LS_MASK) != (return_pc & SPU_LS_MASK)) {
         /* SPU_RET stores pc=r0. The lifter plants the brsl link in r78
-         * (attach 2668/2698) or r6 (AllocateJob 2418 from 3038) while the
+         * (attach 2668/2698, idle 2660 from 2D40), r6 (AllocateJob 2418
+         * from 3038), or r4 (wait-tag 2330 / ieq-wait 2320) while the
          * helper still does `bi $r0`, so r0 is stale:
          *   0x2C44 — unlifted mid-2BF0; restart interprets/halts, never 2C60
          *   0x2CF0 — idle, not 0x3048/0x3078; restart abandons 3038 so the
          *            job 2418 found is never launched
-         * Resume the C frame for those. Other mismatches still restart
-         * (WwsJob idle 2D20/2808 uses r0 as a real tail target). */
+         *   0x2C88 / ret 0x2DC4 — 2330 from 2DB8; restart abandons execute
+         *            so C00=0x200 never runs (12A0==2, 2C78 would take 2DB8)
+         *   0x2CF8 / ret 0x2D28 — 2320→2330 from idle 2D20; restart loops
+         *            2CF8 forever so an empty first AllocateJob never retries
+         * Resume when the planted link still names this drain site. 2B20
+         * returns via `pc=r4` (drain matches 2D20); 2808's own SPU_RET uses
+         * r0=2D4C (matches). 2D4C→2850 is 26C8's stale r0 with r78=2850,
+         * and 2D4C is unlifted so the first clause already resumes it. */
         extern void spu_restart_dispatch(spu_context*);
         extern int spu_have_function(uint32_t addr);
         uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
         uint32_t ret = return_pc & SPU_LS_MASK;
+        uint32_t r4 = ctx->gpr[4]._u32[0] & SPU_LS_MASK;
+        uint32_t r6 = ctx->gpr[6]._u32[0] & SPU_LS_MASK;
+        uint32_t r78 = ctx->gpr[78]._u32[0] & SPU_LS_MASK;
+        int planted = (r4 == ret || r6 == ret || r78 == ret);
         int resume_caller = !spu_have_function(pc)
             || ((pc == 0x2CF0u || pc == 0x2CF8u)
-                && (ret == 0x3048u || ret == 0x3078u));
+                && (ret == 0x3048u || ret == 0x3078u))
+            || planted;
         if (resume_caller) {
             static int _n;
-            if (_n++ < 16) {
+            if (_n++ < 64) {
                 fprintf(stderr, "[spu-drain] skip restart pc=0x%05X ret=0x%05X "
                         "img=%d (stale r0, resume caller)\n",
                         pc, ret, ctx->image_id);
