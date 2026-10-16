@@ -3765,6 +3765,29 @@ static uint32_t iwl_packed_tag(const uint8_t* in, uint32_t dma_sz)
            ((uint32_t)in[2] << 8) | (uint32_t)in[3];
 }
 
+/* Scaleform magic is 3 ASCII bytes + a version. ACIT ships GFX/FWS v8
+ * (mainmenu.swf, leaderboard.swf) and GFX v9 (profile.swf). Matching only
+ * v8 made 68C770RAW miss the v9 member; guest zlib then ate already-inflated
+ * bytes and produced signed-negative tag lengths (0xFFFFFE18). */
+static int iwl_swf_ver_ok(uint32_t mag)
+{
+    uint32_t ver = mag & 0xFFu;
+    return ver >= 1u && ver <= 20u;
+}
+
+static int iwl_is_unc_scaleform(uint32_t mag)
+{
+    uint32_t sig = mag >> 8;
+    return iwl_swf_ver_ok(mag) && (sig == 0x474658u || sig == 0x465753u);
+}
+
+static int iwl_is_swf_magic(uint32_t mag)
+{
+    uint32_t sig = mag >> 8;
+    return iwl_swf_ver_ok(mag) &&
+           (sig == 0x474658u || sig == 0x465753u || sig == 0x435753u);
+}
+
 static int iwl_slot_find(uint32_t dma_src, uint32_t dma_sz, uint32_t tag)
 {
     int i;
@@ -3873,8 +3896,8 @@ static int iwl_window_serve(const uint8_t* in, uint32_t dma_sz,
      * Seek+full load pulls block1 and triggers a nested import that currently
      * stalls mainmenu create; leavefe33 relied on that desync. */
     if (!did_rewind && use_off == 0u && n >= 4u) {
-        int is_gfx = (dst0 == 0x47465808u);
-        int is_fws = (dst0 == 0x46575308u || dst0 == 0x43575308u);
+        int is_gfx = iwl_is_unc_scaleform(dst0) && ((dst0 >> 8) == 0x474658u);
+        int is_fws = iwl_is_swf_magic(dst0) && ((dst0 >> 8) != 0x474658u);
         uint32_t tag = g_iwl_slots[slot].tag;
         if (is_gfx || (is_fws && tag != 0x9CDB093Cu))
             g_iwl_gfx_rewind_src = dma_src;
@@ -4134,9 +4157,14 @@ int acit_iwl_member_copy(uint32_t member_len, uint32_t off,
         d = g_iwl_slots[i].data;
         mag = ((uint32_t)d[0] << 24) | ((uint32_t)d[1] << 16) |
               ((uint32_t)d[2] << 8) | (uint32_t)d[3];
-        /* Uncompressed Scaleform/SWF only — CWS still needs guest zlib. */
-        if (mag != 0x47465808u && mag != 0x46575308u)
+        /* Uncompressed Scaleform/SWF only — CWS still needs guest zlib.
+         * GFX/FWS v8 and v9 (profile.swf) both live in the IWL cache. */
+        if (!iwl_is_unc_scaleform(mag))
             continue;
+        { static int _v9 = 0;
+          if ((mag & 0xFFu) != 8u && _v9++ < 8)
+            fprintf(stderr, "[iwl-raw] mag=0x%08X len=0x%X off=0x%X sz=0x%X\n",
+                    mag, member_len, off, size); }
         if (off >= g_iwl_slots[i].len) {
             if (out_n)
                 *out_n = 0;

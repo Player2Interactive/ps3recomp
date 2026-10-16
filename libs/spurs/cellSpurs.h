@@ -296,7 +296,8 @@ s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking);
 s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea);
 s32 cellSpursLFQueueDetachLv2EventQueue(u64 queue_ea);
 
-/* Raw copy from IWL full-member cache (GFX/FWS). Returns 1 on hit/EOF. */
+/* Raw copy from IWL full-member cache (uncompressed GFX/FWS v8–v20).
+ * Returns 1 on hit/EOF. CWS is not served (guest zlib). */
 int acit_iwl_member_copy(uint32_t member_len, uint32_t off,
                          uint32_t dst_ea, uint32_t size, uint32_t* out_n);
 
