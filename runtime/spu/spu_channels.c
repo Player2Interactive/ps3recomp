@@ -2316,26 +2316,37 @@ void spu_indirect_branch(spu_context* ctx)
         spu_halt(ctx);
         return;
     }
-    /* WWS job-code overlay match: the PM (image 2) streams a job module into the
-     * code buffer (base = LS[0x1320]) and branches to base+entryOffset. Its 16-byte
-     * ila header identifies which of the 89 lifted job modules it is; match it and
-     * mark that overlay resident so the module's lifted functions dispatch. The
-     * module arrives via a DMA LIST, so the single-GET note_get hook never fired. */
-    if (!fn && ctx->image_id == 2 && ctx->pc >= 0x4000 && ctx->pc < 0x3E000) {
-        uint32_t codeBase = ((uint32_t)ctx->ls[0x1320] << 24) | ((uint32_t)ctx->ls[0x1321] << 16) |
-                            ((uint32_t)ctx->ls[0x1322] << 8) | ctx->ls[0x1323];
-        if (codeBase + 16 <= SPU_LS_SIZE) {
-            extern int spu_overlay_match_sig(const uint8_t hdr[16]);
-            int img = spu_overlay_match_sig(&ctx->ls[codeBase]);
-            if (img) {
-                if (ctx->resident_ovl != img) {
-                    ctx->resident_ovl = img;
-                    static int _n = 0; if (_n++ < 32)
-                        fprintf(stderr, "[spu-ovl] WWS job module resident: codeBase=0x%05X "
-                                "pc=0x%05X -> overlay image %d\n", codeBase, ctx->pc & SPU_LS_MASK, img);
-                }
-                fn = spu_lookup(ctx->pc, img);
+    /* WWS job-code overlay match: the PM streams a job module into the code
+     * buffer (base = LS[0x1320]) and branches to base+entryOffset. LBP's PM is
+     * image 2; ACIT's Wws_Job is image 10. The 16-byte ila header identifies
+     * the lifted module. The module often arrives via a DMA LIST, so the
+     * single-GET note_get hook may not have fired. Also try 0x1330 (LBP's
+     * lsaJobCodeBuffer) and LS 0x4000 (ACIT GET dest for overlay 135). */
+    if (!fn && ctx->policy_mode &&
+        (ctx->image_id == 2 || ctx->image_id == 10) &&
+        ctx->pc >= 0x4000 && ctx->pc < 0x3E000) {
+        uint32_t bases[3];
+        unsigned bi;
+        bases[0] = ((uint32_t)ctx->ls[0x1320] << 24) | ((uint32_t)ctx->ls[0x1321] << 16)
+                 | ((uint32_t)ctx->ls[0x1322] << 8) | ctx->ls[0x1323];
+        bases[1] = ((uint32_t)ctx->ls[0x1330] << 24) | ((uint32_t)ctx->ls[0x1331] << 16)
+                 | ((uint32_t)ctx->ls[0x1332] << 8) | ctx->ls[0x1333];
+        bases[2] = 0x4000u;
+        extern int spu_overlay_match_sig(const uint8_t hdr[16]);
+        for (bi = 0; bi < 3 && !fn; bi++) {
+            uint32_t codeBase = bases[bi];
+            int img;
+            if (codeBase + 16u > SPU_LS_SIZE) continue;
+            img = spu_overlay_match_sig(&ctx->ls[codeBase]);
+            if (!img) continue;
+            if (ctx->resident_ovl != img) {
+                ctx->resident_ovl = img;
+                static int _n = 0; if (_n++ < 32)
+                    fprintf(stderr, "[spu-ovl] WWS job module resident: codeBase=0x%05X "
+                            "pc=0x%05X img=%d -> overlay image %d\n",
+                            codeBase, ctx->pc & SPU_LS_MASK, ctx->image_id, img);
             }
+            fn = spu_lookup(ctx->pc, img);
         }
     }
     /* WWS job-code fallback: the jobmanager PM (image 2) stages each job's
@@ -2515,7 +2526,7 @@ void spu_indirect_branch(spu_context* ctx)
      * with a return link in r0 (0x31C8 sets 0x3258); route the kernel-return
      * there: the PM resumes its post-job flow, which is exactly what the jm2
      * kernel hand-back does on hardware. */
-    if (ctx->image_id == 2 && ctx->policy_mode && ctx->pc == 0 &&
+    if ((ctx->image_id == 2 || ctx->image_id == 10) && ctx->policy_mode && ctx->pc == 0 &&
         (ctx->gpr[0]._u32[0] & SPU_LS_MASK) >= 0xA00 &&
         (ctx->gpr[0]._u32[0] & SPU_LS_MASK) < 0x3700) {
         static int _n = 0;
@@ -2549,7 +2560,7 @@ void spu_indirect_branch(spu_context* ctx)
         spu_halt(ctx);
         return;
     }
-    if (ctx->image_id == 2 &&
+    if ((ctx->image_id == 2 || ctx->image_id == 10) &&
         ((ctx->pc >= 0x3700 && ctx->pc < 0x3FE80) ||
          (ctx->pc < 0xA00 && ctx->pc != SPURS_PM_EXIT_TO_KERNEL_LS &&
           ctx->pc != SPURS_PM_SELECT_WORKLOAD_LS))) {

@@ -145,6 +145,27 @@ int spurs_pm_ls32(uint32_t wid, uint32_t ls_off, uint32_t* out)
     return 1;
 }
 
+int spurs_pm_gpr32(uint32_t wid, unsigned spu, unsigned reg, uint32_t* out)
+{
+    spu_context* c;
+    if (wid >= SPURS_PM_MAX_WKL || spu >= 6 || reg >= 128 || !out) return 0;
+    c = s_pm_ctx[wid][spu];
+    if (!c) return 0;
+    *out = c->gpr[reg]._u32[0];
+    return 1;
+}
+
+int spurs_pm_ovl(uint32_t wid, unsigned spu, int* ovl, int* img)
+{
+    spu_context* c;
+    if (wid >= SPURS_PM_MAX_WKL || spu >= 6) return 0;
+    c = s_pm_ctx[wid][spu];
+    if (!c) return 0;
+    if (ovl) *ovl = c->resident_ovl;
+    if (img) *img = c->image_id;
+    return 1;
+}
+
 static uint32_t ovl12_ls_be32(const spu_context* c, uint32_t lsa)
 {
     const uint8_t* p = c->ls + (lsa & SPU_LS_MASK);

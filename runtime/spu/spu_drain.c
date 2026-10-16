@@ -351,7 +351,43 @@ int spu_tailret_enabled(void)
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
     spu_depth_guard(ctx);
-    while (g_spu_trampoline_fn) {
+    /* 0x31C8 changeloadtorunjob: brsl 2668/2698 then bisled r5 with link
+     * 0x3258. Hang census sits in 2668/2698 with r0=0x3258 after overlay 135
+     * lands at LS 0x4000 — name r5 (the bie target) and the code-buffer words
+     * the PM used to compute it. */
+    if ((return_pc & SPU_LS_MASK) == 0x3258u && ctx->image_id == 10) {
+        static int _n;
+        if (_n++ < 8) {
+            uint32_t b1320 = ((uint32_t)ctx->ls[0x1320] << 24) | ((uint32_t)ctx->ls[0x1321] << 16)
+                           | ((uint32_t)ctx->ls[0x1322] << 8) | ctx->ls[0x1323];
+            uint32_t b1330 = ((uint32_t)ctx->ls[0x1330] << 24) | ((uint32_t)ctx->ls[0x1331] << 16)
+                           | ((uint32_t)ctx->ls[0x1332] << 8) | ctx->ls[0x1333];
+            uint32_t off = 0, entry = 0;
+            if (b1320 + 0x14u <= SPU_LS_SIZE) {
+                const uint8_t* p = ctx->ls + (b1320 & SPU_LS_MASK) + 0x10u;
+                off = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+                    | ((uint32_t)p[2] << 8) | p[3];
+                entry = (b1320 + off) & SPU_LS_MASK;
+            }
+            fprintf(stderr, "[wws-attach] drain 0x3258 n=%d pc=0x%05X r5=0x%08X r0=0x%05X "
+                    "r78=0x%05X 1320=0x%08X +10=0x%08X entry=0x%05X 1330=0x%08X ovl=%d ie=%u "
+                    "12A0=%02X%02X%02X%02X 4000=%02X%02X%02X%02X 4080=%02X%02X%02X%02X "
+                    "D80=%02X%02X%02X%02X DD0=%02X%02X%02X%02X stall=0x%X\n",
+                    _n,
+                    (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[5]._u32[0],
+                    ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[78]._u32[0] & SPU_LS_MASK,
+                    b1320, off, entry, b1330, ctx->resident_ovl, ctx->int_enable,
+                    ctx->ls[0x12A0], ctx->ls[0x12A1], ctx->ls[0x12A2], ctx->ls[0x12A3],
+                    ctx->ls[0x4000], ctx->ls[0x4001], ctx->ls[0x4002], ctx->ls[0x4003],
+                    ctx->ls[0x4080], ctx->ls[0x4081], ctx->ls[0x4082], ctx->ls[0x4083],
+                    ctx->ls[0xD80], ctx->ls[0xD81], ctx->ls[0xD82], ctx->ls[0xD83],
+                    ctx->ls[0xDD0], ctx->ls[0xDD1], ctx->ls[0xDD2], ctx->ls[0xDD3],
+                    ctx->list_stall_mask);
+            fflush(stderr);
+        }
+    }
+    for (;;) {
+        while (g_spu_trampoline_fn) {
         if (g_spu_trampoline_fn == spu_indirect_branch &&
             (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
             g_spu_trampoline_fn = 0;
@@ -364,6 +400,41 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
         if (ctx->int_enable && (ctx->event_status & ctx->event_mask))
             fn = spu_take_interrupt(ctx, fn);
         fn(ctx);
+        }
+        if ((return_pc & SPU_LS_MASK) == 0x3258u && ctx->image_id == 10 &&
+            ((uint32_t)ctx->pc & SPU_LS_MASK) == 0x3258u) {
+            static int _x;
+            if (_x++ < 8)
+                fprintf(stderr, "[wws-attach] drain 0x3258 returned pc=0x%05X\n",
+                        (uint32_t)ctx->pc & SPU_LS_MASK);
+        }
+        if ((ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK))
+            return;
+        /* changeloadtorunjob bisled (link 0x3258): overlay 135 actually
+         * entered (pc=0x40B8, 1320=0x4000, +10=0x80, entry=0x4080). The job
+         * overwrites r0 with 0x412C+r126 and SPU_RETs there at host_depth>0,
+         * so the while exits with pc still in the module. have_function(0x412C)
+         * is true (image 135), r78 is the job's 0x100 not 0x3258, and the
+         * planted-link resume therefore does not fire — restart_dispatch
+         * longjmps out of 0x31C8, the job never SPU_RETs to 0x3258, tags
+         * stay 1,1,0. Keep dispatching until the job returns to the bisled
+         * link. boot_31c8.err [wws-attach] RESTART pc=0x0412C. */
+        {
+            uint32_t jpc = (uint32_t)ctx->pc & SPU_LS_MASK;
+            if ((return_pc & SPU_LS_MASK) == 0x3258u &&
+                (ctx->image_id == 10 || ctx->image_id == 2) &&
+                jpc >= 0x4000u && jpc < 0x3E000u) {
+                static int _k;
+                if (_k++ < 16) {
+                    fprintf(stderr, "[wws-attach] keep job pc=0x%05X ovl=%d img=%d\n",
+                            jpc, ctx->resident_ovl, ctx->image_id);
+                    fflush(stderr);
+                }
+                g_spu_trampoline_fn = spu_indirect_branch;
+                continue;
+            }
+        }
+        break;
     }
     if ((ctx->pc & SPU_LS_MASK) != (return_pc & SPU_LS_MASK)) {
         /* SPU_RET stores pc=r0. The lifter plants the brsl link in r78
@@ -402,6 +473,12 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                 fflush(stderr);
             }
         } else {
+            if (ret == 0x3258u && ctx->image_id == 10) {
+                static int _r;
+                if (_r++ < 8)
+                    fprintf(stderr, "[wws-attach] RESTART pc=0x%05X r5=0x%08X r78=0x%05X ovl=%d\n",
+                            pc, ctx->gpr[5]._u32[0], r78, ctx->resident_ovl);
+            }
             spu_restart_dispatch(ctx);
         }
     }
