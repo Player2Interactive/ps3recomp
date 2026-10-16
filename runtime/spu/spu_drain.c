@@ -98,6 +98,42 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     if (g_pm_flow_ctx == (void*)ctx && g_pm_flow_n < 8192)
         g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;
 
+    /* Wrap-183 CRT trampolines 0x598→0x59C/0x620/0x638/0x508/0x448/0x4A0
+     * without indirect_branch, so disp never sees the 512-byte GET wrch.
+     * Dump r1/r3/r4 here (IWL leftover attach ABI). */
+    {
+        uint32_t p = (uint32_t)ctx->pc & SPU_LS_MASK;
+        int has183 = (ctx->resident_ovl == 183);
+        unsigned slot;
+        for (slot = 0; slot < 4; ++slot)
+            if (ctx->resident_code[slot].image_id == 183) { has183 = 1; break; }
+        if (has183 &&
+            (p == 0x508u || p == 0x448u || p == 0x4A0u || p == 0x638u
+             || p == 0x778u || p == 0x540u || p == 0x59Cu || p == 0x620u)) {
+            static int _n;
+            if (_n++ < 40) {
+                uint32_t r4 = ctx->gpr[4]._u32[0];
+                fprintf(stderr,
+                        "[ovl-183] step n=%d pc=0x%05X r1=0x%05X r3=%08X r4=%08X "
+                        "r5=%08X r6=%08X r11=%08X lr=0x%05X\n",
+                        _n, p, ctx->gpr[1]._u32[0] & SPU_LS_MASK,
+                        ctx->gpr[3]._u32[0], r4,
+                        ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0],
+                        ctx->gpr[11]._u32[0],
+                        ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+                if (r4 < SPU_LS_SIZE) {
+                    const uint8_t* q = ctx->ls + (r4 & (SPU_LS_MASK & ~15u));
+                    fprintf(stderr,
+                            "[ovl-183] step LS[r4]=%02X%02X%02X%02X %02X%02X%02X%02X "
+                            "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                            q[0],q[1],q[2],q[3], q[4],q[5],q[6],q[7],
+                            q[8],q[9],q[10],q[11], q[12],q[13],q[14],q[15]);
+                }
+                fflush(stderr);
+            }
+        }
+    }
+
     static int s_on = -1;
     if (s_on < 0) s_on = getenv("SPU_JOBDRAIN") ? 1 : 0;
     if (!s_on || ctx->image_id != 2 || !ctx->policy_mode) return;
@@ -465,20 +501,26 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                 && (ret == 0x3048u || ret == 0x3078u))
             || planted;
         if (ret == 0x3F940u) {
-            static int _o;
-            if (_o++ < 32) {
-                const uint8_t* t = ctx->ls + 0x18100;
-                fprintf(stderr,
-                        "[ovl-183] drain 3F940 n=%d pc=0x%05X owns=%d resume=%d img=%d "
-                        "code=%d/%d/%d/%d LS[18100]=%02X%02X%02X%02X %02X%02X%02X%02X\n",
-                        _o, pc, spu_context_owns_pc(ctx, pc), resume_caller,
-                        ctx->image_id,
-                        ctx->resident_code[0].image_id,
-                        ctx->resident_code[1].image_id,
-                        ctx->resident_code[2].image_id,
-                        ctx->resident_code[3].image_id,
-                        t[0],t[1],t[2],t[3], t[4],t[5],t[6],t[7]);
-                fflush(stderr);
+            int has183d = (ctx->resident_ovl == 183);
+            unsigned s183d;
+            for (s183d = 0; s183d < 4; ++s183d)
+                if (ctx->resident_code[s183d].image_id == 183) { has183d = 1; break; }
+            if (has183d) {
+                static int _o;
+                if (_o++ < 32) {
+                    const uint8_t* t = ctx->ls + 0x18100;
+                    fprintf(stderr,
+                            "[ovl-183] drain 3F940 n=%d pc=0x%05X owns=%d resume=%d img=%d "
+                            "code=%d/%d/%d/%d LS[18100]=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                            _o, pc, spu_context_owns_pc(ctx, pc), resume_caller,
+                            ctx->image_id,
+                            ctx->resident_code[0].image_id,
+                            ctx->resident_code[1].image_id,
+                            ctx->resident_code[2].image_id,
+                            ctx->resident_code[3].image_id,
+                            t[0],t[1],t[2],t[3], t[4],t[5],t[6],t[7]);
+                    fflush(stderr);
+                }
             }
         }
         if (resume_caller) {

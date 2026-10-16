@@ -2248,15 +2248,30 @@ void spu_indirect_branch(spu_context* ctx)
             static int _n183 = 0;
             if (_n183++ < 32) {
                 const uint8_t* t = ctx->ls + 0x18100;
+                const uint8_t* w = ctx->ls + 0x18200;
+                uint32_t r4 = ctx->gpr[4]._u32[0];
                 fprintf(stderr,
                         "[ovl-183] disp n=%d pc=0x%05X lr=0x%05X owner=%d fn=%d img=%d "
-                        "r3=%08X r12=%08X LS[18100]=%02X%02X%02X%02X %02X%02X%02X%02X "
-                        "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                        "r1=0x%05X r3=%08X r4=%08X r11=%08X r12=%08X "
+                        "LS[18100]=%02X%02X%02X%02X %02X%02X%02X%02X "
+                        "%02X%02X%02X%02X %02X%02X%02X%02X "
+                        "LS[18200]=%02X%02X%02X%02X %02X%02X%02X%02X\n",
                         _n183, p, ctx->gpr[0]._u32[0] & SPU_LS_MASK, code_owner,
                         fn ? 1 : 0, ctx->image_id,
-                        ctx->gpr[3]._u32[0], ctx->gpr[12]._u32[0],
+                        ctx->gpr[1]._u32[0] & SPU_LS_MASK,
+                        ctx->gpr[3]._u32[0], r4, ctx->gpr[11]._u32[0],
+                        ctx->gpr[12]._u32[0],
                         t[0],t[1],t[2],t[3], t[4],t[5],t[6],t[7],
-                        t[8],t[9],t[10],t[11], t[12],t[13],t[14],t[15]);
+                        t[8],t[9],t[10],t[11], t[12],t[13],t[14],t[15],
+                        w[0],w[1],w[2],w[3], w[4],w[5],w[6],w[7]);
+                if (r4 < SPU_LS_SIZE) {
+                    const uint8_t* q = ctx->ls + (r4 & (SPU_LS_MASK & ~15u));
+                    fprintf(stderr,
+                            "[ovl-183] disp LS[r4]=%02X%02X%02X%02X %02X%02X%02X%02X "
+                            "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                            q[0],q[1],q[2],q[3], q[4],q[5],q[6],q[7],
+                            q[8],q[9],q[10],q[11], q[12],q[13],q[14],q[15]);
+                }
                 fflush(stderr);
             }
         }

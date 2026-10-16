@@ -28,6 +28,22 @@ extern "C" {
 
 extern uint8_t* vm_base;
 
+/* True if this context currently owns overlay/image `id` via resident_ovl
+ * or a resident_code span. Wrap-183 (Bink leftover at EA 0x00ADB700) is
+ * claimed as a spanned code slot, not resident_ovl: a resident_ovl/sig
+ * claim would steal WWS lookup(0x4000). MFC allowlists and logs that
+ * key only resident_ovl==183 never see it. Lives here (not spu_context.h)
+ * so a header-only helper change does not rebuild every lifted SPU TU. */
+static inline int spu_context_has_image(const spu_context* ctx, int id)
+{
+    unsigned slot;
+    if (!ctx || !id) return 0;
+    if (ctx->resident_ovl == id) return 1;
+    for (slot = 0; slot < 4; ++slot)
+        if (ctx->resident_code[slot].image_id == id) return 1;
+    return 0;
+}
+
 /* Peer SPU in the issuing context's SPURS workload (lane n of that wid).
  * MFC LS-window EAs are 0xF0000000 + n*0x100000 + ls_off. */
 spu_context* spurs_pm_lane_ctx(const spu_context* issuer, unsigned n);
@@ -171,14 +187,18 @@ static inline int mfc_is_fence(uint32_t cmd)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
-    if (spu->resident_ovl == 183) {
+    if (spu_context_has_image(spu, 183)) {
         static unsigned n183dma;
         if (++n183dma <= 80u || (n183dma % 200u) == 0u)
             fprintf(stderr,
                     "[ovl-183] dma n=%u %s cmd=0x%X lsa=0x%05X ea=0x%08X "
-                    "size=0x%X pc=0x%05X\n",
+                    "size=0x%X pc=0x%05X r1=0x%05X r3=%08X r4=%08X "
+                    "ovl=%d code0=%d\n",
                     n183dma, mfc_is_put(cmd) ? "PUT" : (mfc_is_get(cmd) ? "GET" : "OTH"),
-                    cmd, lsa, (uint32_t)ea, size, (uint32_t)spu->pc & SPU_LS_MASK);
+                    cmd, lsa, (uint32_t)ea, size, (uint32_t)spu->pc & SPU_LS_MASK,
+                    spu->gpr[1]._u32[0] & SPU_LS_MASK,
+                    spu->gpr[3]._u32[0], spu->gpr[4]._u32[0],
+                    spu->resident_ovl, spu->resident_code[0].image_id);
     }
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
      * this guest address. A DMA landing in the loaded ELF image is always a
@@ -226,22 +246,29 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                         (uint32_t)ea >= 0xF0000000u &&
                         (uint32_t)ea < 0xF0000000u + 6u * 0x100000u);
           int align_bad = !ls_win && (((lsa ^ (uint32_t)ea) & 15) != 0);
-          /* Wrap-183 (Bink leftover at EA 0x00ADB700) GETs/PUTs a 512-byte
-           * work item at the PPU pointer in the job header (0x004060C8):
-           * 8-byte aligned, size 0x200. Hardware MFC would fault; rejecting
-           * it leaves LS 0x18200 empty and the VM spins at 0x59F0/0xACD8
-           * with no scanout PUT. Do not widen this to other images -- YDKJ
-           * sprayed its OPD with an unaligned 16 KB PUT. */
-          if (align_bad && spu->resident_ovl == 183 && size >= 16 && !(size & 15)
-              && (uint32_t)ea >= 0x10000u) {
+          /* Wrap-183 (Bink leftover at EA 0x00ADB700) is claimed as a
+           * resident_code span, not resident_ovl (that stays 0 so WWS
+           * lookup(0x4000) is not stolen). Its leftover CRT may issue
+           * 8-aligned size-multiple-of-16 GETs/PUTs; hardware MFC would
+           * fault those. Drive15: the 512-byte work-item GET at 0x508/0x448
+           * used EA 0x00F66180 (16-aligned) from LS[dest+16], not the
+           * job-header EA 0x004060C8 in r3. Keep this allowlist keyed on
+           * has_image(183) so a future 8-aligned wrap-183 transfer is not
+           * silently dropped. Do not widen to other images -- YDKJ sprayed
+           * its OPD with an unaligned 16 KB PUT. */
+          if (align_bad && spu_context_has_image(spu, 183) && size >= 16
+              && !(size & 15) && (uint32_t)ea >= 0x10000u) {
               static unsigned n183al;
               if (++n183al <= 24u || (n183al % 64u) == 0u)
                   fprintf(stderr,
                           "[ovl-183] align-ok n=%u %s cmd=0x%X lsa=0x%05X ea=0x%08X "
-                          "size=0x%X pc=0x%05X\n",
+                          "size=0x%X pc=0x%05X r1=0x%05X r4=%08X code0=%d\n",
                           n183al, mfc_is_put(cmd) ? "PUT" : "GET",
                           cmd, lsa, (uint32_t)ea, size,
-                          (uint32_t)spu->pc & SPU_LS_MASK);
+                          (uint32_t)spu->pc & SPU_LS_MASK,
+                          spu->gpr[1]._u32[0] & SPU_LS_MASK,
+                          spu->gpr[4]._u32[0],
+                          spu->resident_code[0].image_id);
               align_bad = 0;
           }
           int malformed = (size == 0) || (size > 0x4000)
@@ -250,13 +277,17 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                        || (mfc_is_put(cmd) && (uint32_t)ea < 0x10000u);
           if (malformed) {
               static int _n = 0;
-              int ovl183 = (spu->resident_ovl == 183);
+              int ovl183 = spu_context_has_image(spu, 183);
               if (_n++ < 8 || ovl183)
-                  fprintf(stderr, "[mfc] REJECTED malformed transfer: img=%d ovl=%d pc=0x%05X"
-                                  " cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
+                  fprintf(stderr, "[mfc] REJECTED malformed transfer: img=%d ovl=%d "
+                                  "code0=%d pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X "
+                                  "size=%u r1=0x%05X r4=%08X\n",
                           spu->image_id, spu->resident_ovl,
+                          spu->resident_code[0].image_id,
                           (uint32_t)spu->pc & SPU_LS_MASK, cmd,
-                          lsa, (uint32_t)ea, size);
+                          lsa, (uint32_t)ea, size,
+                          spu->gpr[1]._u32[0] & SPU_LS_MASK,
+                          spu->gpr[4]._u32[0]);
               return 0;
           } } }
     /* SPU_DMACHK=1: report transfers that break the MFC rules the guest's own
@@ -701,6 +732,25 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         }
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        if (spu_context_has_image(spu, 183) &&
+            (lsa == 0x18200u || size == 0x200u)) {
+            static unsigned n183get;
+            if (++n183get <= 16u) {
+                const uint8_t* t = ls_ptr;
+                unsigned nz = 0, i;
+                for (i = 0; i < size && i < 0x200u; i++)
+                    if (t[i]) nz++;
+                fprintf(stderr,
+                        "[ovl-183] GET-ok n=%u lsa=0x%05X ea=0x%08X size=0x%X "
+                        "pc=0x%05X nz=%u LS=%02X%02X%02X%02X %02X%02X%02X%02X "
+                        "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                        n183get, lsa, (uint32_t)ea, size,
+                        (uint32_t)spu->pc & SPU_LS_MASK, nz,
+                        t[0],t[1],t[2],t[3], t[4],t[5],t[6],t[7],
+                        t[8],t[9],t[10],t[11], t[12],t[13],t[14],t[15]);
+                fflush(stderr);
+            }
+        }
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
@@ -819,18 +869,38 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
         /* Wrap-183 / GCM-local PUT dest: Bink leftover wrap vs display scanout. */
         { uint32_t e = (uint32_t)ea;
-          int ovl = spu->resident_ovl;
+          uint32_t pc = (uint32_t)spu->pc & SPU_LS_MASK;
+          int ovl183 = spu_context_has_image(spu, 183);
           int to_fb = (size >= 0x100u && e >= 0xC0000000u && e < 0xC1000000u);
-          if (ovl == 183 || to_fb) {
+          if (ovl183 || to_fb) {
               static unsigned n183, nfb;
-              unsigned* np = (ovl == 183) ? &n183 : &nfb;
+              unsigned* np = ovl183 ? &n183 : &nfb;
               if (++*np <= 64u || (*np % 128u) == 0u)
                   fprintf(stderr,
-                          "[%s] PUT n=%u img=%d ovl=%d ea=0x%08X size=0x%X "
+                          "[%s] PUT n=%u img=%d ovl=%d code0=%d ea=0x%08X size=0x%X "
                           "lsa=0x%05X pc=0x%05X\n",
-                          ovl == 183 ? "ovl-183" : "fb-PUT", *np,
-                          spu->image_id, ovl, e, size, lsa,
-                          (uint32_t)spu->pc & SPU_LS_MASK);
+                          ovl183 ? "ovl-183" : "fb-PUT", *np,
+                          spu->image_id, spu->resident_ovl,
+                          spu->resident_code[0].image_id, e, size, lsa, pc);
+              /* Decode rows (0x1400=one 1280xRGBA line). Next stall: these
+               * land in 0x21xxxxxx, never GCM local 0xC0000000. */
+              if (ovl183 && size >= 0x1000u && (pc == 0x400u || pc == 0x4A0u)) {
+                  static unsigned n183pnz;
+                  if (++n183pnz <= 8u) {
+                      const uint8_t* t = (const uint8_t*)ls_ptr;
+                      unsigned nz = 0, i, n = size < 256u ? size : 256u;
+                      for (i = 0; i < n; i++)
+                          if (t[i]) nz++;
+                      fprintf(stderr,
+                              "[ovl-183] PUT-ok n=%u ea=0x%08X size=0x%X lsa=0x%05X "
+                              "pc=0x%05X nz256=%u/%u LS=%02X%02X%02X%02X "
+                              "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                              n183pnz, e, size, lsa, pc, nz, n,
+                              t[0],t[1],t[2],t[3], t[4],t[5],t[6],t[7],
+                              t[8],t[9],t[10],t[11], t[12],t[13],t[14],t[15]);
+                      fflush(stderr);
+                  }
+              }
           }
         }
         /* POISON-DMA detector: does an SPU PUT write the singleton object region
