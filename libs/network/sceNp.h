@@ -174,9 +174,10 @@ s32 sceNpManagerRequestTicket(const SceNpId* npId, const char* serviceId,
                               const void* entitlementId, u32 consumedCount);
 
 /* NPDRM: k_licensee may be NULL; drm_path is required (SDK/RPCS3).
- * SCE_NP_DRM_ERROR_INVALID_PARAM from np/error.h. cellFsOpen already
- * decrypts EDAT via edat_resolve, so a present path is CELL_OK. */
+ * Missing path matches RPCS3 (lv2 open error, typically CELL_ENOENT).
+ * Present files are CELL_OK; cellFsOpen decrypts EDAT via edat_resolve. */
 #define SCE_NP_DRM_ERROR_INVALID_PARAM          0x80029502
+s32 sceNpDrmIsAvailable(const void* k_licensee, const char* drm_path);
 s32 sceNpDrmIsAvailable2(const void* k_licensee, const char* drm_path);
 
 /* NP Basic lives in the sceNp PRX. Offline: no friends, do not invent one. */

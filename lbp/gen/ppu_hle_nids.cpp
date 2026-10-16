@@ -840,6 +840,8 @@ extern "C" {
     void sceNpGetAccountRegion(void);
     void sceNpGetAccountAge(void);
     void sceNpGetMyLanguages(void);
+    void sceNpDrmIsAvailable(void);
+    void sceNpDrmIsAvailable2(void);
     void sceNpManagerGetStatus(void);
     void sceNpManagerRegisterCallback(void);
     void sceNpManagerUnregisterCallback(void);
@@ -1873,6 +1875,8 @@ extern "C" void ppu_hle_register_all(void) {
     ps3_hle_register(0x652DDE99u, "sceNpGetAccountRegion", (void*)sceNpGetAccountRegion);
     ps3_hle_register(0x72CA41DCu, "sceNpGetAccountAge", (void*)sceNpGetAccountAge);
     ps3_hle_register(0xFACC5962u, "sceNpGetMyLanguages", (void*)sceNpGetMyLanguages);
+    ps3_hle_register(0xAD218FAFu, "sceNpDrmIsAvailable", (void*)sceNpDrmIsAvailable);
+    ps3_hle_register(0xF042B14Fu, "sceNpDrmIsAvailable2", (void*)sceNpDrmIsAvailable2);
     ps3_hle_register(0xA7BFF757u, "sceNpManagerGetStatus", (void*)sceNpManagerGetStatus);
     ps3_hle_register(0xE7DCD3B4u, "sceNpManagerRegisterCallback", (void*)sceNpManagerRegisterCallback);
     ps3_hle_register(0x52A6B523u, "sceNpManagerUnregisterCallback", (void*)sceNpManagerUnregisterCallback);

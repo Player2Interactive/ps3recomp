@@ -6,9 +6,19 @@
  */
 
 #include "sceNp.h"
+#include "../filesystem/cellFs.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <sys/types.h>
+#define HOST_STAT _stat
+#define HOST_STAT_T struct _stat
+#else
+#define HOST_STAT stat
+#define HOST_STAT_T struct stat
+#endif
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 
@@ -310,26 +320,51 @@ s32 sceNpManagerRequestTicket(const SceNpId* npId, const char* serviceId,
     return CELL_OK;
 }
 
-s32 sceNpDrmIsAvailable2(const void* k_licensee, const char* drm_path)
+/* RPCS3 npDrmIsAvailable: NULL path is INVALID_PARAM; missing file is the
+ * lv2 open error (CELL_ENOENT). Always-OK used to mark every preorder EDAT
+ * present, so ACIT CreateGame invoked GFx preorderMessages and never
+ * FSCommand StartGame. */
+static s32 npdrm_is_available(const void* k_licensee, const char* drm_path)
 {
+    const char* path;
+    char host[1024];
+    HOST_STAT_T st;
+    s32 rc;
     (void)k_licensee;
 
-    /* RPCS3: NULL path is SCE_NP_DRM_ERROR_INVALID_PARAM; k_licensee optional.
-     * Firmware blocks until the kernel has the key; we do not — cellFsOpen
-     * already decrypts NPD/EDAT through edat_resolve. */
     if (!drm_path)
         return (s32)SCE_NP_DRM_ERROR_INVALID_PARAM;
+    path = GUEST_PTR(drm_path, const char*);
+    if (!path || !path[0])
+        return (s32)SCE_NP_DRM_ERROR_INVALID_PARAM;
+
+    host[0] = 0;
+    if (cellfs_translate_path(path, host, sizeof host) != 0)
+        rc = (s32)CELL_ENOENT;
+    else if (HOST_STAT(host, &st) != 0 || (st.st_mode & S_IFREG) == 0)
+        rc = (s32)CELL_ENOENT;
+    else
+        rc = CELL_OK;
 
     {
-        const char* path = GUEST_PTR(drm_path, const char*);
         static int nlog;
-        if (nlog < 8) {
-            printf("[sceNp] DrmIsAvailable2(path=\"%s\") -> CELL_OK\n",
-                   path ? path : "");
+        if (nlog < 16) {
+            printf("[sceNp] DrmIsAvailable(path=\"%s\") -> %s\n",
+                   path, rc == CELL_OK ? "CELL_OK" : "CELL_ENOENT");
             nlog++;
         }
     }
-    return CELL_OK;
+    return rc;
+}
+
+s32 sceNpDrmIsAvailable(const void* k_licensee, const char* drm_path)
+{
+    return npdrm_is_available(k_licensee, drm_path);
+}
+
+s32 sceNpDrmIsAvailable2(const void* k_licensee, const char* drm_path)
+{
+    return npdrm_is_available(k_licensee, drm_path);
 }
 
 s32 sceNpBasicGetFriendPresenceByIndex(u32 index, SceNpUserInfo* user,
