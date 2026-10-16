@@ -453,14 +453,14 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
          * r0=2D4C (matches). 2D4C→2850 is 26C8's stale r0 with r78=2850,
          * and 2D4C is unlifted so the first clause already resumes it. */
         extern void spu_restart_dispatch(spu_context*);
-        extern int spu_have_function(uint32_t addr);
+        extern int spu_context_owns_pc(const spu_context* ctx, uint32_t pc);
         uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
         uint32_t ret = return_pc & SPU_LS_MASK;
         uint32_t r4 = ctx->gpr[4]._u32[0] & SPU_LS_MASK;
         uint32_t r6 = ctx->gpr[6]._u32[0] & SPU_LS_MASK;
         uint32_t r78 = ctx->gpr[78]._u32[0] & SPU_LS_MASK;
         int planted = (r4 == ret || r6 == ret || r78 == ret);
-        int resume_caller = !spu_have_function(pc)
+        int resume_caller = !spu_context_owns_pc(ctx, pc)
             || ((pc == 0x2CF0u || pc == 0x2CF8u)
                 && (ret == 0x3048u || ret == 0x3078u))
             || planted;

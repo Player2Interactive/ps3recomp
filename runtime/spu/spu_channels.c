@@ -1412,6 +1412,28 @@ int spu_have_function(uint32_t addr)
     return spu_image_of_function(addr) >= 0;
 }
 
+/* Would THIS context dispatch a lifted function at pc?
+ *
+ * spu_have_function is any-image: leftover wraps (igPm jobs at LS 0x100) share
+ * the same LS addresses as the WWS PM (0xA00-0x3700) and WWS job buffer
+ * (0x4000+). A dense wrap that registers 851 functions makes have_function()
+ * true for PCs the WWS PM treats as unlifted, so drain RESTARTs into the wrap
+ * instead of resuming the caller -- WWS then jumps to LS 0 at PortStart.
+ * Drain must ask the same question dispatch does. */
+int spu_context_owns_pc(const spu_context* ctx, uint32_t pc)
+{
+    if (!ctx) return 0;
+    pc &= SPU_LS_MASK;
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        if (ctx->resident_code[slot].image_id &&
+            pc >= ctx->resident_code[slot].lsa &&
+            pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
+            return spu_lookup(pc, ctx->resident_code[slot].image_id) != NULL;
+    }
+    if (ctx->resident_ovl && spu_lookup(pc, ctx->resident_ovl)) return 1;
+    return spu_lookup(pc, ctx->image_id) != NULL;
+}
+
 /* The pure interpreter's fast-path "is this LSA already lifted?" probe
  * (spu_interp.c, rejoin path). It IS the registry lookup, so overlay eviction and
  * self-modifying-code invalidation are honored automatically. Lived in
