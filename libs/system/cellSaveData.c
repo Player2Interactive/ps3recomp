@@ -286,6 +286,8 @@ static s32 dispatch_func_file(uint32_t func_opd, uint32_t* userdata_ea,
     if (!cb_ea || !get_ea || !set_ea) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
     marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT, *userdata_ea);
     vm_write32(get_ea, exc_size);
+    printf("[cellSaveData] dispatching funcFile OPD=0x%08X userdata=0x%08X excSize=%u\n",
+           func_opd, *userdata_ea, exc_size);
     g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0, 0, 0, 0, 0);
     *userdata_ea = vm_read32(cb_ea + 16);
     memset(out, 0, sizeof(*out));
@@ -298,7 +300,13 @@ static s32 dispatch_func_file(uint32_t func_opd, uint32_t* userdata_ea,
     out->fileSize = vm_read32(set_ea + 36);
     out->fileBufSize = vm_read32(set_ea + 40);
     out->fileBuf = buffer ? vm_base + buffer : NULL;
-    return marshal_cbresult_read_result(cb_ea);
+    {
+        s32 result = marshal_cbresult_read_result(cb_ea);
+        printf("[cellSaveData] funcFile returned result=%d op=%u type=%u name='%s' size=%u\n",
+               result, out->fileOperation, out->fileType,
+               out->fileName ? out->fileName : "", out->fileSize);
+        return result;
+    }
 }
 
 static void marshal_statget_init(uint32_t addr, int is_new, const char* dirName,
@@ -946,6 +954,18 @@ static s32 savedata_execute(const char* dirName, int is_save,
 
     printf("[cellSaveData] %s complete for '%s'\n",
            is_save ? "SAVE" : "LOAD", dirName);
+    if (callback_userdata >= 0x10000u) {
+        u32 mgr = vm_read32(callback_userdata);
+        printf("[cellSaveData] post userdata=0x%08X *ud=0x%08X +0x10=%u +0x14=%d +0x18=%u\n",
+               callback_userdata, mgr,
+               vm_read32(callback_userdata + 0x10),
+               (s32)vm_read32(callback_userdata + 0x14),
+               vm_read32(callback_userdata + 0x18));
+        if (mgr >= 0x10000u)
+            printf("[cellSaveData] post mgr vt=0x%08X +D8=%u +E4=0x%04X +EC=%d\n",
+                   vm_read32(mgr), (unsigned)vm_read16(mgr + 0xD8),
+                   (unsigned)vm_read16(mgr + 0xE4), (s32)vm_read32(mgr + 0xEC));
+    }
     return CELL_OK;
 }
 

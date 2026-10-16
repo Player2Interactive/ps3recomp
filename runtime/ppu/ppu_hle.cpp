@@ -712,9 +712,14 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 extern "C" void ppu_hle_register_all(void) __attribute__((weak));
 extern "C" void ppu_hle_register_all(void) {}
 
+extern "C" void cellSaveData_register_ctx_handlers(void);
+
 extern "C" void ppu_hle_init(void)
 {
     ppu_hle_register_all();
+    /* UserListSave/Load take userdata on the stack (arg9). Register after the
+     * generated 8-arg table so ACIT's Save Thread actually echoes cbResult. */
+    cellSaveData_register_ctx_handlers();
 
     /* The generated registration unit is per-game and easy to leave out: the
      * weak stub above means a build without it links and starts, then fails
