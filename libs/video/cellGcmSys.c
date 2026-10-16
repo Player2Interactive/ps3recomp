@@ -1086,17 +1086,36 @@ static void nv0039_copy(void)
     u8 out_fmt = (u8)((s_nv0039.format >> 8) & 0xFFu);
     if (!in_fmt) in_fmt = 1;
     if (!out_fmt) out_fmt = 1;
-    if (!line_len || !rows || in_fmt > 4 || out_fmt > 4) return;
     s32 in_pitch = (s32)s_nv0039.pitch_in;
     s32 out_pitch = (s32)s_nv0039.pitch_out;
     if (!in_pitch) in_pitch = (s32)(line_len * in_fmt);
     if (!out_pitch) out_pitch = (s32)(line_len * out_fmt);
-    int src_local = (s_nv0039.dma_in != 0xFEED0001u);
-    int dst_local = (s_nv0039.dma_out != 0xFEED0001u);
+    /* FEED0001 or Ice bit-31 = MAIN (IO). Do not let a leftover LOCAL DMA
+     * context plus bit 31 still resolve through VRAM. */
+    int src_local = (s_nv0039.dma_in != 0xFEED0001u) &&
+                    !(s_nv0039.off_in & 0x80000000u);
+    int dst_local = (s_nv0039.dma_out != 0xFEED0001u) &&
+                    !(s_nv0039.off_out & 0x80000000u);
     u32 src = cellGcmResolveLocated(src_local, s_nv0039.off_in);
     u32 dst = cellGcmResolveLocated(dst_local, s_nv0039.off_out);
     extern u8* vm_base;
-    if (!vm_base || src == 0xFFFFFFFFu || dst == 0xFFFFFFFFu) return;
+    extern unsigned g_ovl183_put_n;
+    {
+        int skip = (!line_len || !rows || in_fmt > 4 || out_fmt > 4);
+        int bad = (!vm_base || src == 0xFFFFFFFFu || dst == 0xFFFFFFFFu);
+        if (g_ovl183_put_n) {
+            static unsigned n;
+            if (n++ < 24u)
+                fprintf(stderr,
+                        "[NV0039] n=%u dma_in=0x%08X dma_out=0x%08X "
+                        "off_in=0x%08X off_out=0x%08X src=0x%08X dst=0x%08X "
+                        "len=%u rows=%u fmt=0x%X skip=%d bad=%d%c",
+                        n, s_nv0039.dma_in, s_nv0039.dma_out,
+                        s_nv0039.off_in, s_nv0039.off_out, src, dst,
+                        line_len, rows, s_nv0039.format, skip, bad, 10);
+        }
+        if (skip || bad) return;
+    }
     u8* d = vm_base + dst;
     const u8* s = vm_base + src;
     u32 width = line_len * in_fmt;
@@ -1163,7 +1182,8 @@ static void nv3089_blit(void)
       if (en < 0) { const char* e = getenv("NV309E_BLIT"); en = e ? atoi(e) : 1; }
       if (en && f == 3 && s_nv309e.active && s_nv309e.offset &&
           (1u << l2w) == out_w && (1u << l2h) == out_h) {
-        int sl = (s_nv3089.src_dma != 0xFEED0001u);
+        int sl = (s_nv3089.src_dma != 0xFEED0001u) &&
+                 !(s_nv3089.in_off & 0x80000000u);
         u32 src2 = cellGcmResolveLocated(sl, s_nv3089.in_off);
         u32 dst2 = cellGcmResolveLocated(1, s_nv309e.offset);
         u32 u0b = s_nv3089.in_uv & 0xFFFF, v0b = s_nv3089.in_uv >> 16;
@@ -1203,8 +1223,10 @@ static void nv3089_blit(void)
          * copy from the scene surface to a registered display buffer is the
          * composite this title needs, and is worth telling apart from some
          * incidental small transfer. */
-        { int _sl = (s_nv3089.src_dma != 0xFEED0001u);
-          int _dl = (s_gcm2d.dst_dma  != 0xFEED0001u);
+        { int _sl = (s_nv3089.src_dma != 0xFEED0001u) &&
+                    !(s_nv3089.in_off & 0x80000000u);
+          int _dl = (s_gcm2d.dst_dma  != 0xFEED0001u) &&
+                    !(s_gcm2d.dst_offset & 0x80000000u);
           printf("[NV3089] SKIPPED fmt=0x%X  %ux%u  src=0x%08X(pitch %u,%s) -> dst=0x%08X(pitch %u,%s) at %u,%u%c",
                  f, out_w, out_h,
                  cellGcmResolveLocated(_sl, s_nv3089.in_off), in_pitch, _sl?"LOCAL":"MAIN",
@@ -1214,8 +1236,10 @@ static void nv3089_blit(void)
         if (_w++ < 4) printf("[NV3089] unsupported colour format 0x%X, blit skipped\n", f);
         return;
     }
-    int src_local = (s_nv3089.src_dma != 0xFEED0001u);
-    int dst_local = (s_gcm2d.dst_dma  != 0xFEED0001u);
+    int src_local = (s_nv3089.src_dma != 0xFEED0001u) &&
+                    !(s_nv3089.in_off & 0x80000000u);
+    int dst_local = (s_gcm2d.dst_dma  != 0xFEED0001u) &&
+                    !(s_gcm2d.dst_offset & 0x80000000u);
     u32 src = cellGcmResolveLocated(src_local, s_nv3089.in_off);
     u32 dst = cellGcmResolveLocated(dst_local, s_gcm2d.dst_offset);
     u32 u0 = s_nv3089.in_uv & 0xFFFF, v0 = s_nv3089.in_uv >> 16;   /* 12.4 start */
@@ -3032,19 +3056,34 @@ u32 cellGcmResolveIO(u32 offset)
     return 0;
 }
 
+/* Wrap-183 / Bink decode PUT dest (IO-mapped main, 0x21xxxxxx). Present and
+ * FIFO probes sample this instead of assuming the scanout was the dest. */
+u32 g_ovl183_put_ea;
+u32 g_ovl183_put_size;
+unsigned g_ovl183_put_n;
+
 /* Location-aware resolve. RSX offsets are TWO overlapping number spaces --
  * LOCAL (VRAM, ea = localAddress + offset) and MAIN (IO-mapped, via the
- * offset table). cellGcmResolveOffset guesses table-first, which breaks when
- * a title's IO region is large enough to cover the same page numbers as its
- * local allocations (gcm/cube: ioSize 16MB, FP ucode at local 0xB90000 --
- * table hit returned the empty command-buffer EA instead of VRAM). Callers
- * that KNOW the location (texture format bits, SET_SHADER_PROGRAM bits) must
- * use this. `local` != 0 -> local memory. */
+ * offset table). cellGcmResolveOffset prefers a page once seen as LOCAL, which
+ * is right for VRAM objects but wrong for MAIN: ACIT's 190 MB IO window covers
+ * the same page numbers as low local offsets, so a wrap-183 PUT at
+ * 0x21C9xxxx (IO 0x01C9xxxx) resolved to empty VRAM 0xC1C9xxxx. Ice
+ * AddressToOffset (0x005C6B0C) also oris bit 31 for MAIN; mask it here.
+ * `local` != 0 -> local memory. MAIN never falls back through the local-page
+ * shortcut. */
 u32 cellGcmResolveLocated(int local, u32 offset)
 {
+    u32 off = offset & 0x7FFFFFFFu;
     if (local)
-        return s_config.localAddress + offset;
-    return cellGcmResolveOffset(offset);
+        return s_config.localAddress + off;
+    {
+        u32 ea = cellGcmResolveIO(off);
+        if (ea)
+            return ea;
+        if (s_config.ioAddress && off < s_config.ioSize)
+            return s_config.ioAddress + off;
+        return 0xFFFFFFFFu;
+    }
 }
 
 /* ---------------------------------------------------------------------------

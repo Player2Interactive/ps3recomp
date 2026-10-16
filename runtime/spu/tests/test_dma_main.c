@@ -31,6 +31,9 @@ void spu_register_function(uint32_t addr, void (*fn)(spu_context*)) { (void)addr
 
 /* diagnostics externs referenced from spu_dma.h in the full runtime */
 int g_cri_video_dma = 0;
+uint32_t g_ovl183_put_ea;
+uint32_t g_ovl183_put_size;
+unsigned g_ovl183_put_n;
 /* stop/halt hooks required by current lifter output */
 void spu_stop(spu_context* ctx) { (void)ctx; }
 void spu_halt(spu_context* ctx) { (void)ctx; }

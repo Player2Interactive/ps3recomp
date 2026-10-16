@@ -3947,6 +3947,31 @@ static void guest_fb_present(u32 fi)
                         sn, flip_id, off, gw, gh, sel_nz, sel_n, sel_mn, sel_mx,
                         sel_n ? sel_sum / sel_n : 0,
                         gcm_tile_covering(off) ? 1 : 0, 10);
+            { extern u32 g_ovl183_put_ea, g_ovl183_put_size;
+              extern unsigned g_ovl183_put_n;
+              extern u8* vm_base;
+              extern u32 cellGcmResolveLocated(int, u32);
+              if (g_ovl183_put_n && g_ovl183_put_ea && vm_base &&
+                  (sn <= 8u || (sn % 60u) == 0u)) {
+                  u32 nz = 0, i, span = g_ovl183_put_size < 256u ? g_ovl183_put_size : 256u;
+                  u32 io = g_ovl183_put_ea - 0x20000000u;
+                  u32 ea_main = cellGcmResolveLocated(0, io);
+                  u32 ea_loc  = cellGcmResolveLocated(1, io);
+                  u32 nz_m = 0, nz_l = 0;
+                  for (i = 0; i < span; i++)
+                      if (vm_base[g_ovl183_put_ea + i]) nz++;
+                  if (ea_main && ea_main != 0xFFFFFFFFu)
+                      for (i = 0; i < span; i++)
+                          if (vm_base[ea_main + i]) nz_m++;
+                  if (ea_loc && ea_loc != 0xFFFFFFFFu)
+                      for (i = 0; i < span; i++)
+                          if (vm_base[ea_loc + i]) nz_l++;
+                  fprintf(stderr,
+                          "[present] put-dest n=%u ea=0x%08X size=0x%X nz256=%u/%u "
+                          "io=0x%08X MAIN@0x%08X nz=%u LOCAL@0x%08X nz=%u%c",
+                          g_ovl183_put_n, g_ovl183_put_ea, g_ovl183_put_size, nz, span,
+                          io, ea_main, nz_m, ea_loc, nz_l, 10);
+              } }
         }
     }
     up_pitch = (gw * 4u + 255u) & ~255u;
@@ -6743,8 +6768,13 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         { static int _ra = -1; if (_ra < 0) _ra = getenv("TEX_RESOLVE_AUTO") ? 1 : 0;
           extern u32 cellGcmResolveIO(u32);
           u32 _r = 0;
-          if (_ra) _r = cellGcmResolveIO(offset);          /* IO table first */
-          if (!_r) _r = cellGcmResolveLocated((tex->format & 3) == 1, offset);
+          /* Bit 31 is Ice MAIN (0x005C6B0C oris 0x8000). Format loc 2 is MAIN.
+           * ResolveLocated(0) uses the IO table only so 0x01C9xxxx is
+           * 0x21C9xxxx, not VRAM 0xC1C9xxxx shadowed by the 190 MB IO window. */
+          int _main = (offset & 0x80000000u) || ((tex->format & 3) == 2);
+          u32 _off = offset & 0x7FFFFFFFu;
+          if (_ra) _r = cellGcmResolveIO(_off);
+          if (!_r) _r = cellGcmResolveLocated(!_main && ((tex->format & 3) == 1), _off);
           /* TEX_PROBE=1: the location bits are not always right. This title
            * binds its menu textures with a location that resolves into main
            * memory, where the bytes are all zero, while the same raw offset
@@ -6793,7 +6823,9 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].set = 1;
     }
     if (base_fmt == 0x81 /* B8 */) {
-        s_d3d.tex_src_offset = cellGcmResolveLocated((tex->format & 3) == 1, offset);
+        s_d3d.tex_src_offset = cellGcmResolveLocated(
+            !((offset & 0x80000000u) || ((tex->format & 3) == 2)) &&
+            ((tex->format & 3) == 1), offset & 0x7FFFFFFFu);
         if (s_d3d.tex_w != width || s_d3d.tex_h != height) {
             /* dims changed -> resource must be (re)created in render_frame */
             s_d3d.tex_ready = 0;

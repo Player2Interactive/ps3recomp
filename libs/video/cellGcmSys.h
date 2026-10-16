@@ -330,6 +330,16 @@ s32 cellGcmUnmapIoAddress(u32 io);
 /* NID: 0xC47D0812 */
 s32 cellGcmIoOffsetToAddress(u32 ioOffset, u32* ea);
 
+/* Location-aware RSX offset -> guest EA. local!=0 is VRAM; MAIN uses the IO
+ * table only (never the local-page shortcut). Bit 31 of `offset` is masked. */
+u32 cellGcmResolveLocated(int local, u32 offset);
+u32 cellGcmResolveIO(u32 offset);
+
+/* Last wrap-183 PUT dest in IO-mapped main (0x21xxxxxx). */
+extern u32 g_ovl183_put_ea;
+extern u32 g_ovl183_put_size;
+extern unsigned g_ovl183_put_n;
+
 /* Label / report / timestamp */
 
 /* NID: 0xF80196C1 */

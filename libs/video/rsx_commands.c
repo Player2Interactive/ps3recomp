@@ -121,8 +121,38 @@ void rsx_state_init(rsx_state* state)
 #define RSX_INLINE_MAX  4096
 static u32 s_inline_words[RSX_INLINE_MAX];
 static u32 s_inline_n;
+static int s_inline_imm; /* SET_VERTEX_DATA*M push; ignore leftover arrays */
 static u32 s_elem_idx[RSX_INLINE_MAX];
 static u32 s_elem_n;
+
+/* Immediate mode: writing position (attrib 0) inside BEGIN/END pushes one
+ * vertex from the current register file. Ice FMV (ACIT intro Bink) submits
+ * quads this way via 2S/2F, not DRAW_ARRAYS. Snapshot attrib 0+1 so a 2S
+ * texcoord written just before position is not lost as a shared constant. */
+static void rsx_imm_emit_attr0(rsx_state* state)
+{
+    if (!state->in_begin_end || s_inline_n + 8u > RSX_INLINE_MAX)
+        return;
+    for (int k = 0; k < 4; k++) {
+        u32 w;
+        memcpy(&w, &state->vertex_data4f[0][k], 4);
+        s_inline_words[s_inline_n++] = w;
+    }
+    for (int k = 0; k < 4; k++) {
+        u32 w;
+        memcpy(&w, &state->vertex_data4f[1][k], 4);
+        s_inline_words[s_inline_n++] = w;
+    }
+    s_inline_imm = 1;
+    { static unsigned n;
+      extern unsigned g_ovl183_put_n;
+      if (n++ < 16u)
+          fprintf(stderr,
+                  "[RSX] IMM-VTX n=%u pos=%.1f,%.1f uv=%.1f,%.1f words=%u bink=%u%c",
+                  n, state->vertex_data4f[0][0], state->vertex_data4f[0][1],
+                  state->vertex_data4f[1][0], state->vertex_data4f[1][1],
+                  s_inline_n, g_ovl183_put_n, 10); }
+}
 /* High local-memory scratch: past display tiles and the 640x640 RT. */
 #define RSX_INLINE_SCRATCH  0x0F000000u
 
@@ -143,26 +173,34 @@ static void rsx_flush_begin_end(rsx_state* state)
 {
     extern u8* vm_base;
     extern u32 cellGcmResolveLocated(int local, u32 offset);
-    if (!s_backend) { s_inline_n = 0; s_elem_n = 0; return; }
+    if (!s_backend) { s_inline_n = 0; s_inline_imm = 0; s_elem_n = 0; return; }
     if (s_inline_n) {
         u32 packed = 0;
         int any = 0;
-        for (int i = 0; i < RSX_MAX_VERTEX_ATTRIBS; i++)
-            if (state->vertex_attribs[i].enabled) {
-                packed += rsx_attrib_packed_bytes(&state->vertex_attribs[i]);
-                any = 1;
-            }
-        if (!packed) packed = 16;
+        int imm = s_inline_imm;
+        s_inline_imm = 0;
+        if (imm) {
+            packed = 32;
+            any = 0;
+        } else {
+            for (int i = 0; i < RSX_MAX_VERTEX_ATTRIBS; i++)
+                if (state->vertex_attribs[i].enabled) {
+                    packed += rsx_attrib_packed_bytes(&state->vertex_attribs[i]);
+                    any = 1;
+                }
+            if (!packed) packed = 16;
+        }
         u32 nbytes = s_inline_n * 4u;
         u32 count = packed ? nbytes / packed : 0;
         if (!count) { s_inline_n = 0; s_elem_n = 0; return; }
         u32 ea = cellGcmResolveLocated(1, RSX_INLINE_SCRATCH);
         { static int n = 0;
           if (n++ < 16)
-              fprintf(stderr, "[RSX] INLINE_ARRAY prim=%u words=%u packed=%u count=%u surf=0x%08X clip=%ux%u%c",
+              fprintf(stderr, "[RSX] INLINE_ARRAY prim=%u words=%u packed=%u count=%u surf=0x%08X clip=%ux%u%s%c",
                       state->primitive_type, s_inline_n, packed, count,
                       state->surface_color_offset[0],
-                      state->surface_clip_w, state->surface_clip_h, 10); }
+                      state->surface_clip_w, state->surface_clip_h,
+                      imm ? " (imm)" : "", 10); }
         if (vm_base && ea != 0xFFFFFFFFu) {
             u8* p = vm_base + ea;
             for (u32 i = 0; i < s_inline_n; i++) {
@@ -172,7 +210,19 @@ static void rsx_flush_begin_end(rsx_state* state)
             }
             rsx_vertex_attrib saved[RSX_MAX_VERTEX_ATTRIBS];
             memcpy(saved, state->vertex_attribs, sizeof(saved));
-            if (!any) {
+            if (imm) {
+                memset(state->vertex_attribs, 0, sizeof(state->vertex_attribs));
+                state->vertex_attribs[0].enabled = 1;
+                state->vertex_attribs[0].type = 2;
+                state->vertex_attribs[0].size = 4;
+                state->vertex_attribs[0].stride = 32;
+                state->vertex_attribs[0].offset = RSX_INLINE_SCRATCH;
+                state->vertex_attribs[1].enabled = 1;
+                state->vertex_attribs[1].type = 2;
+                state->vertex_attribs[1].size = 4;
+                state->vertex_attribs[1].stride = 32;
+                state->vertex_attribs[1].offset = RSX_INLINE_SCRATCH + 16u;
+            } else if (!any) {
                 state->vertex_attribs[0].enabled = 1;
                 state->vertex_attribs[0].type = 2;
                 state->vertex_attribs[0].size = 4;
@@ -225,6 +275,17 @@ static void rsx_flush_begin_end(rsx_state* state)
             state->index_array_dma = save_dma;
         }
         s_elem_n = 0;
+    } else {
+        extern unsigned g_ovl183_put_n;
+        if (g_ovl183_put_n) {
+            static unsigned n;
+            if (n++ < 16u)
+                fprintf(stderr,
+                        "[RSX] BEGIN_END empty prim=%u surf=0x%08X clip=%ux%u "
+                        "(no inline/elem)%c",
+                        state->primitive_type, state->surface_color_offset[0],
+                        state->surface_clip_w, state->surface_clip_h, 10);
+        }
     }
 }
 
@@ -337,12 +398,19 @@ static int process_texture_method(rsx_state* state, u32 method, u32 data)
     case 0x00: /* TEXTURE_OFFSET */
         tex->offset = data;
         { static int after = 0, n = 0;
+          u32 o = data & 0x7FFFFFFFu;
+          u32 rw = tex->image_rect >> 16, rh = tex->image_rect & 0xFFFF;
+          extern unsigned g_ovl183_put_n;
+          int bink = g_ovl183_put_n &&
+                     ((data & 0x80000000u) || (o >= 0x01000000u && o < 0x03000000u) ||
+                      rw == 1280u || (rw == 640u && rh == 360u));
           if (data >= 0x08000000u || rsx_hi_rt(state)) after = 1;
-          if ((data >= 0x08000000u || after) && n < 16) {
+          if (((data >= 0x08000000u || after) && n < 16) || (bink && n < 48)) {
               n++;
-              fprintf(stderr, "[TEXOFF] unit=%u off=0x%08X rect=%ux%u fmt=0x%X surf=0x%08X%c",
-                      unit, data, tex->image_rect >> 16, tex->image_rect & 0xFFFF,
-                      tex->format, state->surface_color_offset[0], 10); } }
+              fprintf(stderr, "[TEXOFF] unit=%u off=0x%08X rect=%ux%u fmt=0x%X surf=0x%08X%s%c",
+                      unit, data, rw, rh,
+                      tex->format, state->surface_color_offset[0],
+                      bink ? " (bink)" : "", 10); } }
         break;
     case 0x04: /* TEXTURE_FORMAT */
         tex->format = data;
@@ -736,6 +804,54 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->vertex_attrib_output_mask = data;
         return 0;
     }
+    /* NV4097_SET_VERTEX_DATA2F_M (0x1880): 16 attribs x 2 floats. Ice FMV
+     * writes attrib 3 = (1,1) as a shared current value inside BEGIN_END. */
+    if (method >= NV4097_SET_VERTEX_DATA2F_M &&
+        method < NV4097_SET_VERTEX_DATA2F_M + RSX_MAX_VERTEX_ATTRIBS * 8u) {
+        u32 idx  = (method - NV4097_SET_VERTEX_DATA2F_M) >> 3;
+        u32 lane = ((method - NV4097_SET_VERTEX_DATA2F_M) >> 2) & 1u;
+        float f; memcpy(&f, &data, 4);
+        state->vertex_data4f[idx][lane] = f;
+        if (lane == 1u) {
+            state->vertex_data4f[idx][2] = 0.0f;
+            state->vertex_data4f[idx][3] = 1.0f;
+            if (idx == 0)
+                rsx_imm_emit_attr0(state);
+        }
+        return 0;
+    }
+    /* NV4097_SET_VERTEX_DATA2S_M (0x1900): 16 attribs x packed s16 x,y.
+     * Ice FMV quads: attrib 0 = position, attrib 1 = texcoord. CELL SDK packs
+     * y in the high half. One write completes the pair -> emit on attrib 0. */
+    if (method >= NV4097_SET_VERTEX_DATA2S_M &&
+        method < NV4097_SET_VERTEX_DATA2S_M + RSX_MAX_VERTEX_ATTRIBS * 4u) {
+        u32 idx = (method - NV4097_SET_VERTEX_DATA2S_M) >> 2;
+        s16 x = (s16)(data & 0xFFFFu);
+        s16 y = (s16)(data >> 16);
+        state->vertex_data4f[idx][0] = (float)x;
+        state->vertex_data4f[idx][1] = (float)y;
+        state->vertex_data4f[idx][2] = 0.0f;
+        state->vertex_data4f[idx][3] = 1.0f;
+        if (idx == 0)
+            rsx_imm_emit_attr0(state);
+        { static unsigned n;
+          extern unsigned g_ovl183_put_n;
+          if (g_ovl183_put_n && n++ < 24u)
+              fprintf(stderr, "[RSX] V2S attr=%u x=%d y=%d%c", idx, (int)x, (int)y, 10); }
+        return 0;
+    }
+    /* NV4097_SET_VERTEX_DATA4UB_M (0x1940): current colour, 0..255 -> 0..1. */
+    if (method >= NV4097_SET_VERTEX_DATA4UB_M &&
+        method < NV4097_SET_VERTEX_DATA4UB_M + RSX_MAX_VERTEX_ATTRIBS * 4u) {
+        u32 idx = (method - NV4097_SET_VERTEX_DATA4UB_M) >> 2;
+        state->vertex_data4f[idx][0] = (float)(data & 0xFFu) / 255.0f;
+        state->vertex_data4f[idx][1] = (float)((data >> 8) & 0xFFu) / 255.0f;
+        state->vertex_data4f[idx][2] = (float)((data >> 16) & 0xFFu) / 255.0f;
+        state->vertex_data4f[idx][3] = (float)((data >> 24) & 0xFFu) / 255.0f;
+        if (idx == 0)
+            rsx_imm_emit_attr0(state);
+        return 0;
+    }
     /* NV4097_SET_VERTEX_DATA4F_M (0x1C00): the constant/"current" value for each
      * vertex attribute, 16 attributes x 4 floats. The hardware feeds this to
      * every vertex when the attribute's ARRAY is disabled -- it is not zero.
@@ -743,9 +859,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * Rubber Ducky leaves attribute 3 (diffuse colour) disabled and sets it here
      * instead; its duck shader computes (lighting * col0) * texture + spec, so a
      * zero col0 multiplies the texture away and the ducks rendered as a dim grey
-     * specular term only -- present in the framebuffer, invisible on screen.
-     * SET_VERTEX_DATA2F/4UB/2S/4S are the other encodings of the same register
-     * file; add them if a title needs them. */
+     * specular term only -- present in the framebuffer, invisible on screen. */
     if (method >= 0x1C00u && method < 0x1C00u + RSX_MAX_VERTEX_ATTRIBS * 16u) {
         u32 idx  = (method - 0x1C00u) >> 4;         /* attribute */
         u32 lane = ((method - 0x1C00u) >> 2) & 3;   /* x/y/z/w   */
@@ -820,16 +934,21 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method == NV4097_SET_BEGIN_END) {
         if (data != 0) {
             s_inline_n = 0;
+            s_inline_imm = 0;
             s_elem_n = 0;
             state->primitive_type = data;
             state->in_begin_end = 1;
             state->begin_epoch++;
             { static int after = 0, n = 0;
+              extern unsigned g_ovl183_put_n;
+              int disp = (state->surface_clip_w == 1280u && state->surface_clip_h == 720u);
               if (rsx_hi_rt(state)) after = 1;
-              if (after && n++ < 16)
-                  fprintf(stderr, "[RSX] BEGIN_END prim=%u surf=0x%08X clip=%ux%u%c",
+              if ((after && n < 16) || (g_ovl183_put_n && disp && n < 40)) {
+                  n++;
+                  fprintf(stderr, "[RSX] BEGIN_END prim=%u surf=0x%08X clip=%ux%u%s%c",
                           data, state->surface_color_offset[0],
-                          state->surface_clip_w, state->surface_clip_h, 10); }
+                          state->surface_clip_w, state->surface_clip_h,
+                          (g_ovl183_put_n && disp) ? " (bink-disp)" : "", 10); } }
 
             /* Flush dirty state to backend before drawing */
             if (s_backend) {

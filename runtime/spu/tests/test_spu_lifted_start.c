@@ -921,6 +921,9 @@ uint64_t ps3_ms_now(void)                        { return 0; }
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
 int      g_resv_store_active = 0;
 int      g_barrier_sync_watch = 0;
+uint32_t g_ovl183_put_ea;
+uint32_t g_ovl183_put_size;
+unsigned g_ovl183_put_n;
 
 /* Title-specific SPURS hooks the SPU half offers but nothing here installs. */
 void (*g_spurs_kernel_hook)(uint32_t) = 0;

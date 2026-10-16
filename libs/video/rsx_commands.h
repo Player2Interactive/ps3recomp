@@ -112,6 +112,15 @@ extern "C" {
 /* Vertex attributes */
 #define NV4097_SET_VERTEX_DATA_ARRAY_FORMAT     0x00001740
 #define NV4097_SET_VERTEX_DATA_ARRAY_OFFSET     0x00001680
+/* Immediate / current vertex register file (CELL_GCM / envytools). Ice FMV
+ * quads write 2F+2S inside BEGIN_END instead of DRAW_ARRAYS. */
+#define NV4097_SET_VERTEX_DATA3F_M              0x00001500
+#define NV4097_SET_VERTEX_DATA2F_M              0x00001880
+#define NV4097_SET_VERTEX_DATA2S_M              0x00001900
+#define NV4097_SET_VERTEX_DATA4UB_M             0x00001940
+#define NV4097_SET_VERTEX_DATA4S_M              0x00001980
+#define NV4097_SET_VERTEX_DATA4F_M              0x00001C00
+#define NV4097_SET_VERTEX_DATA1F_M              0x00001E40
 
 /* Texture */
 #define NV4097_SET_TEXTURE_OFFSET               0x00001A00

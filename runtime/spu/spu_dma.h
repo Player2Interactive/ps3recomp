@@ -882,9 +882,15 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                           ovl183 ? "ovl-183" : "fb-PUT", *np,
                           spu->image_id, spu->resident_ovl,
                           spu->resident_code[0].image_id, e, size, lsa, pc);
-              /* Decode rows (0x1400=one 1280xRGBA line). Next stall: these
-               * land in 0x21xxxxxx, never GCM local 0xC0000000. */
+              /* Decode rows (0x1400=one 1280xRGBA line). Dest is IO-mapped
+               * main 0x21xxxxxx; Ice AddressToOffset (0x005C6B0C) tags MAIN
+               * with bit 31 so RSX can sample / m2mf them into scanout. */
               if (ovl183 && size >= 0x1000u && (pc == 0x400u || pc == 0x4A0u)) {
+                  { extern u32 g_ovl183_put_ea, g_ovl183_put_size;
+                    extern unsigned g_ovl183_put_n;
+                    g_ovl183_put_ea = e;
+                    g_ovl183_put_size = size;
+                    g_ovl183_put_n++; }
                   static unsigned n183pnz;
                   if (++n183pnz <= 8u) {
                       const uint8_t* t = (const uint8_t*)ls_ptr;
