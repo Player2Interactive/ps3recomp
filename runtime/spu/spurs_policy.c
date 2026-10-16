@@ -95,6 +95,56 @@ int acit_ovl12_pm_snap(int spu, uint32_t* pc, uint32_t* resv_ea,
     return 1;
 }
 
+/* Snapshot of a persistent PM lane (any workload). Hang censuses use this
+ * to say WHERE a policy module that never exits to the kernel is sitting. */
+int spurs_pm_snap(uint32_t wid, unsigned spu, uint32_t* pc, uint32_t* lr,
+                  uint32_t* resv_ea, int* resv_valid, uint32_t* r3)
+{
+    spu_context* c;
+    if (wid >= SPURS_PM_MAX_WKL || spu >= 6) return 0;
+    c = s_pm_ctx[wid][spu];
+    if (!c || !c->ls) return 0;
+    if (pc) *pc = (uint32_t)c->pc & SPU_LS_MASK;
+    if (lr) *lr = c->gpr[0]._u32[0] & SPU_LS_MASK;
+    if (resv_ea) *resv_ea = c->resv_ea;
+    if (resv_valid) *resv_valid = c->resv_valid;
+    if (r3) *r3 = c->gpr[3]._u32[0];
+    return 1;
+}
+
+/* WwsJob g_WwsJob_loadJobState at LS 0x12A0 (u16). 0 = kNone / idle poll.
+ * GetWorkloadInfo uses this so an async never-exiting PM is not reported as
+ * "still processing a kick" when it is just parked on an empty joblist. */
+int spurs_pm_wws_loadstate(uint32_t wid)
+{
+    spu_context* c;
+    const uint8_t* p;
+    unsigned i;
+    if (wid >= SPURS_PM_MAX_WKL) return -1;
+    c = s_pm_ctx[wid][0];
+    if (!c || !c->ls) return -1;
+    p = c->ls + 0x12A0;
+    for (i = 0; i < 16; i++)
+        if (p[i]) return 1;
+    return 0;
+}
+
+/* Big-endian u32 from a persistent PM local store. Hang censuses use this
+ * to print WwsJob pipeline words (eaWorkLoad@0x13F0, jobHeader@0x1420, …)
+ * without planting guest state. */
+int spurs_pm_ls32(uint32_t wid, uint32_t ls_off, uint32_t* out)
+{
+    spu_context* c;
+    const uint8_t* p;
+    if (wid >= SPURS_PM_MAX_WKL || !out) return 0;
+    c = s_pm_ctx[wid][0];
+    if (!c || !c->ls) return 0;
+    p = c->ls + (ls_off & SPU_LS_MASK);
+    *out = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+         | ((uint32_t)p[2] << 8) | p[3];
+    return 1;
+}
+
 static uint32_t ovl12_ls_be32(const spu_context* c, uint32_t lsa)
 {
     const uint8_t* p = c->ls + (lsa & SPU_LS_MASK);

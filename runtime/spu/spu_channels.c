@@ -686,6 +686,21 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           } }
         ctx->resv_valid = 0;                           /* reservation consumed */
         spu_lockline_unlock();
+        /* WwsJob 00003698/00003488 CAS the CellSpurs instance line from every
+         * enabled image-10 module at once. Two host threads GETLLAR the same
+         * 128B, the first PUTLLC succeeds, the loser retries immediately -- at
+         * host speed that livelocks two cores and starves the PPU (seizureCard
+         * never advances). Hardware retry has pipeline delay; Sleep(0) is the
+         * equivalent so a peer commit can land. */
+        if (ctx->atomic_stat == MFC_PUTLLC_FAILURE) {
+            static int _n;
+            if (_n++ < 8) {
+                fprintf(stderr, "[spu-atomic] PUTLLC fail ea=0x%08X pc=0x%05X img=%d "
+                        "(yield)\n", ea, (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id);
+                fflush(stderr);
+            }
+            Sleep(0);
+        }
         return 1;
 
     case MFC_PUTLLUC_CMD:

@@ -1391,14 +1391,17 @@ s32 cellSpursWorkloadAttributeInitialize(CellSpursWorkloadAttribute* attr,
 }
 
 /* ---------------------------------------------------------------------------
- * The SPURS "kernel": one host poll thread per instance (the virtual SPU).
+ * The SPURS "kernel": one host poll thread per instance.
  *
  * The game kicks work by storing a nonzero wklReadyCount1[wid] byte or a
  * wklSignal1 bit into the instance — mostly with INLINED atomics (LBP never
  * calls an API for it beyond cellSpursReadyCountStore). The kernel thread
- * polls those real BE fields, consumes one ready unit (decrement / clear the
- * signal bit, like the real kernel's dispatch), and runs the workload's
- * policy module to completion via spu_run_policy_module.
+ * polls those real BE fields and starts each enabled workload's policy module
+ * on its own host thread. A never-exiting PM (wwsjob idle GETLLAR, igPm
+ * overlay wait) must not occupy the poll thread: ACIT's "" instance hosts
+ * SharedList0/1 AND the SCREAM synth (wid=3, joblist 0x01027580), and a
+ * synchronous run of SharedList0 starved the synth so 00718898 tags never
+ * advanced and 009762E0 waited forever.
  * -----------------------------------------------------------------------*/
 typedef struct {
     spu_lifted_entry_fn fn;
@@ -1452,6 +1455,73 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     struct spurs_pm_worker_arg* a = (struct spurs_pm_worker_arg*)p;
     spu_run_policy_module(a->fn, a->image_id, a->pm, a->pm_size,
                           a->arg, a->wid, a->ea, a->spu_num);
+    return 0;
+}
+
+/* Per-(instance,wid) occupancy: a parked PM keeps this set so the poll
+ * thread can start sibling wids. Cleared only when the quantum returns. */
+static volatile long s_wid_running[MAX_SPURS_INST][CELL_SPURS_MAX_WORKLOAD];
+static u8 s_wkl_idle[CELL_SPURS_MAX_WORKLOAD];
+
+struct spurs_wid_run_arg {
+    spu_lifted_entry_fn fn;
+    int image_id;
+    const uint8_t* pm;
+    uint32_t pm_size;
+    uint64_t arg;
+    uint32_t wid, ea;
+    u8 maxcont;
+    int slot;
+};
+
+static void spurs_run_wid_lanes(struct spurs_wid_run_arg* a)
+{
+    if (a->maxcont <= 1) {
+        spu_run_policy_module(a->fn, a->image_id, a->pm, a->pm_size,
+                              a->arg, a->wid, a->ea, 0);
+        return;
+    }
+    /* Extra lanes stay on this quantum thread's stack: they join before
+     * we return, same as the old synchronous kernel path. */
+    HANDLE th[8];
+    struct spurs_pm_worker_arg wa[8];
+    unsigned nth = 0;
+    u32 sn;
+    for (sn = 1; sn < a->maxcont && nth < 7; sn++, nth++) {
+        wa[nth].fn = a->fn;
+        wa[nth].image_id = a->image_id;
+        wa[nth].pm = a->pm;
+        wa[nth].pm_size = a->pm_size;
+        wa[nth].arg = a->arg;
+        wa[nth].wid = a->wid;
+        wa[nth].ea = a->ea;
+        wa[nth].spu_num = sn;
+        th[nth] = CreateThread(NULL, 1u << 20, spurs_pm_worker, &wa[nth], 0, NULL);
+    }
+    spu_run_policy_module(a->fn, a->image_id, a->pm, a->pm_size,
+                          a->arg, a->wid, a->ea, 0);
+    if (nth) {
+        WaitForMultipleObjects(nth, th, TRUE, INFINITE);
+        for (unsigned k = 0; k < nth; k++) CloseHandle(th[k]);
+    }
+}
+
+static DWORD WINAPI spurs_wid_run(LPVOID p)
+{
+#ifdef _WIN32
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+#endif
+    struct spurs_wid_run_arg* a = (struct spurs_wid_run_arg*)p;
+    extern volatile unsigned g_spurs_pm_polls;
+    spurs_run_wid_lanes(a);
+    *(vm_base + a->ea + SPURS_WKL_CURCONT + a->wid) = 0;
+    if (g_spurs_pm_polls == 0) {
+        if (s_wkl_idle[a->wid] < 8) s_wkl_idle[a->wid]++;
+    } else {
+        s_wkl_idle[a->wid] = 0;
+    }
+    InterlockedExchange(&s_wid_running[a->slot][a->wid], 0);
+    free(a);
     return 0;
 }
 
@@ -1549,23 +1619,33 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              * ever called cellSpursEventFlagSet and the title's loading thread
              * blocked forever.
              *
-             * Run one scheduling quantum per enabled workload per pass: the
-             * module does its work, exits to the kernel (LS 0x9C0) when it has
-             * none, and we re-enter it on the next pass -- which is exactly what
-             * the real kernel's dispatch loop does.
+             * A module that never exits (empty wwsjob SharedList GETLLAR, igPm
+             * overlay ch0 wait) used to occupy this poll thread, so later wids
+             * on the same instance never started. Run the quantum on a sideline
+             * thread and only re-enter after exit-to-kernel.
              *
              * readyCount/wklSignal are still honoured when a title DOES use them:
              * consume one unit so a kick-driven title paces the same as before. */
+            int slot = (int)(si - s_inst);
+            if (slot < 0 || slot >= MAX_SPURS_INST) continue;
+            if (s_wid_running[slot][wid]) {
+                /* Persistent PMs never return, so later ReadyCount pokes would
+                 * sit unconsumed. GetWorkloadInfo.readyCount then stays 1 and
+                 * SCREAM's 00718D20 treats that as "SPU still working on a
+                 * kick" even when the module is idle on an empty joblist. */
+                volatile u8* rdy_skip = vm_base + ea + SPURS_WKL_READY1 + wid;
+                u32 sig_skip = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;
+                if (*rdy_skip) *rdy_skip = 0;
+                if (sig_skip & (0x8000u >> wid))
+                    vm_write32(ea + SPURS_WKL_SIGNAL1,
+                               (vm_read32(ea + SPURS_WKL_SIGNAL1)
+                                & ~((0x8000u >> wid) << 16)));
+                continue;
+            }
+
             volatile u8* rdy = vm_base + ea + SPURS_WKL_READY1 + wid;
             u32 sig = vm_read32(ea + SPURS_WKL_SIGNAL1) >> 16;    /* be u16 @0x70 */
             int kicked = (*rdy != 0) || ((sig & (0x8000u >> wid)) != 0);
-            if (*rdy) (*rdy)--;
-            if (sig & (0x8000u >> wid))
-                vm_write32(ea + SPURS_WKL_SIGNAL1,
-                           (vm_read32(ea + SPURS_WKL_SIGNAL1) & ~((0x8000u >> wid) << 16)));
-
-            WklPm* r = spurs_resolve_pm(wid);
-            if (!r) continue;
 
             /* Idle backoff: running EVERY enabled workload's module EVERY 1ms
              * pass (x N instance threads) burned ~5 host cores on modules that
@@ -1574,19 +1654,27 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
              * A module that keeps finding nothing gets re-run every 2nd, 4th,
              * ... up to 16th pass; an explicit kick (readyCount/signal) resets
              * it to every pass, so kick-driven latency is unchanged. */
+            if (kicked) s_wkl_idle[wid] = 0;
             {
-                static u8 s_idle[CELL_SPURS_MAX_WORKLOAD];      /* idle streak (log2 cadence) */
-                if (kicked) s_idle[wid] = 0;
-                u32 cad = 1u << (s_idle[wid] > 4 ? 4 : s_idle[wid]);
+                u32 cad = 1u << (s_wkl_idle[wid] > 4 ? 4 : s_wkl_idle[wid]);
                 if (!kicked && (pass & (cad - 1)) != 0) continue;
-                extern volatile unsigned g_spurs_pm_polls;
-                u32 polls_before = g_spurs_pm_polls;   /* heuristic only */
-                (void)polls_before;
+            }
+
+            WklPm* r = spurs_resolve_pm(wid);
+            if (!r) continue;
+
+            if (InterlockedCompareExchange(&s_wid_running[slot][wid], 1, 0) != 0)
+                continue;
+
+            if (*rdy) (*rdy)--;
+            if (sig & (0x8000u >> wid))
+                vm_write32(ea + SPURS_WKL_SIGNAL1,
+                           (vm_read32(ea + SPURS_WKL_SIGNAL1) & ~((0x8000u >> wid) << 16)));
 
             {   static int _n = 0;
-                if (_n < 8) { _n++;
+                if (_n < 16) { _n++;
                     fprintf(stderr, "[spurs-kern] \"%s\" dispatch wid=%u (enabled, state=2) "
-                                    "image=%d ready=%u\n", si->prefix, wid, r->image_id, *rdy);
+                                    "image=%d ready=%u async\n", si->prefix, wid, r->image_id, *rdy);
                     fflush(stderr); } }
 
             /* Live workload arg from the real wklInfo (the game may update it). */
@@ -1627,38 +1715,30 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
               if (s_fs > 0) maxcont = (u8)(s_fs > 6 ? 6 : s_fs); }
             *(vm_base + ea + SPURS_WKL_CURCONT + wid) = maxcont;
             {
-                const uint8_t* pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm;
-                uint32_t sz = s_workloads[wid].sizePm;
-                if (maxcont <= 1) {
-                    spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
-                } else {
-                    /* Run the workload's virtual SPUs CONCURRENTLY (see
-                     * spurs_pm_worker): each lane advances in parallel so the
-                     * cross-SPU barrier resolves. Spawn maxcont-1 workers for
-                     * lanes 1..N-1 and run lane 0 on this thread, then join. */
-                    HANDLE th[8]; struct spurs_pm_worker_arg wa[8];
-                    unsigned nth = 0;
-                    for (u32 sn = 1; sn < maxcont && nth < 7; sn++, nth++) {
-                        wa[nth].fn = r->fn; wa[nth].image_id = r->image_id;
-                        wa[nth].pm = pm; wa[nth].pm_size = sz;
-                        wa[nth].arg = arg; wa[nth].wid = wid; wa[nth].ea = ea;
-                        wa[nth].spu_num = sn;
-                        th[nth] = CreateThread(NULL, 1u << 20, spurs_pm_worker, &wa[nth], 0, NULL);
-                    }
-                    spu_run_policy_module(r->fn, r->image_id, pm, sz, arg, wid, ea, 0);
-                    if (nth) {
-                        WaitForMultipleObjects(nth, th, TRUE, INFINITE);
-                        for (unsigned k = 0; k < nth; k++) CloseHandle(th[k]);
-                    }
+                struct spurs_wid_run_arg* wa = (struct spurs_wid_run_arg*)malloc(sizeof(*wa));
+                HANDLE th;
+                if (!wa) {
+                    *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
+                    InterlockedExchange(&s_wid_running[slot][wid], 0);
+                    continue;
                 }
-            }
-            *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
-            /* "Found work" heuristic: a module that did something polls the
-             * kernel for MORE work before exiting (selectWorkload calls >0);
-             * an idle module exits immediately with polls==0. Grow the idle
-             * streak on the latter, reset on the former. */
-            if (g_spurs_pm_polls == 0) { if (s_idle[wid] < 8) s_idle[wid]++; }
-            else s_idle[wid] = 0;
+                wa->fn = r->fn;
+                wa->image_id = r->image_id;
+                wa->pm = (const uint8_t*)vm_base + (uint32_t)(uintptr_t)s_workloads[wid].pm;
+                wa->pm_size = s_workloads[wid].sizePm;
+                wa->arg = arg;
+                wa->wid = wid;
+                wa->ea = ea;
+                wa->maxcont = maxcont;
+                wa->slot = slot;
+                th = CreateThread(NULL, 1u << 20, spurs_wid_run, wa, 0, NULL);
+                if (!th) {
+                    *(vm_base + ea + SPURS_WKL_CURCONT + wid) = 0;
+                    InterlockedExchange(&s_wid_running[slot][wid], 0);
+                    free(wa);
+                    continue;
+                }
+                CloseHandle(th);
             }
         }
     }
@@ -3006,6 +3086,28 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
     *(vm_base + base + 0x24) = *(vm_base + se + SPURS_WKL_IDLE2  + wid);   /* idleSpuRequest */
     u32 sig = vm_read32(se + SPURS_WKL_SIGNAL1) >> 16;
     *(vm_base + base + 0x25) = (sig & (0x8000u >> wid)) ? 1 : 0;           /* hasSignal    */
+    /* WwsJob (image 10) is a persistent PM. CURCONT stays maxContention for
+     * the whole sideline thread, and an idle module's loadJobState is 0.
+     * SCREAM 00718D20 (via this struct at +0x20/+0x23) returns "still busy"
+     * unless currentContention==0 && readyCount==0, which blocked syn_tick
+     * from publishing the jobs that would advance 00718898 lane-3 tags. */
+    {
+        WklPm* r = spurs_resolve_pm(wid);
+        if (r && r->image_id == 10) {
+            extern int spurs_pm_wws_loadstate(uint32_t wid);
+            int st = spurs_pm_wws_loadstate(wid);
+            if (st <= 0) {
+                static int _idle_n = 0;
+                if (_idle_n++ < 8)
+                    fprintf(stderr,
+                            "[cellSpurs] GetWorkloadInfo wid=%u WwsJob idle "
+                            "loadstate=%d -> contention=0 readyCount=0\n",
+                            wid, st);
+                *(vm_base + base + 0x20) = 0;
+                *(vm_base + base + 0x23) = 0;
+            }
+        }
+    }
     return CELL_OK;
 }
 

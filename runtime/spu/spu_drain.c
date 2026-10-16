@@ -366,7 +366,31 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
         fn(ctx);
     }
     if ((ctx->pc & SPU_LS_MASK) != (return_pc & SPU_LS_MASK)) {
+        /* SPU_RET stores pc=r0. The lifter plants the brsl link in r78
+         * (attach 2668/2698) or r6 (AllocateJob 2418 from 3038) while the
+         * helper still does `bi $r0`, so r0 is stale:
+         *   0x2C44 — unlifted mid-2BF0; restart interprets/halts, never 2C60
+         *   0x2CF0 — idle, not 0x3048/0x3078; restart abandons 3038 so the
+         *            job 2418 found is never launched
+         * Resume the C frame for those. Other mismatches still restart
+         * (WwsJob idle 2D20/2808 uses r0 as a real tail target). */
         extern void spu_restart_dispatch(spu_context*);
-        spu_restart_dispatch(ctx);
+        extern int spu_have_function(uint32_t addr);
+        uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+        uint32_t ret = return_pc & SPU_LS_MASK;
+        int resume_caller = !spu_have_function(pc)
+            || ((pc == 0x2CF0u || pc == 0x2CF8u)
+                && (ret == 0x3048u || ret == 0x3078u));
+        if (resume_caller) {
+            static int _n;
+            if (_n++ < 16) {
+                fprintf(stderr, "[spu-drain] skip restart pc=0x%05X ret=0x%05X "
+                        "img=%d (stale r0, resume caller)\n",
+                        pc, ret, ctx->image_id);
+                fflush(stderr);
+            }
+        } else {
+            spu_restart_dispatch(ctx);
+        }
     }
 }
