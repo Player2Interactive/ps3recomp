@@ -115,17 +115,24 @@ typedef struct CellSaveDataDirList {
     char reserved[8];
 } CellSaveDataDirList;
 
+typedef struct CellSaveDataListNewData CellSaveDataListNewData;
+
+/* PS3 ABI (32-bit pointers): dirNum, dirListNum, dirList*, reserved[64] = 0x4C. */
 typedef struct CellSaveDataListGet {
+    u32  dirNum;
     u32  dirListNum;
     CellSaveDataDirList* dirList;
+    char reserved[64];
 } CellSaveDataListGet;
 
+/* PS3 ABI: focusPosition, focusDirName*, fixedListNum, fixedList*, newData*, reserved = 0x18. */
 typedef struct CellSaveDataListSet {
     u32  focusPosition;
     char* focusDirName;
     u32  fixedListNum;
     CellSaveDataDirList* fixedList;
-    char reserved[12];
+    CellSaveDataListNewData* newData;
+    u32  reserved;
 } CellSaveDataListSet;
 
 typedef struct CellSaveDataFixedSet {
