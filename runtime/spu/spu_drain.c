@@ -464,6 +464,23 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             || ((pc == 0x2CF0u || pc == 0x2CF8u)
                 && (ret == 0x3048u || ret == 0x3078u))
             || planted;
+        if (ret == 0x3F940u) {
+            static int _o;
+            if (_o++ < 32) {
+                const uint8_t* t = ctx->ls + 0x18100;
+                fprintf(stderr,
+                        "[ovl-183] drain 3F940 n=%d pc=0x%05X owns=%d resume=%d img=%d "
+                        "code=%d/%d/%d/%d LS[18100]=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                        _o, pc, spu_context_owns_pc(ctx, pc), resume_caller,
+                        ctx->image_id,
+                        ctx->resident_code[0].image_id,
+                        ctx->resident_code[1].image_id,
+                        ctx->resident_code[2].image_id,
+                        ctx->resident_code[3].image_id,
+                        t[0],t[1],t[2],t[3], t[4],t[5],t[6],t[7]);
+                fflush(stderr);
+            }
+        }
         if (resume_caller) {
             static int _n;
             if (_n++ < 64) {

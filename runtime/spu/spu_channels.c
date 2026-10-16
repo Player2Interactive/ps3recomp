@@ -1643,11 +1643,26 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].source_ea = claim_ea;
                     ctx->resident_code[slot].image_id = o->image_id;
                     { static int _n = 0;
-                      if (_n++ < 48)
+                      int log183 = (o->image_id == 183);
+                      static int _n183;
+                      if (_n++ < 48 || (log183 && _n183++ < 24))
                           fprintf(stderr, "[spu-ovl] span claim img=%d src=0x%08X -> LS 0x%05X "
-                                  "span=0x%X -> code image %d pc=0x%05X size=%u\n",
+                                  "span=0x%X -> code image %d pc=0x%05X size=%u%s\n",
                                   ctx->image_id, claim_ea, claim_lsa, o->span, o->image_id,
-                                  (uint32_t)ctx->pc & SPU_LS_MASK, size);
+                                  (uint32_t)ctx->pc & SPU_LS_MASK, size,
+                                  (log183 && size < o->span) ? " (partial GET)" : "");
+                      if (log183 && _n183 <= 24) {
+                          const uint8_t* t = ctx->ls + 0x18100;
+                          fprintf(stderr,
+                                  "[ovl-183] claim src=0x%08X lsa=0x%05X get=0x%X span=0x%X "
+                                  "pc=0x%05X LS[18100]=%02X%02X%02X%02X %02X%02X%02X%02X "
+                                  "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                                  claim_ea, lsa, size, o->span,
+                                  (uint32_t)ctx->pc & SPU_LS_MASK,
+                                  t[0],t[1],t[2],t[3], t[4],t[5],t[6],t[7],
+                                  t[8],t[9],t[10],t[11], t[12],t[13],t[14],t[15]);
+                          fflush(stderr);
+                      }
                       if (o->image_id == 178 || ea == 0x00B5FC80u) {
                           const uint8_t* p = ctx->ls + 0x1F00;
                           fprintf(stderr,
@@ -2222,6 +2237,23 @@ void spu_indirect_branch(spu_context* ctx)
                         "%02X%02X%02X%02X %02X%02X%02X%02X\n",
                         p, ctx->gpr[0]._u32[0] & SPU_LS_MASK, code_owner, fn ? 1 : 0,
                         ctx->image_id, ctx->resident_ovl,
+                        ctx->gpr[3]._u32[0], ctx->gpr[12]._u32[0],
+                        t[0],t[1],t[2],t[3], t[4],t[5],t[6],t[7],
+                        t[8],t[9],t[10],t[11], t[12],t[13],t[14],t[15]);
+                fflush(stderr);
+            }
+        }
+        if (p == 0x598u || p == 0x59Cu || p == 0x620u || p == 0x638u || p == 0x508u
+            || code_owner == 183) {
+            static int _n183 = 0;
+            if (_n183++ < 32) {
+                const uint8_t* t = ctx->ls + 0x18100;
+                fprintf(stderr,
+                        "[ovl-183] disp n=%d pc=0x%05X lr=0x%05X owner=%d fn=%d img=%d "
+                        "r3=%08X r12=%08X LS[18100]=%02X%02X%02X%02X %02X%02X%02X%02X "
+                        "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                        _n183, p, ctx->gpr[0]._u32[0] & SPU_LS_MASK, code_owner,
+                        fn ? 1 : 0, ctx->image_id,
                         ctx->gpr[3]._u32[0], ctx->gpr[12]._u32[0],
                         t[0],t[1],t[2],t[3], t[4],t[5],t[6],t[7],
                         t[8],t[9],t[10],t[11], t[12],t[13],t[14],t[15]);

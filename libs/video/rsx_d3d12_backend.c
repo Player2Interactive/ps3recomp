@@ -3788,7 +3788,11 @@ static void guest_fb_present(u32 fi)
             return;
         }
         if (s_composite_src) return;
-        if (s_ever_display_draw) return;
+        /* Empty SetFlip after FE 3D (Bink / 2D blit into the GCM scanout):
+         * the 3D path wrote D3D RTs, so s_ever_display_draw is sticky, but
+         * this batch has no display draws -- copy the buffer the guest is
+         * flipping. Still skip when THIS batch rasterized display 3D
+         * (s_rf_had_display) so a later 3D frame is not overwritten. */
         u32 lea = 0, o = 0, p = 0, w = 0, h = 0;
         if (!cellGcm_scanout_info(&lea, &o, &p, &w, &h) || !w || !h || !p)
             return;
@@ -4365,8 +4369,23 @@ static void render_frame(void)
 
     /* Swapchain is FLIP_DISCARD: copying the previously presented buffer is
      * undefined. Offscreen-only batches therefore leave the last Present()
-     * on the compositor and do not touch the backbuffer. */
-    s_present_this_frame = (s_rf_had_display || s_composite_src || !s_ever_display_draw);
+     * on the compositor and do not touch the backbuffer.
+     * Empty SetFlip after FE 3D (no geom in this batch) is the Bink/2D path:
+     * present the GCM scanout rather than freezing the last D3D frame. */
+    {
+        int geom = 0;
+        extern unsigned cellGcm_flip_request_count(void);
+        for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++)
+            if (!s_d3d.draws[_i].is_clear) { geom = 1; break; }
+        s_present_this_frame = (s_rf_had_display || s_composite_src || !s_ever_display_draw
+                                || (!geom && cellGcm_flip_request_count() != 0));
+        if (!geom && !s_rf_had_display && s_ever_display_draw) {
+            static unsigned n = 0;
+            if (++n <= 8u || (n % 60u) == 0u)
+                fprintf(stderr, "[present] empty-flip scanout n=%u flip=%u%c",
+                        n, cellGcm_flip_request_count(), 10);
+        }
+    }
 
     D3D12_RESOURCE_BARRIER barrier = {0};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

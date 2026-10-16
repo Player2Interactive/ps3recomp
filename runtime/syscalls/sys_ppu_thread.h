@@ -104,6 +104,8 @@ void sys_ppu_thread_init(lv2_syscall_table* tbl);
 
 /* Guest PPU thread table dump for hang census (stderr). */
 void ppu_dump_threads(const char* tag);
+/* Guest stacks for Bink / occupancy-wait threads (stderr). */
+void ppu_dump_thread_stacks(const char* tag);
 
 #ifdef __cplusplus
 }

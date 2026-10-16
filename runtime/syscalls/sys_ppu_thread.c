@@ -126,6 +126,44 @@ void ppu_dump_threads(const char* tag)
     fflush(stderr);
 }
 
+void ppu_dump_thread_stacks(const char* tag)
+{
+    struct {
+        ppu_context ctx;
+        char name[32];
+        uint32_t prof;
+    } snap[8];
+    int n = 0, i;
+    extern void ppu_dump_guest_stack(ppu_context* ctx, const char* tag);
+    if (!tag) tag = "?";
+    table_lock();
+    for (i = 0; i < PPU_THREAD_MAX && n < 8; i++) {
+        ppu_thread_info* t = &g_ppu_threads[i];
+        uint32_t prof;
+        int want;
+        if (t->state == PPU_THREAD_STATE_FREE) continue;
+        prof = t->prof_pc;
+        want = (t->name[0] && strstr(t->name, "Bink") != NULL)
+            || (t->name[0] && strcmp(t->name, "main") == 0)
+            || (prof >= 0x00696000u && prof < 0x00697000u)
+            || (prof >= 0x00D1F000u && prof < 0x00D20000u);
+        if (!want) continue;
+        snap[n].ctx = t->ctx;
+        snap[n].prof = prof;
+        strncpy(snap[n].name, t->name[0] ? t->name : "?", sizeof snap[n].name - 1);
+        snap[n].name[sizeof snap[n].name - 1] = 0;
+        n++;
+    }
+    table_unlock();
+    for (i = 0; i < n; i++) {
+        char tbuf[48];
+        snprintf(tbuf, sizeof tbuf, "%s/%s", tag, snap[i].name);
+        fprintf(stderr, "[sg-stack] %s prof=0x%08X\n", tbuf, snap[i].prof);
+        ppu_dump_guest_stack(&snap[i].ctx, tbuf);
+    }
+    fflush(stderr);
+}
+
 /* ---------------------------------------------------------------------------
  * Host thread entry point
  * -----------------------------------------------------------------------*/

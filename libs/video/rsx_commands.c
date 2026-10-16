@@ -761,6 +761,11 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
                 u32 w; memcpy(&w, &state->vertex_data4f[0][k], 4);
                 s_inline_words[s_inline_n++] = w;
             }
+        } else if (state->in_begin_end && idx == 0 && lane == 3) {
+            static unsigned skipn;
+            if (skipn++ < 32u)
+                fprintf(stderr, "[RSX] V4F-IMM skip en=%d inline=%u%c",
+                        state->vertex_attribs[0].enabled, s_inline_n, 10);
         }
         { static int _d = -1; if (_d < 0) _d = getenv("VDATA_DBG") ? 1 : 0;
           static int _n = 0;

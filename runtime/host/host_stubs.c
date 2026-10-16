@@ -83,6 +83,7 @@ void ppu_log_host_chain(const char* tag)    { (void)tag; }
 void ppu_guest_callstack(const char* tag)   { (void)tag; }
 void ppu_guard_page(uint32_t guest_ea)      { (void)guest_ea; }
 void ppu_dump_guest_stack(void* ctx, const char* tag) { (void)ctx; (void)tag; }
+void ppu_dump_thread_stacks(const char* tag) { (void)tag; }
 
 void ppu_guest_caller(char* out, size_t n)
 {
