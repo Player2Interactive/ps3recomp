@@ -1067,8 +1067,9 @@ static void gcm_blit_to_display(u32 src_off, u32 dst_off, u32 w, u32 h,
                                 const char* eng)
 {
     int disp = cellGcmOffsetIsDisplay(dst_off);
-    { static int n = 0;
-      if (n++ < 32)
+    { static int n = 0, nd = 0;
+      if (disp) nd++;
+      if ((!disp && n++ < 32) || (disp && (nd <= 80 || (nd % 40) == 0)))
           fprintf(stderr, "[%s] %ux%u src=0x%08X -> dst=0x%08X display=%d%c",
                   eng, w, h, src_off, dst_off, disp, 10); }
     if (disp && src_off) {
@@ -2548,8 +2549,10 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
           int set = (bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
                     ? s_display_buffer_set[bufferId] : -1;
           if (n <= 400ull || (n % 10ull) == 0)
-              fprintf(stderr, "[flip] %llu at %llu ms buf=%u set=%d%c",
-                      n, now - t0, bufferId, set, 10);
+              fprintf(stderr, "[flip] %llu at %llu ms buf=%u set=%d off=0x%X%c",
+                      n, now - t0, bufferId, set,
+                      (bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
+                          ? s_display_buffers[bufferId].offset : 0u, 10);
       } }
 
     /* GCM_FLIP_BT=<n>: dump the flipping thread's guest stack for the flips
@@ -3492,6 +3495,17 @@ int cellGcm_scanout_info(u32* local_ea, u32* offset, u32* pitch, u32* w, u32* h)
     if (pitch)    *pitch    = s_display_buffers[id].pitch;
     if (w)        *w        = s_display_buffers[id].width;
     if (h)        *h        = s_display_buffers[id].height;
+    return 1;
+}
+
+int cellGcm_display_buffer_info(u32 id, u32* offset, u32* pitch, u32* w, u32* h)
+{
+    if (id >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM || !s_display_buffer_set[id])
+        return 0;
+    if (offset) *offset = s_display_buffers[id].offset;
+    if (pitch)  *pitch  = s_display_buffers[id].pitch;
+    if (w)      *w      = s_display_buffers[id].width;
+    if (h)      *h      = s_display_buffers[id].height;
     return 1;
 }
 

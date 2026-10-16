@@ -171,6 +171,15 @@ static inline int mfc_is_fence(uint32_t cmd)
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    if (spu->resident_ovl == 183) {
+        static unsigned n183dma;
+        if (++n183dma <= 80u || (n183dma % 200u) == 0u)
+            fprintf(stderr,
+                    "[ovl-183] dma n=%u %s cmd=0x%X lsa=0x%05X ea=0x%08X "
+                    "size=0x%X pc=0x%05X\n",
+                    n183dma, mfc_is_put(cmd) ? "PUT" : (mfc_is_get(cmd) ? "GET" : "OTH"),
+                    cmd, lsa, (uint32_t)ea, size, (uint32_t)spu->pc & SPU_LS_MASK);
+    }
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
      * this guest address. A DMA landing in the loaded ELF image is always a
      * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job
@@ -216,16 +225,37 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           int ls_win = ((ea >> 32) == 0 &&
                         (uint32_t)ea >= 0xF0000000u &&
                         (uint32_t)ea < 0xF0000000u + 6u * 0x100000u);
+          int align_bad = !ls_win && (((lsa ^ (uint32_t)ea) & 15) != 0);
+          /* Wrap-183 (Bink leftover at EA 0x00ADB700) GETs/PUTs a 512-byte
+           * work item at the PPU pointer in the job header (0x004060C8):
+           * 8-byte aligned, size 0x200. Hardware MFC would fault; rejecting
+           * it leaves LS 0x18200 empty and the VM spins at 0x59F0/0xACD8
+           * with no scanout PUT. Do not widen this to other images -- YDKJ
+           * sprayed its OPD with an unaligned 16 KB PUT. */
+          if (align_bad && spu->resident_ovl == 183 && size >= 16 && !(size & 15)
+              && (uint32_t)ea >= 0x10000u) {
+              static unsigned n183al;
+              if (++n183al <= 24u || (n183al % 64u) == 0u)
+                  fprintf(stderr,
+                          "[ovl-183] align-ok n=%u %s cmd=0x%X lsa=0x%05X ea=0x%08X "
+                          "size=0x%X pc=0x%05X\n",
+                          n183al, mfc_is_put(cmd) ? "PUT" : "GET",
+                          cmd, lsa, (uint32_t)ea, size,
+                          (uint32_t)spu->pc & SPU_LS_MASK);
+              align_bad = 0;
+          }
           int malformed = (size == 0) || (size > 0x4000)
                        || (!ls_win && size >= 16 && (size & 15))
-                       || (!ls_win && (((lsa ^ (uint32_t)ea) & 15) != 0))
+                       || align_bad
                        || (mfc_is_put(cmd) && (uint32_t)ea < 0x10000u);
           if (malformed) {
               static int _n = 0;
-              if (_n++ < 8)
-                  fprintf(stderr, "[mfc] REJECTED malformed transfer: img=%d pc=0x%05X"
+              int ovl183 = (spu->resident_ovl == 183);
+              if (_n++ < 8 || ovl183)
+                  fprintf(stderr, "[mfc] REJECTED malformed transfer: img=%d ovl=%d pc=0x%05X"
                                   " cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
-                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd,
+                          spu->image_id, spu->resident_ovl,
+                          (uint32_t)spu->pc & SPU_LS_MASK, cmd,
                           lsa, (uint32_t)ea, size);
               return 0;
           } } }
@@ -787,6 +817,22 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                           lp[8],lp[9],lp[10],lp[11],lp[12],lp[13],lp[14],lp[15]);
               }
           } }
+        /* Wrap-183 / GCM-local PUT dest: Bink leftover wrap vs display scanout. */
+        { uint32_t e = (uint32_t)ea;
+          int ovl = spu->resident_ovl;
+          int to_fb = (size >= 0x100u && e >= 0xC0000000u && e < 0xC1000000u);
+          if (ovl == 183 || to_fb) {
+              static unsigned n183, nfb;
+              unsigned* np = (ovl == 183) ? &n183 : &nfb;
+              if (++*np <= 64u || (*np % 128u) == 0u)
+                  fprintf(stderr,
+                          "[%s] PUT n=%u img=%d ovl=%d ea=0x%08X size=0x%X "
+                          "lsa=0x%05X pc=0x%05X\n",
+                          ovl == 183 ? "ovl-183" : "fb-PUT", *np,
+                          spu->image_id, ovl, e, size, lsa,
+                          (uint32_t)spu->pc & SPU_LS_MASK);
+          }
+        }
         /* POISON-DMA detector: does an SPU PUT write the singleton object region
          * (0x40003000-0x40005000) or carry the 0xC708C708 poison? This host-side
          * memcpy bypasses vm_write32/AWATCH, so it's the prime suspect for the

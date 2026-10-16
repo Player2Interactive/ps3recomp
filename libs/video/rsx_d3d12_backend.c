@@ -3752,6 +3752,83 @@ static const CellGcmTileInfo* gcm_tile_covering(u32 off)
     return NULL;
 }
 
+static const u8* scanout_px(u32 local_ea, u32 off, u32 pitch, u32 x, u32 y, int destile)
+{
+    extern u8* vm_base;
+    const u8* srow = vm_base + local_ea + off;
+    if (!destile)
+        return srow + (size_t)y * pitch + x * 4u;
+    const CellGcmTileInfo* tile = gcm_tile_covering(off);
+    if (!tile || !tile->pitch)
+        return srow + (size_t)y * pitch + x * 4u;
+    u32 y0 = (off - tile->offset) / tile->pitch;
+    u32 ta = gcm_tile_byte(x * 4u, y0 + y, tile->pitch);
+    if (ta + 4u <= tile->size)
+        return vm_base + local_ea + tile->offset + ta;
+    return srow + (size_t)y * pitch + x * 4u;
+}
+
+static void scanout_sample(u32 local_ea, u32 off, u32 pitch, u32 w, u32 h, int destile,
+                           u32* nz, u32* n, u32* luma_sum, u32* luma_min, u32* luma_max)
+{
+    extern u8* vm_base;
+    *nz = *n = *luma_sum = 0;
+    *luma_min = 255;
+    *luma_max = 0;
+    if (!vm_base || !w || !h || !pitch) return;
+    for (u32 y = 0; y < h; y += 8u) {
+        for (u32 x = 0; x < w; x += 8u) {
+            const u8* s = scanout_px(local_ea, off, pitch, x, y, destile);
+            u32 L = ((u32)s[0] * 25u + (u32)s[1] * 129u + (u32)s[2] * 66u) >> 8;
+            (*n)++;
+            if (s[0] | s[1] | s[2]) (*nz)++;
+            *luma_sum += L;
+            if (L < *luma_min) *luma_min = L;
+            if (L > *luma_max) *luma_max = L;
+        }
+    }
+}
+
+static void scanout_dump_bmp(const char* path, u32 local_ea, u32 off, u32 pitch,
+                             u32 w, u32 h, int destile)
+{
+    extern u8* vm_base;
+    FILE* f;
+    u32 rowb, rowp, fsz, x;
+    u8 hd[54];
+    if (!vm_base || !path || !w || !h || !pitch) return;
+    f = fopen(path, "wb");
+    if (!f) return;
+    rowb = w * 3u;
+    rowp = (rowb + 3u) & ~3u;
+    fsz = 54u + rowp * h;
+    memset(hd, 0, sizeof hd);
+    hd[0] = 'B'; hd[1] = 'M';
+    hd[2] = (u8)fsz; hd[3] = (u8)(fsz >> 8); hd[4] = (u8)(fsz >> 16); hd[5] = (u8)(fsz >> 24);
+    hd[10] = 54; hd[14] = 40;
+    hd[18] = (u8)w; hd[19] = (u8)(w >> 8);
+    hd[22] = (u8)h; hd[23] = (u8)(h >> 8);
+    hd[26] = 1; hd[28] = 24;
+    fwrite(hd, 1, 54, f);
+    {
+        int yy;
+        for (yy = (int)h - 1; yy >= 0; yy--) {
+            for (x = 0; x < w; x++) {
+                const u8* s = scanout_px(local_ea, off, pitch, x, (u32)yy, destile);
+                u8 px[3];
+                px[0] = s[0]; px[1] = s[1]; px[2] = s[2];
+                fwrite(px, 1, 3, f);
+            }
+            if (rowp > rowb) {
+                u8 z[4] = {0, 0, 0, 0};
+                fwrite(z, 1, rowp - rowb, f);
+            }
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "[GUESTFB] dumped %s off=0x%08X destile=%d%c", path, off, destile, 10);
+}
+
 static void guest_fb_present(u32 fi)
 {
     static int mode = -1; /* 0=off, 1=explicit env, 2=auto current scanout */
@@ -3794,9 +3871,83 @@ static void guest_fb_present(u32 fi)
          * flipping. Still skip when THIS batch rasterized display 3D
          * (s_rf_had_display) so a later 3D frame is not overwritten. */
         u32 lea = 0, o = 0, p = 0, w = 0, h = 0;
+        u32 flip_id;
         if (!cellGcm_scanout_info(&lea, &o, &p, &w, &h) || !w || !h || !p)
             return;
+        flip_id = cellGcmGetCurrentDisplayBufferId();
         local_ea = lea; off = o; gw = w; gh = h; gpitch = p;
+        {
+            u32 sid, so, sp, sw, sh;
+            u32 best_id = flip_id, best_span = 0;
+            u32 sel_nz = 0, sel_n = 1, sel_sum = 0, sel_mn = 0, sel_mx = 0;
+            static unsigned sn = 0;
+            unsigned dump_n;
+            sn++;
+            for (sid = 0; sid < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; sid++) {
+                u32 nz = 0, n = 0, sum = 0, mn = 255, mx = 0;
+                u32 lnz = 0, ln = 0, lsum = 0, lmn = 255, lmx = 0;
+                u32 span;
+                if (!cellGcm_display_buffer_info(sid, &so, &sp, &sw, &sh) || !sw || !sh || !sp)
+                    continue;
+                scanout_sample(lea, so, sp, sw, sh, 1, &nz, &n, &sum, &mn, &mx);
+                scanout_sample(lea, so, sp, sw, sh, 0, &lnz, &ln, &lsum, &lmn, &lmx);
+                span = (mx > mn) ? (mx - mn) : 0;
+                if (sid == flip_id) {
+                    sel_nz = nz; sel_n = n ? n : 1; sel_sum = sum; sel_mn = mn; sel_mx = mx;
+                }
+                if (span > best_span) { best_span = span; best_id = sid; }
+                if (sn <= 8u || (sn % 60u) == 0u)
+                    fprintf(stderr,
+                            "[GUESTFB] buf=%u off=0x%08X tile nz=%u/%u luma %u..%u mean=%u "
+                            "lin nz=%u/%u luma %u..%u mean=%u%s%c",
+                            sid, so, nz, n ? n : 1, mn, mx, n ? sum / n : 0,
+                            lnz, ln ? ln : 1, lmn, lmx, ln ? lsum / ln : 0,
+                            sid == flip_id ? " <-flip" : "", 10);
+            }
+            /* SetFlip selected a black/empty scanout but a sibling display
+             * buffer holds FMV pixels: present that sibling (it is the buffer
+             * the flip listed, if scanout_info and the flip id ever disagree,
+             * or the one Bink actually wrote). Do not plant pixels. */
+            if (sel_n && sel_nz * 50u < sel_n && (sel_mx - sel_mn) < 12u &&
+                best_id != flip_id && best_span >= 24u &&
+                cellGcm_display_buffer_info(best_id, &so, &sp, &sw, &sh) &&
+                sw && sh && sp) {
+                fprintf(stderr,
+                        "[present] scanout-switch flip_id=%u off=0x%08X empty "
+                        "-> buf=%u off=0x%08X span=%u%c",
+                        flip_id, o, best_id, so, best_span, 10);
+                off = so; gpitch = sp; gw = sw; gh = sh;
+                flip_id = best_id;
+            }
+            dump_n = sn;
+            if (dump_n == 60u || dump_n == 90u || dump_n == 120u ||
+                dump_n == 180u || dump_n == 240u) {
+                char dir[260], path[300];
+                const char* t = getenv("TEMP");
+                if (!t) t = ".";
+                snprintf(dir, sizeof dir, "%s\\acit_fbdump", t);
+                CreateDirectoryA(dir, NULL);
+                for (sid = 0; sid < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; sid++) {
+                    if (!cellGcm_display_buffer_info(sid, &so, &sp, &sw, &sh) || !sw || !sh)
+                        continue;
+                    snprintf(path, sizeof path, "%s\\n%u_buf%u_off%08X_tile.bmp",
+                             dir, dump_n, sid, so);
+                    scanout_dump_bmp(path, lea, so, sp, sw, sh, 1);
+                    if (dump_n == 60u) {
+                        snprintf(path, sizeof path, "%s\\n%u_buf%u_off%08X_lin.bmp",
+                                 dir, dump_n, sid, so);
+                        scanout_dump_bmp(path, lea, so, sp, sw, sh, 0);
+                    }
+                }
+            }
+            if (sn <= 8u || (sn % 60u) == 0u)
+                fprintf(stderr,
+                        "[present] scanout n=%u flip_id=%u off=0x%08X %ux%u "
+                        "nz=%u/%u luma %u..%u mean=%u tiled=%d%c",
+                        sn, flip_id, off, gw, gh, sel_nz, sel_n, sel_mn, sel_mx,
+                        sel_n ? sel_sum / sel_n : 0,
+                        gcm_tile_covering(off) ? 1 : 0, 10);
+        }
     }
     up_pitch = (gw * 4u + 255u) & ~255u;
     u32 need = up_pitch * gh;
@@ -3858,10 +4009,6 @@ static void guest_fb_present(u32 fi)
       }
       D3D12_RANGE wr = {0, (SIZE_T)need};
       up->lpVtbl->Unmap(up, 0, &wr); }
-    { static unsigned n = 0;
-      if (++n <= 8u || (n % 60u) == 0u)
-          fprintf(stderr, "[present] scanout n=%u off=0x%08X %ux%u display_draws=%d tiled=%d%c",
-                  n, off, gw, gh, s_rf_had_display, gcm_tile_covering(off) ? 1 : 0, 10); }
 
     D3D12_RESOURCE_BARRIER gb = {0};
     gb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

@@ -294,6 +294,8 @@ int      cellGcm_take_flip_pending_synced(void);
 unsigned cellGcm_flip_request_count(void);
 /* Current SetFlip target: local EA + RSX offset/pitch/size. 0 if unset. */
 int      cellGcm_scanout_info(u32* local_ea, u32* offset, u32* pitch, u32* w, u32* h);
+/* Registered display buffer `id`, or 0 if that slot was never SetDisplayBuffer. */
+int      cellGcm_display_buffer_info(u32 id, u32* offset, u32* pitch, u32* w, u32* h);
 
 /* NID: 0xF9BFCDA3 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);
