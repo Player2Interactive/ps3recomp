@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <setjmp.h>
 #include <time.h>
 #include "../platform/win32_compat.h"
@@ -359,11 +360,15 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     uint8_t* mem = vm_base + ea;
 
     /* ACIT image 1: 0xA7F8 GETLLAR-decrements 0x00F7AAAC; 0x8FF0 locks the flag.
-     * First few atomics name the EA/mask/old word so we can see why Set is skipped. */
+     * First few atomics name the EA/mask/old word so we can see why Set is skipped.
+     * Cap must be unsigned and must stop incrementing: a signed `_ef++ < 4`
+     * wraps after 2^31 idle GETLLAR/PUTLLC ops and then logs every atomic
+     * (with fflush), which starves wrap-183 FMV decode. */
     if (ctx->image_id == 1) {
-        static int _ef = 0;
-        if (_ef++ < 4) {
+        static unsigned _ef = 0;
+        if (_ef < 4u) {
             uint32_t wctr = 0, mask0 = 0, mask1 = 0;
+            _ef++;
             if (vm_base) {
                 const uint8_t* c = vm_base + 0x00F7AAACu;
                 wctr = ((uint32_t)c[0] << 24) | ((uint32_t)c[1] << 16) |
@@ -376,7 +381,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                 mask1 = ((uint32_t)m[4] << 24) | ((uint32_t)m[5] << 16) |
                         ((uint32_t)m[6] << 8) | (uint32_t)m[7];
             }
-            fprintf(stderr, "[efset-atom] #%d cmd=0x%02X img=1 pc=0x%05X lr=0x%05X "
+            fprintf(stderr, "[efset-atom] #%u cmd=0x%02X img=1 pc=0x%05X lr=0x%05X "
                             "eal=0x%08X line=0x%08X ctr@F7AAAC=%08X LS[BB00]=%08X %08X\n",
                     _ef, cmd, (uint32_t)ctx->pc & SPU_LS_MASK,
                     ctx->gpr[0]._u32[0] & SPU_LS_MASK,
@@ -1452,27 +1457,47 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
 /* 6 FMOD codec/DSP overlays + WWS/igPm job-code modules (LS 0x4000 / 0x480).
  * ACIT registers 111 wrap-0x480 bodies plus leftover C0DEC0DE/FFFFEF jobmods;
  * 128 filled up, so this is 256 rather than dropping overlay hashes. */
-#define SPU_OVL_SRC_MAX 256
+#define SPU_OVL_SRC_MAX 384
 static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
 static int s_ovl_src_count = 0;
 
+static void spu_overlay_src_overflow(const char* what, uint32_t ea, int image_id)
+{
+    static int _n;
+    if (_n++ < 8)
+        fprintf(stderr, "[spu-ovl] register %s DROPPED img=%d ea=0x%08X "
+                "(table full %d)\n", what, image_id, ea, SPU_OVL_SRC_MAX);
+}
+
 void spu_overlay_register_source(uint32_t content_ea, int image_id)
 {
-    if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
-        s_ovl_src[s_ovl_src_count].src_ea = content_ea;
-        s_ovl_src[s_ovl_src_count].image_id = image_id;
-        s_ovl_src[s_ovl_src_count].has_sig = 0;
-        s_ovl_src_count++;
+    if (s_ovl_src_count >= SPU_OVL_SRC_MAX) {
+        spu_overlay_src_overflow("source", content_ea, image_id);
+        return;
     }
+    memset(&s_ovl_src[s_ovl_src_count], 0, sizeof(s_ovl_src[0]));
+    s_ovl_src[s_ovl_src_count].src_ea = content_ea;
+    s_ovl_src[s_ovl_src_count].image_id = image_id;
+    s_ovl_src[s_ovl_src_count].has_sig = 0;
+    s_ovl_src_count++;
 }
 
 /* Register a bounded code image that may coexist with other streamed images.
  * Its functions must be translated at the local-store addresses used by the title. */
 void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_id)
 {
-    if (!span || span > SPU_LS_SIZE || s_ovl_src_count >= SPU_OVL_SRC_MAX) return;
+    if (!span || span > SPU_LS_SIZE) return;
+    if (s_ovl_src_count >= SPU_OVL_SRC_MAX) {
+        spu_overlay_src_overflow("region", content_ea, image_id);
+        return;
+    }
     spu_overlay_register_source(content_ea, image_id);
     s_ovl_src[s_ovl_src_count - 1].span = span;
+    if (image_id >= 173) {
+        fprintf(stderr, "[spu-ovl] region img=%d ea=0x%08X span=0x%X count=%d/%d\n",
+                image_id, content_ea, span, s_ovl_src_count, SPU_OVL_SRC_MAX);
+        fflush(stderr);
+    }
 }
 
 /* Register one-way runtime entries that replace the guest call stack.
@@ -1559,13 +1584,16 @@ static int spu_taskset_resident_image(const spu_context* ctx)
  * time -- match the first 16 bytes of the streamed content instead. */
 void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
 {
-    if (s_ovl_src_count < SPU_OVL_SRC_MAX) {
-        s_ovl_src[s_ovl_src_count].src_ea = 0;
-        s_ovl_src[s_ovl_src_count].image_id = image_id;
-        memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
-        s_ovl_src[s_ovl_src_count].has_sig = 1;
-        s_ovl_src_count++;
+    if (s_ovl_src_count >= SPU_OVL_SRC_MAX) {
+        spu_overlay_src_overflow("sig", 0, image_id);
+        return;
     }
+    memset(&s_ovl_src[s_ovl_src_count], 0, sizeof(s_ovl_src[0]));
+    s_ovl_src[s_ovl_src_count].src_ea = 0;
+    s_ovl_src[s_ovl_src_count].image_id = image_id;
+    memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
+    s_ovl_src[s_ovl_src_count].has_sig = 1;
+    s_ovl_src_count++;
 }
 
 /* igPm overlay-12 swap slot (LS 0x3F580). Job bodies live below this. */
@@ -1596,6 +1624,19 @@ static int spu_overlay_get_is_job_data(const spu_context* ctx, uint32_t lsa, uin
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
+    if (ea == 0x00B18180u) {
+        int found = 0, span184 = 0;
+        for (int i = 0; i < s_ovl_src_count; i++) {
+            if (s_ovl_src[i].src_ea == ea || s_ovl_src[i].image_id == 184) {
+                found = s_ovl_src[i].image_id;
+                span184 = (int)s_ovl_src[i].span;
+            }
+        }
+        fprintf(stderr, "[ovl-184] note_get ea=0x%08X lsa=0x%05X size=0x%X "
+                "img=%d found=%d span=0x%X srcs=%d\n",
+                ea, lsa, size, ctx->image_id, found, span184, s_ovl_src_count);
+        fflush(stderr);
+    }
     for (unsigned slot = 0; slot < 4; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
@@ -1608,33 +1649,48 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
             (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)))
             ctx->resident_code[slot].image_id = 0;
     }
+    /* EA/span first, then content-sig. A leftover wrap at a unique EA must
+     * not lose to an earlier jobmod whose first 16 bytes collide (or whose
+     * uninitialized span used to swallow the GET and return). */
+    for (int pass = 0; pass < 2; pass++)
     for (int i = 0; i < s_ovl_src_count; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
         uint32_t claim_lsa = lsa, claim_ea = ea;
         int hit = 0;
-        if (o->has_sig)
-            hit = (size >= 512 && memcmp(ls, o->sig, 16) == 0);
-        else if (o->src_ea == ea)
-            hit = 1;
-        else if (o->span && ea > o->src_ea && ea < o->src_ea + o->span) {
-            /* Overlay 12 splits bodies larger than the MFC 0x4000 GET max:
-             * GET(src, 0x4000) @ dest then GET(src+0x4000, tail) @ dest+0x4000.
-             * Image 182 entry 0x41B8 is 0xB8 past the first chunk; claiming
-             * only the first DMA size leaves it unowned. Treat a linear
-             * continuation as the same region (implied dest LS 0x100). */
-            uint32_t off = ea - o->src_ea;
-            if (lsa >= off) {
-                uint32_t dest = lsa - off;
-                if (dest == 0x100u && dest + o->span <= SPU_LS_SIZE) {
-                    hit = 1;
-                    claim_lsa = dest;
-                    claim_ea = o->src_ea;
+        if (pass == 0) {
+            if (o->has_sig) continue;
+            if (o->src_ea == ea)
+                hit = 1;
+            else if (o->span && ea > o->src_ea && ea < o->src_ea + o->span) {
+                /* Overlay 12 splits bodies larger than the MFC 0x4000 GET max:
+                 * GET(src, 0x4000) @ dest then GET(src+0x4000, tail) @ dest+0x4000.
+                 * Image 182 entry 0x41B8 is 0xB8 past the first chunk; claiming
+                 * only the first DMA size leaves it unowned. Treat a linear
+                 * continuation as the same region (implied dest LS 0x100). */
+                uint32_t off = ea - o->src_ea;
+                if (lsa >= off) {
+                    uint32_t dest = lsa - off;
+                    if (dest == 0x100u && dest + o->span <= SPU_LS_SIZE) {
+                        hit = 1;
+                        claim_lsa = dest;
+                        claim_ea = o->src_ea;
+                    }
                 }
             }
+        } else {
+            if (!o->has_sig) continue;
+            hit = (size >= 512 && memcmp(ls, o->sig, 16) == 0);
         }
         if (hit) {
             if (o->span) {
-                if (claim_lsa + o->span > SPU_LS_SIZE) return;
+                if (claim_lsa + o->span > SPU_LS_SIZE) {
+                    static int _big;
+                    if (_big++ < 8)
+                        fprintf(stderr, "[spu-ovl] span too big img=%d src=0x%08X "
+                                "lsa=0x%05X span=0x%X (skip)\n",
+                                o->image_id, claim_ea, claim_lsa, o->span);
+                    continue;
+                }
                 for (unsigned slot = 0; slot < 4; ++slot) {
                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != claim_lsa)
                         continue;
@@ -1644,13 +1700,23 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].image_id = o->image_id;
                     { static int _n = 0;
                       int log183 = (o->image_id == 183);
-                      static int _n183;
-                      if (_n++ < 48 || (log183 && _n183++ < 24))
+                      int log184 = (o->image_id == 184);
+                      static int _n183, _n184;
+                      if (_n++ < 48 || (log183 && _n183++ < 24) ||
+                          (log184 && _n184++ < 24))
                           fprintf(stderr, "[spu-ovl] span claim img=%d src=0x%08X -> LS 0x%05X "
                                   "span=0x%X -> code image %d pc=0x%05X size=%u%s\n",
                                   ctx->image_id, claim_ea, claim_lsa, o->span, o->image_id,
                                   (uint32_t)ctx->pc & SPU_LS_MASK, size,
-                                  (log183 && size < o->span) ? " (partial GET)" : "");
+                                  ((log183 || log184) && size < o->span) ? " (partial GET)" : "");
+                      if (log184 && _n184 <= 24) {
+                          fprintf(stderr,
+                                  "[ovl-184] claim src=0x%08X lsa=0x%05X get=0x%X span=0x%X "
+                                  "pc=0x%05X img=%d\n",
+                                  claim_ea, lsa, size, o->span,
+                                  (uint32_t)ctx->pc & SPU_LS_MASK, ctx->image_id);
+                          fflush(stderr);
+                      }
                       if (log183 && _n183 <= 24) {
                           const uint8_t* t = ctx->ls + 0x18100;
                           fprintf(stderr,
@@ -2209,9 +2275,14 @@ void spu_indirect_branch(spu_context* ctx)
     for (unsigned slot = 0; slot < 4; ++slot) {
         if (ctx->resident_code[slot].image_id && ctx->pc >= ctx->resident_code[slot].lsa &&
             ctx->pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
-            code_owner = ctx->resident_code[slot].image_id;
-            fn = spu_lookup(ctx->pc, code_owner);
-            break;
+            spu_fn hit = spu_lookup(ctx->pc, ctx->resident_code[slot].image_id);
+            if (hit) {
+                code_owner = ctx->resident_code[slot].image_id;
+                fn = hit;
+                break;
+            }
+            /* Stale span (previous leftover wrap) with no function at this PC
+             * must not hide the next image's lift. */
         }
     }
     if (!code_owner && ctx->resident_task)
@@ -2221,6 +2292,20 @@ void spu_indirect_branch(spu_context* ctx)
      * may also be registered (historical junk lifts) and must lose. */
     if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup(ctx->pc, ctx->resident_ovl);
     if (!code_owner && !fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    /* Leftover wrap 184 entry 0xC8E8 lives at LS 0x100. Overlay-12 bisl keeps
+     * image_id=11/12; if span claim missed, still dispatch the lift of the
+     * bytes that GET just wrote. */
+    if (!fn && ((uint32_t)ctx->pc & SPU_LS_MASK) == 0xC8E8u)
+        fn = spu_lookup(ctx->pc, 184);
+    {
+        uint32_t p184 = (uint32_t)ctx->pc & SPU_LS_MASK;
+        if (p184 == 0xC8E8u) {
+            static int _n184b;
+            if (_n184b++ < 12)
+                fprintf(stderr, "[ovl-184] ibranch pc=0x0C8E8 img=%d ovl=%d owner=%d fn=%p\n",
+                        ctx->image_id, ctx->resident_ovl, code_owner, (void*)fn);
+        }
+    }
     /* Dump-only: image-178 CRT / ctor bisl / main / GETLLAR helper. */
     {
         uint32_t p = (uint32_t)ctx->pc & SPU_LS_MASK;
