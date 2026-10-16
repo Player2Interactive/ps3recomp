@@ -116,9 +116,18 @@ static void fs_normalize_sep(char* p) {
  * cellGame misses. flOw opendir'd /dev_bdvd/PS3_GAME/USRDIR, got ENOENT, and
  * read that as "no disc".
  *
- * Additive and last-resort: if the translated path does not exist but dropping
- * a PS3_GAME component yields one that does, use that. When neither exists the
- * original is kept, so failure messages still name the path the guest asked for.
+ * Additive and last-resort, both directions:
+ *   - disc-style guest path on a flattened tree: drop PS3_GAME if that hits.
+ *   - flattened host path on a disc tree: insert PS3_GAME before USRDIR if
+ *     that hits. sys_fs_translate_path strips any "...USRDIR/..." down to
+ *     <root>/USRDIR/... (flOw / junction workaround). LBP Bink paths have no
+ *     USRDIR component so they never took that branch; ACIT Bink does
+ *     (/dev_bdvd/PS3_GAME/USRDIR/built/movies/*.bik) and the strip misses the
+ *     real file at <root>/PS3_GAME/USRDIR/.... cellFs keeps PS3_GAME, which is
+ *     why the sibling .pkg open succeeded.
+ * When neither exists the original is kept, so failure messages still name
+ * the path the guest asked for. Do not rewrite /game/<titleId>/USRDIR (hdd0
+ * game-data) -- only a USRDIR that is not sitting under a title id.
  *
  * All three path translators call this -- sys_fs, cellFs and ppu_fs each do
  * their own translation (see docs), and a guest path can arrive at any of them. */
@@ -149,32 +158,95 @@ static char* ps3_vfs_find_ps3game(char* path)
     return strstr(path, "\\PS3_GAME/");
 }
 
+static char* ps3_vfs_find_usrdir(char* path)
+{
+    char* p = strstr(path, "/USRDIR/");
+    if (p) return p;
+    p = strstr(path, "\\USRDIR\\");
+    if (p) return p;
+    p = strstr(path, "/USRDIR\\");
+    if (p) return p;
+    return strstr(path, "\\USRDIR/");
+}
+
+/* Parent directory of .../USRDIR/ is a CELL title id (BCUS98124, NPEA00241). */
+static int ps3_vfs_usrdir_parent_is_title_id(const char* path, const char* usr)
+{
+    if (!path || !usr || usr <= path)
+        return 0;
+    const char* endp = usr;
+    const char* start = endp;
+    while (start > path && start[-1] != '/' && start[-1] != '\\')
+        start--;
+    size_t n = (size_t)(endp - start);
+    if (n != 9)
+        return 0;
+    for (size_t i = 0; i < 4; i++) {
+        char c = start[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')))
+            return 0;
+    }
+    for (size_t i = 4; i < 9; i++) {
+        if (start[i] < '0' || start[i] > '9')
+            return 0;
+    }
+    return 1;
+}
+
 void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 {
     struct stat st;
     if (!path || !*path || stat(path, &st) == 0)
         return;
-    char* p = ps3_vfs_find_ps3game(path);
-    if (!p)
-        return;
     char alt[1024];
-    /* Flattened tree: drop the PS3_GAME component. */
-    size_t head = (size_t)(p - path);
-    if (head + 1 < sizeof alt) {
+    char* p = ps3_vfs_find_ps3game(path);
+    if (p) {
+        /* Flattened tree: drop the PS3_GAME component. */
+        size_t head = (size_t)(p - path);
+        if (head + 1 < sizeof alt) {
+            memcpy(alt, path, head);
+            snprintf(alt + head, sizeof alt - head, "/%s", p + 10);
+            if (stat(alt, &st) == 0) {
+                snprintf(path, cap, "%s", alt);
+                return;
+            }
+        }
+        /* Wrong $PS3_VFS_ROOT (no disc files): rewrite onto the ELF dump root. */
+        if (s_disc_root[0]) {
+            snprintf(alt, sizeof alt, "%s/%s", s_disc_root, p + 1);
+            for (char* c = alt; *c; c++)
+                if (*c == '\\') *c = '/';
+            if (stat(alt, &st) == 0) {
+                fprintf(stderr, "[fs] disc-root fallback '%s' -> '%s'\n", path, alt);
+                snprintf(path, cap, "%s", alt);
+            }
+        }
+        return;
+    }
+
+    /* Disc tree: sys_fs flattened .../PS3_GAME/USRDIR/... to <root>/USRDIR/... .
+     * Insert PS3_GAME if that file exists. Skip /game/<titleId>/USRDIR. */
+    char* usr = ps3_vfs_find_usrdir(path);
+    if (!usr || ps3_vfs_usrdir_parent_is_title_id(path, usr))
+        return;
+    size_t head = (size_t)(usr - path);
+    if (head + 16 < sizeof alt) {
         memcpy(alt, path, head);
-        snprintf(alt + head, sizeof alt - head, "/%s", p + 10);
+        snprintf(alt + head, sizeof alt - head, "/PS3_GAME%s", usr);
+        for (char* c = alt; *c; c++)
+            if (*c == '\\') *c = '/';
         if (stat(alt, &st) == 0) {
+            fprintf(stderr, "[fs] PS3_GAME insert '%s' -> '%s'\n", path, alt);
             snprintf(path, cap, "%s", alt);
             return;
         }
     }
-    /* Wrong $PS3_VFS_ROOT (no disc files): rewrite onto the ELF dump root. */
     if (s_disc_root[0]) {
-        snprintf(alt, sizeof alt, "%s/%s", s_disc_root, p + 1);
+        snprintf(alt, sizeof alt, "%s/PS3_GAME%s", s_disc_root, usr);
         for (char* c = alt; *c; c++)
             if (*c == '\\') *c = '/';
         if (stat(alt, &st) == 0) {
-            fprintf(stderr, "[fs] disc-root fallback '%s' -> '%s'\n", path, alt);
+            fprintf(stderr, "[fs] PS3_GAME insert '%s' -> '%s'\n", path, alt);
             snprintf(path, cap, "%s", alt);
         }
     }
@@ -601,8 +673,8 @@ int64_t sys_fs_open(ppu_context* ctx)
 
     if (!fp) {
         { struct stat _s2; int _ex = (stat(host_path,&_s2)==0);
-          fprintf(stderr, "[sys_fs] open FAILED: %s (errno=%d %s, exists=%d, size=%lld)\n",
-                  host_path, errno, strerror(errno), _ex, _ex?(long long)_s2.st_size:-1LL); }
+          fprintf(stderr, "[sys_fs] open FAILED: guest='%s' host='%s' (errno=%d %s, exists=%d, size=%lld)\n",
+                  ps3_path, host_path, errno, strerror(errno), _ex, _ex?(long long)_s2.st_size:-1LL); }
         return (int64_t)(int32_t)CELL_ENOENT;
     }
 
