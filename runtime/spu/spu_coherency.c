@@ -14,6 +14,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -73,6 +74,159 @@ static spu_context* s_coh_ctxs[SPU_COH_MAX_CTX];
 
 unsigned long g_spu_lr_raise = 0;
 
+extern uint8_t* vm_base;
+
+static uint32_t ovl12_load_be32(uint32_t ea)
+{
+    const uint8_t* p;
+    if (!vm_base) return 0;
+    p = vm_base + ea;
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+         | ((uint32_t)p[2] << 8) | p[3];
+}
+
+/* liveA 00FC7B00+lane<<7, liveB 00FC7D80+lane<<7. slot 0=A, 1=B. */
+static int ovl12_occupancy_lane(uint32_t ram, uint32_t* line_off, int* slot)
+{
+    if (ram >= 0x00FC7B00u && ram < 0x00FC7D00u) {
+        uint32_t off = ram - 0x00FC7B00u;
+        if (line_off) *line_off = off & 0x7Fu;
+        if (slot) *slot = 0;
+        return (int)(off >> 7);
+    }
+    if (ram >= 0x00FC7D80u && ram < 0x00FC7F80u) {
+        uint32_t off = ram - 0x00FC7D80u;
+        if (line_off) *line_off = off & 0x7Fu;
+        if (slot) *slot = 1;
+        return (int)(off >> 7);
+    }
+    return -1;
+}
+
+static int ovl12_ea_is_occupancy(uint32_t ea)
+{
+    uint32_t ram = ovl12_io_to_ram(ea);
+    return ovl12_occupancy_lane(ram ? ram : ea, 0, 0) >= 0;
+}
+
+static int ovl12_lane_pending(int lane)
+{
+    uint32_t a, b;
+    if (lane < 0 || lane > 3 || !vm_base) return 0;
+    a = ovl12_load_be32(0x00FC7B00u + ((uint32_t)lane << 7));
+    b = ovl12_load_be32(0x00FC7D80u + ((uint32_t)lane << 7));
+    return a != b;
+}
+
+static int ovl12_is_overlay_idle(const spu_context* ctx)
+{
+    uint32_t pc;
+    if (!ctx || ctx->resident_ovl != 12) return 0;
+    pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+    return pc >= 0x3F000u && pc < 0x40000u;
+}
+
+static int ovl12_is_ice_parked(const spu_context* ctx)
+{
+    if (!ctx || !ctx->resv_valid) return 0;
+    return (ctx->resv_ea & ~15u) == 0x00F3CF00u;
+}
+
+/* 00696614 cell 00F7B488+4 holds the Great Clock handle only after
+ * 005F9C48 packs. 00B5D900 is also posted during boot, walker+3C is
+ * 9 during FE, and the doorbell is 0x180 in 0055BF88 / 0 at the wrap
+ * hang -- none of those uniquely mark leftover wrap. */
+static int ovl12_steal_allowed(void)
+{
+    if (!vm_base) return 0;
+    return ovl12_load_be32(0x00F7B48Cu) != 0;
+}
+
+/* Lowest overlay-idle matching SPU steals the lowest Ice-parked pending lane. */
+static int ovl12_find_steal_peer(const spu_context* self)
+{
+    int best_idle, peer;
+    int i;
+    if (!self) return -1;
+    best_idle = (int)self->spu_id;
+    if (best_idle < 0 || best_idle > 5 || ovl12_lane_pending(best_idle))
+        best_idle = 99;
+    peer = -1;
+    for (i = 0; i < SPU_COH_MAX_CTX; i++) {
+        spu_context* c = s_coh_ctxs[i];
+        int id;
+        if (!c || c == self) continue;
+        id = (int)c->spu_id;
+        if (ovl12_is_overlay_idle(c) && id >= 0 && id <= 5
+            && !ovl12_lane_pending(id) && id < best_idle)
+            best_idle = id;
+        if (ovl12_is_ice_parked(c) && ovl12_lane_pending(id)
+            && (peer < 0 || id < peer))
+            peer = id;
+    }
+    if ((int)self->spu_id != best_idle || peer < 0)
+        return -1;
+    return peer;
+}
+
+uint32_t ovl12_occupancy_remap(const spu_context* ctx, uint32_t ea)
+{
+    uint32_t ram = ovl12_io_to_ram(ea);
+    uint32_t base = ram ? ram : ea;
+    uint32_t line_off = 0;
+    int slot = 0;
+    int lane;
+    int peer;
+    uint32_t out;
+
+    lane = ovl12_occupancy_lane(base, &line_off, &slot);
+    if (lane < 0 || lane > 3)
+        return ea;
+
+    out = ram ? ram : ea;
+    if (!ctx || !ovl12_is_overlay_idle(ctx))
+        return out;
+    if (lane != (int)ctx->spu_id)
+        return out;
+    if (ovl12_lane_pending(lane))
+        return out;
+    if (!ovl12_steal_allowed())
+        return out;
+    peer = ovl12_find_steal_peer(ctx);
+    if (peer < 0 || peer == lane)
+        return out;
+
+    out = (slot ? 0x00FC7D80u : 0x00FC7B00u)
+        + ((uint32_t)peer << 7) + line_off;
+    {
+        static unsigned n;
+        if (++n <= 24u || (n % 64u) == 0u) {
+            fprintf(stderr,
+                    "[ovl12-steal] spu=%u pc=0x%05X lane%u ea=0x%08X -> peer%u "
+                    "0x%08X A=0x%08X B=0x%08X\n",
+                    ctx->spu_id, (uint32_t)ctx->pc & SPU_LS_MASK,
+                    (unsigned)lane, ea, (unsigned)peer, out,
+                    ovl12_load_be32(0x00FC7B00u + ((uint32_t)peer << 7)),
+                    ovl12_load_be32(0x00FC7D80u + ((uint32_t)peer << 7)));
+            fflush(stderr);
+        }
+    }
+    return out;
+}
+
+void ovl12_occupancy_sync_liveA(spu_context* ctx, uint32_t liveB_ram)
+{
+    uint32_t off = 0;
+    int slot = 0;
+    int lane;
+    uint32_t liveA;
+    if (!ctx || !ctx->ls || !vm_base) return;
+    lane = ovl12_occupancy_lane(liveB_ram, &off, &slot);
+    if (slot != 1 || lane < 0 || lane > 3) return;
+    liveA = 0x00FC7B00u + ((uint32_t)lane << 7);
+    memcpy(&ctx->ls[0x3FE00], vm_base + liveA, 128);
+}
+
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
@@ -81,8 +235,14 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
      * 00FC7D80. Mark the twin so VM_WRITE_COH notifies this reservation. */
     {
         uint32_t twin = ovl12_io_to_ram(ea & ~127u);
+        uint32_t steal;
         if (twin) {
             uint32_t tline = twin >> SPU_COH_LINE_SHIFT;
+            s_coh_bitmap[tline >> 3] |= (unsigned char)(1u << (tline & 7));
+        }
+        steal = ctx ? (ovl12_occupancy_remap(ctx, ea) & ~127u) : 0u;
+        if (steal && steal != (ea & ~127u) && steal != twin) {
+            uint32_t tline = steal >> SPU_COH_LINE_SHIFT;
             s_coh_bitmap[tline >> 3] |= (unsigned char)(1u << (tline & 7));
         }
     }
@@ -130,6 +290,27 @@ void spu_coh_notify_write(uint32_t ea)
          * waiter re-polls its predicate on a timeout as well, so a
          * straggling store costs latency and not the wakeup itself. */
         spu_ch_wake(c);
+    }
+    /* Packer posts occupancy on an Ice-parked lane. Overlay-idle SPUs wait
+     * GETLLAR of their own matching IO line, which is not that twin, so the
+     * alias notify above misses them. Wake overlay-idle occupancy waiters
+     * so they re-GET and steal the pending lane. Do not wake Ice GETLLAR. */
+    if (ovl12_steal_allowed()
+        && (ovl12_ea_is_occupancy(line)
+            || (extra && ovl12_ea_is_occupancy(extra)))) {
+        for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+            spu_context* c = s_coh_ctxs[i];
+            uint32_t rline;
+            if (!c || !c->resv_valid) continue;
+            if (!ovl12_is_overlay_idle(c)) continue;
+            rline = c->resv_ea & ~127u;
+            if (rline == line || (extra && rline == extra))
+                continue;
+            c->event_status |= SPU_EVENT_LR;
+            c->resv_valid = 0;
+            g_spu_lr_raise++;
+            spu_ch_wake(c);
+        }
     }
 }
 

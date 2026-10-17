@@ -16,6 +16,7 @@
 #define SPU_DMA_H
 
 #include "spu_context.h"
+#include "spu_coherency.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -510,6 +511,27 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                       spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd,
                       lsa, e, size, off); }
         return 0;
+    }
+
+    /* Overlay-12 occupancy IO is a GCM poison window, not a hardware alias.
+     * Idle SPU2/3 also steal a pending Ice-parked lane's RAM cells so a
+     * leftover wrap posted while CollBroad sits on 00F3CF00 still runs. */
+    {
+        uint32_t remap = ovl12_occupancy_remap(spu, (uint32_t)ea);
+        if (remap != (uint32_t)ea) {
+            static unsigned nsteal;
+            if (++nsteal <= 32u || (nsteal % 128u) == 0u)
+                fprintf(stderr,
+                        "[ovl12-steal] %s img=%d ovl=%d pc=0x%05X ea=0x%08X "
+                        "-> 0x%08X size=%u\n",
+                        mfc_is_put(cmd) ? "PUT" : "GET", spu->image_id,
+                        spu->resident_ovl, (uint32_t)spu->pc & SPU_LS_MASK,
+                        (uint32_t)ea, remap, size);
+            ea = remap;
+        }
+        if (mfc_is_get(cmd) && size >= 128u
+            && ((lsa & SPU_LS_MASK) == 0x3FE80u))
+            ovl12_occupancy_sync_liveA(spu, (uint32_t)ea);
     }
 
     /* Reject transfers whose main-memory range is not committed guest memory,
@@ -1100,12 +1122,14 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
      * EA and did not, the elements read back empty and the transfer is a no-op
      * -- which looks identical to "the pipeline never ran" from the PPU side. */
     { uint32_t _e = spu->list_stall_elem_lsa[t] & SPU_LS_MASK;
+      static unsigned nre;
+      if (++nre <= 24u || (nre % 256u) == 0u) {
       fprintf(stderr, "[mfc-list] RESUME-ELEMS dest=0x%05X elems\n0x%05X:",
               spu->list_stall_dest_lsa[t], _e);
       for (uint32_t _o = 0; _o < 16 && (_e + _o) + 3 < SPU_LS_SIZE; _o += 4)
           fprintf(stderr, " %02X%02X%02X%02X", spu->ls[_e+_o], spu->ls[_e+_o+1],
                   spu->ls[_e+_o+2], spu->ls[_e+_o+3]);
-      fprintf(stderr, "\n"); }
+      fprintf(stderr, "\n"); } }
     int rc = mfc_run_list(spu, spu->list_stall_elem_lsa[t], spu->list_stall_remaining[t],
                           spu->list_stall_dest_lsa[t], spu->list_stall_ea_base[t],
                           spu->list_stall_cmd[t], t);

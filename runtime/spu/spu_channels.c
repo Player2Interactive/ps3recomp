@@ -444,8 +444,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
      * 006947E8 (W70) never sees occupancy ready after CollBroad/CollNarrow
      * return. Prefer the RAM twin even when the IO EA itself is committed. */
     {
-        uint32_t ram = ovl12_io_to_ram((uint32_t)ea);
-        if (ram && mfc_ea_range_committed(ram, MFC_ATOMIC_LINE)) {
+        uint32_t ram = ovl12_occupancy_remap(ctx, (uint32_t)ea);
+        if (ram != (uint32_t)ea && mfc_ea_range_committed(ram, MFC_ATOMIC_LINE)) {
             mem = vm_base + ram;
             { static int s_u = 0;
               if (s_u++ < 8)
@@ -568,23 +568,6 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * and a store that lands after the read now leaves BOTH stale -- which
          * is what makes the lost-reservation event fire. */
         memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
-        /* Overlay-12 GETLLAR of IO 20020880: occupancy lives at RAM twin
-         * 00FC7D80. Copy the twin so the reserved line matches the producer. */
-        {
-            uint32_t ram = ovl12_io_to_ram((uint32_t)ea);
-            if (ram && mfc_ea_range_committed(ram, MFC_ATOMIC_LINE)) {
-                memcpy(ls, vm_base + ram, MFC_ATOMIC_LINE);
-                { static int s_ov = 0;
-                  if (s_ov++ < 8) {
-                      const uint8_t* r = vm_base + ram;
-                      fprintf(stderr, "[ovl12-llar] ea=0x%08X ram=0x%08X word0=0x%08X pc=0x%05X\n",
-                              (uint32_t)ea, ram,
-                              ((uint32_t)r[0]<<24)|((uint32_t)r[1]<<16)|
-                              ((uint32_t)r[2]<<8)|r[3],
-                              (uint32_t)ctx->pc & SPU_LS_MASK);
-                      fflush(stderr); } }
-            }
-        }
         /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
          * single atomic 128-byte read, so the reserved data and the reservation
          * come from the same instant. Reading guest memory twice lets a PPU store
@@ -889,12 +872,12 @@ static void spu_resv_lost_poll(spu_context* ctx)
 {
     if (!(ctx->event_mask & 0x400u) || !ctx->resv_valid) return;
     if (!vm_base || ctx->resv_ea == 0) return;
-    /* Overlay-12: GETLLAR EA is IO 20020880; occupancy is RAM 00FC7D80.
-     * Compare the twin only -- IO bytes may be poison/unmapped and would
-     * raise LR every poll, so EventStat would never park. */
+    /* Overlay-12: GETLLAR EA is IO 20020880; occupancy is RAM 00FC7D80
+     * (or a stolen Ice-parked peer). Compare the remapped line only --
+     * IO bytes may be poison/unmapped and would raise LR every poll. */
     {
-        uint32_t ram = ovl12_io_to_ram(ctx->resv_ea);
-        if (ram) {
+        uint32_t ram = ovl12_occupancy_remap(ctx, ctx->resv_ea);
+        if (ram != ctx->resv_ea) {
             if (memcmp(vm_base + ram, ctx->resv_line, 128) != 0) {
                 ctx->resv_valid = 0;
                 ctx->event_status |= 0x400u;
