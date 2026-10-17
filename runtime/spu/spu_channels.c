@@ -2463,18 +2463,91 @@ void spu_indirect_branch(spu_context* ctx)
      * `stop` is opcode 0 in the top 11 bits, so this is unambiguous. */
     if (!fn) {
         uint32_t p0 = ctx->pc & SPU_LS_MASK;
+        uint32_t w = 0;
         if (p0 + 3 < SPU_LS_SIZE) {
-            uint32_t w = ((uint32_t)ctx->ls[p0] << 24) | ((uint32_t)ctx->ls[p0+1] << 16) |
-                         ((uint32_t)ctx->ls[p0+2] << 8) | ctx->ls[p0+3];
-            if ((w >> 21) == 0u) {                 /* stop / stopd */
-                ctx->stop_code = w & 0x3FFFu;
-                static int _n = 0;
-                if (_n++ < 8)
-                    fprintf(stderr, "[spu] img=%d exit: synthesised stop 0x%04X at LS 0x%05X\n",
-                            ctx->image_id, ctx->stop_code, p0);
-                spu_halt(ctx);
+            w = ((uint32_t)ctx->ls[p0] << 24) | ((uint32_t)ctx->ls[p0+1] << 16) |
+                ((uint32_t)ctx->ls[p0+2] << 8) | ctx->ls[p0+3];
+        }
+        /* CollNarrow result buffer is LS 0x1A580 (RPCS3 PUT src → 00EF83D0).
+         * Zeros there decode as stop 0. A bad bi/bisl into that slot used to
+         * synthesised-stop and HALT lane 1, so mgr bit 0x20 was never cleared
+         * and CollBroad parked at 0x13A8. Resume the planted link (bisl) so
+         * the kind handler can finish +0x18 / ~0x28. */
+        {
+            int cn = (ctx->image_id == 11 || ctx->image_id == 12 ||
+                      ctx->image_id == 174);
+            unsigned sl;
+            for (sl = 0; sl < 4; ++sl)
+                if (ctx->resident_code[sl].image_id == 174) cn = 1;
+            /* Kind-4 C240/C2E0 bisl's r8. When the 0x10C00+4 EA slot is 0 or
+             * the result-buffer LS (0x1A580) leaked into r83, that lands in
+             * data: zeros at 0x1A580 decode as stop 0, and LS 0 is the job
+             * header (stop 0x1EAD). Either used to HALT lane 1 so bit 0x20
+             * never cleared. Resume the bisl link so the pair loop / 0xFD4C
+             * ~0x28 PUTF can finish. */
+            if (cn && (w >> 21) == 0u &&
+                (p0 == 0x1A580u || p0 == 0u ||
+                 (p0 >= 0x10900u && p0 < 0x10D00u))) {
+                uint32_t lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+                int in_body = (lr >= 0x120u && lr < 0x10CE0u);
+                if (in_body || p0 == 0x1A580u) {
+                    static int _n1a;
+                    if (_n1a++ < 16) {
+                        unsigned q;
+                        fprintf(stderr,
+                                "[collnarrow-badbisl] false-stop n=%d img=%d ovl=%d "
+                                "pc=0x%05X lr=0x%05X stop=0x%04X r83=0x%08X\n",
+                                _n1a, ctx->image_id, ctx->resident_ovl, p0, lr,
+                                w & 0x3FFFu, ctx->gpr[83]._u32[0]);
+                        fprintf(stderr, "      last PCs:");
+                        for (q = 0; q < 8; q++) {
+                            unsigned idx = (g_spu_pch_n + q) & 7u;
+                            if (g_spu_pch_n > q || g_spu_pch[idx])
+                                fprintf(stderr, " 0x%05X", g_spu_pch[idx]);
+                        }
+                        fprintf(stderr, "\n");
+                        fflush(stderr);
+                    }
+                    ctx->pc = lr;
+                    g_spu_trampoline_fn = 0;
+                    return;
+                }
+            }
+            /* Kind-4 FE38 GETs extra PIC from EA 0x00DB9580 into LS 0x10D00+.
+             * C2E0 bisl's that (r83=0x112B0). No static lift exists; run the
+             * live bytes so the pair writes +0x18 / ~0x28 instead of skip. */
+            if (cn && p0 >= 0x10D00u && p0 < 0x1A580u && (w >> 21) != 0u) {
+                static int _ni;
+                if (_ni++ < 16) {
+                    fprintf(stderr, "[collnarrow-interp] n=%d pc=0x%05X lr=0x%05X "
+                            "w=0x%08X r83=0x%08X\n",
+                            _ni, p0, ctx->gpr[0]._u32[0] & SPU_LS_MASK, w,
+                            ctx->gpr[83]._u32[0]);
+                    fflush(stderr);
+                }
+                g_spu_trampoline_fn = 0;
+                spu_interp_run(ctx, p0);
                 return;
             }
+        }
+        if (p0 + 3 < SPU_LS_SIZE && (w >> 21) == 0u) { /* stop / stopd */
+            ctx->stop_code = w & 0x3FFFu;
+            static int _n = 0;
+            if (_n++ < 8) {
+                unsigned q;
+                fprintf(stderr, "[spu] img=%d exit: synthesised stop 0x%04X at LS 0x%05X lr=0x%05X\n",
+                        ctx->image_id, ctx->stop_code, p0,
+                        ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+                fprintf(stderr, "      last PCs:");
+                for (q = 0; q < 8; q++) {
+                    unsigned idx = (g_spu_pch_n + q) & 7u;
+                    if (g_spu_pch_n > q || g_spu_pch[idx])
+                        fprintf(stderr, " 0x%05X", g_spu_pch[idx]);
+                }
+                fprintf(stderr, "\n");
+            }
+            spu_halt(ctx);
+            return;
         }
     }
 
