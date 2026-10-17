@@ -2829,6 +2829,48 @@ void spu_indirect_branch(spu_context* ctx)
             }
         }
     }
+    /* CollNarrow extra PIC (FE38 GET EA 0x00DBDB00 / 0x00DB9580 → LS 0x10D00+).
+     * Leftover job_00dba980 registers 0x10EC8 / 0x112B0 on images 11/12/174.
+     * A lifted hit here runs leftover instead of the DMA'd bytes, so later
+     * F5E8s stop and CollBroad waits at 0x13A8 for bit 0x20. Interp live. */
+    {
+        uint32_t pex = (uint32_t)ctx->pc & SPU_LS_MASK;
+        if (fn && pex >= 0x10D00u && pex < 0x1A580u) {
+            int cn = (ctx->image_id == 11 || ctx->image_id == 12 ||
+                      ctx->image_id == 174);
+            unsigned sl;
+            for (sl = 0; sl < 4; ++sl)
+                if (ctx->resident_code[sl].image_id == 174) cn = 1;
+            if (cn) {
+                uint32_t w = 0;
+                if (pex + 3u < SPU_LS_SIZE)
+                    w = ((uint32_t)ctx->ls[pex] << 24) | ((uint32_t)ctx->ls[pex + 1] << 16) |
+                        ((uint32_t)ctx->ls[pex + 2] << 8) | ctx->ls[pex + 3];
+                if ((w >> 21) != 0u) {
+                    static int _nex;
+                    if (_nex++ < 24) {
+                        fprintf(stderr,
+                                "[collnarrow-interp] extra n=%d pc=0x%05X lr=0x%05X "
+                                "w=0x%08X owner=%d\n",
+                                _nex, pex, ctx->gpr[0]._u32[0] & SPU_LS_MASK, w,
+                                code_owner);
+                        fflush(stderr);
+                    }
+                    g_spu_trampoline_fn = 0;
+                    {
+                        uint32_t lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+                        int32_t _si = ctx->image_id;
+                        ctx->image_id = -1;
+                        spu_interp_run_keep_nv(ctx, pex, lr ? lr : 0xC314u);
+                        ctx->image_id = _si;
+                        ctx->status = SPU_STATUS_RUNNING;
+                    }
+                    return;
+                }
+                fn = NULL;
+            }
+        }
+    }
     if (fn) {
         spu_check_stack_reset(ctx, fn);
         /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
