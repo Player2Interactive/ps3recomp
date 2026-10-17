@@ -316,6 +316,7 @@ static int spu_step(spu_context* ctx) {
 
 uint32_t g_spu_interp_last_pc = 0;
 uint64_t g_spu_interp_steps   = 0;
+uint32_t g_spu_interp_until   = 0;  /* 0 = disabled; else return when pc matches */
 
 /* Call-trace ring buffer for diagnosing SPU asserts (env SPU_CALLTRACE). */
 #define SPU_TRACE_N 32
@@ -368,11 +369,31 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
                 continue;
             }
         }
+        /* Extra-DMA PIC bisl return: stop at the planted link, do not keep
+         * interpreting CollNarrow body and do not rejoin leftover lifts that
+         * share those LSAs (job_00dba980 @ 0x112B0 on images 11/12/174). */
+        if (g_spu_interp_until && steps > 0 &&
+            (ctx->pc & 0x3FFFCu) == (g_spu_interp_until & 0x3FFFCu)) {
+            g_spu_interp_steps = steps;
+            g_spu_interp_last_pc = ctx->pc;
+            ctx->status = SPU_STATUS_RUNNING;
+            return 0;
+        }
+        if (g_spu_interp_until && steps > 8000000ull) {
+            fprintf(stderr, "[spu_interp] until=0x%05X cap pc=0x%05X steps=%llu\n",
+                    g_spu_interp_until, ctx->pc, (unsigned long long)steps);
+            fflush(stderr);
+            g_spu_interp_steps = steps;
+            g_spu_interp_last_pc = ctx->pc;
+            return 0x2001u;
+        }
         /* Rejoin the compiled fast path only for images that HAVE lifted
          * functions (image_id >= 0). image_id < 0 = pure interpretation: an
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
-         * another image's functions that happen to share an LS address. */
-        if (ctx->image_id >= 0 && spu_lifted_lookup(ctx, ctx->pc)) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+         * another image's functions that happen to share an LS address.
+         * until-mode also skips rejoin: leftover CollNarrow PIC overlays
+         * occupy the extra-DMA window. */
+        if (!g_spu_interp_until && ctx->image_id >= 0 && spu_lifted_lookup(ctx, ctx->pc)) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);

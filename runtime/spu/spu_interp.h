@@ -30,7 +30,13 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
 
 /* Interpret from `start_lsa` until the SPU stops (`stop`/`stopd`/halt) or a
  * host-fatal decode. Handles all control flow internally. Returns the stop
- * code (0 if none). ctx->pc holds the address that stopped execution. */
+ * code (0 if none). ctx->pc holds the address that stopped execution.
+ *
+ * When g_spu_interp_until is non-zero, skip lifted rejoin (DMA'd extra PIC
+ * shares LSAs with leftover lifts) and return 0 as soon as pc hits that
+ * address — the bisl link / call return. */
+extern uint32_t g_spu_interp_until;
+extern uint64_t g_spu_interp_steps;
 uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa);
 
 /* The single dispatch point every computed branch routes through. If `target`
