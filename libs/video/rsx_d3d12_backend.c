@@ -2002,13 +2002,10 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
 /* Ice wrap-183 FMV: SET_VERTEX_DATA2S writes window pixels in attrib0 and
  * matching texel UVs in attrib1. Guest VPs for that blit have been seen
  * writing o[0].w = -1 (clip-discard) or leaving pixels in clip with the
- * identity XY epilogue. One VS maps pixels -> NDC using vp_posscale.
- *
- * HWND / DXGI backbuffer (not a GCM destile) is the oracle: 9f6955e's
- * y' = 1-2y/h presented Ice FMV upside-down. Matching pos/UV means a
- * texel V flip is the same full-screen invert; a 0..1 `1-v` on 0..720
- * UVs was a no-op/wrong. Flip NDC Y here only (y' = 2y/h - 1) so RSX
- * window y=0 lands at the bottom of the D3D RT. Do not flip 3D/menu VPs. */
+ * identity XY epilogue. One VS maps pixels -> NDC using vp_posscale
+ * (filled as 2/w,-2/h,-1,1 for this path) and forwards attrib1 as TEX0.
+ * HWND FMV (fp=0x01903701, draws=1) is already upright with that map.
+ * Do not flip 2S V or this NDC Y; boot-card invert is a separate blit. */
 static ID3DBlob* ice_blit_vs_blob(void)
 {
     if (s_d3d.ice_blit_vs) return s_d3d.ice_blit_vs;
@@ -2070,6 +2067,24 @@ static int dr_ice_fmv_blit(const D3D12DrawRecord* dr)
            dr->tex[0].off >= 0x20000000u && dr->tex[0].off < 0xC0000000u;
 }
 
+/* Ice/Scaleform 2D boot cards (subtitle worm, install creature, SHOW IMAGE
+ * overlays): A8R8G8B8 UNNORM on a non-scanout size (960x704 LOCAL at
+ * 0x00880000 in ACIT). Not Y8 FMV, not the 1280x720 display-as-tex
+ * feedback, not the GFx 640x640 atlas (fmt 0x1E529). */
+static int dr_ice_card_blit(const D3D12DrawRecord* dr)
+{
+    u32 f, base;
+    if (!dr || !dr->tex[0].set) return 0;
+    if (dr_ice_fmv_blit(dr)) return 0;
+    f = dr->tex[0].fmt;
+    base = f & 0x9Fu;
+    if (base != 0x85u) return 0;
+    if (!(f & 0x40u)) return 0; /* UNNORM */
+    if (dr->tex[0].w < 256u || dr->tex[0].h < 256u) return 0;
+    if (dr->tex[0].w == 1280u && dr->tex[0].h == 720u) return 0;
+    return 1;
+}
+
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
                                           u32 cube_mask, int ice_blit)
@@ -2086,7 +2101,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     if (ice_blit) {
         vsb = ice_blit_vs_blob();
         if (vsb) {
-            vs_hash = 0x49434559u; /* 'ICEY' NDC Y vs ICEC */
+            vs_hash = 0x49434543u; /* 'ICEC' */
             vs_idx = -2;
         }
     }
@@ -3321,11 +3336,9 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
     /* Ice FMV (wrap-183): SET_VERTEX_DATA2S positions are window pixels
      * (0,0)..(1280,720) and the VP passes them through. Identity XY + a
      * 640/-360 GCM viewport left those coords in D3D clip, so the quad
-     * clipped to a sliver. Map pixels -> NDC on this blit only:
-     * x' = 2*x/w - 1, y' = 2*y/h - 1.
-     * 9f6955e used y' = 1-2y/h (RSX top-left -> D3D clip top). HWND and
-     * the DXGI backbuffer showed that Ice YUV upside-down; menus (guest
-     * VP) stay upright. */
+     * clipped to a sliver (present dumps nz~27/14400). Map pixels -> NDC:
+     * x' = 2*x/w - 1, y' = 1 - 2*y/h (RSX origin top-left, D3D Y-up).
+     * HWND FMV with this map is upright (fp=0x01903701). */
     if (dr && dr->tex[0].set &&
         (dr->tex[0].fmt & 0x9Fu) == 0x81u &&
         dr->tex[0].w == 1280u && dr->tex[0].h == 720u &&
@@ -3334,16 +3347,29 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
         float vh = dr->vp_h ? (float)dr->vp_h : 720.0f;
         if (vw >= 16.0f && vh >= 16.0f) {
             vpx[0] =  2.0f / vw;
-            vpx[1] =  2.0f / vh;
+            vpx[1] = -2.0f / vh;
             vpx[4] = -1.0f;
-            vpx[5] = -1.0f;
+            vpx[5] =  1.0f;
             { static unsigned n = 0;
               if (n++ < 8u)
                   fprintf(stderr,
                           "[bink-quad] pixel-ndc scale=%.5f,%.5f off=%.1f,%.1f "
-                          "vp_scale=%.1f,%.1f ysign=+%c",
+                          "vp_scale=%.1f,%.1f%c",
                           vpx[0], vpx[1], vpx[4], vpx[5], vs_[0], vs_[1], 10); }
         }
+    } else if (dr_ice_card_blit(dr)) {
+        /* Guest VP identity XY leaves Ice 2D overlay clip Y-down (RSX
+         * window). Negate NDC Y on this blit only so the 960x704 card
+         * matches let's-play (creature lower-left). Menus (GFx 640x640
+         * atlas) and FMV 2S YUV are different fmt/size and stay. */
+        vpx[1] = -1.0f;
+        { static unsigned n = 0;
+          if (n++ < 8u)
+              fprintf(stderr,
+                      "[ice-card] ndc-y scale=%.1f,%.1f off=%.1f,%.1f "
+                      "t0=%ux%u fmt=0x%02X%c",
+                      vpx[0], vpx[1], vpx[4], vpx[5],
+                      dr->tex[0].w, dr->tex[0].h, dr->tex[0].fmt, 10); }
     }
     /* DBG_ZOOM=<k> with DBG_CENTER="cx,cy": a debug camera applied in CLIP space,
      * not a framebuffer crop -- the geometry is re-rasterized at full resolution.
