@@ -975,7 +975,9 @@ static s32 savedata_execute(const char* dirName, int is_save,
     {
         int i;
         printf("[cellSaveData] holding save thread so FE can observe type!=idle\n");
-        for (i = 0; i < 32; ++i) {
+        /* drive28: 32×16ms returned before 004C6F6C saw type=2, so take
+         * stayed 0 and StartGame never ran. 128×16ms covers a busy FE tick. */
+        for (i = 0; i < 128; ++i) {
 #ifdef _WIN32
             Sleep(16);
 #else
