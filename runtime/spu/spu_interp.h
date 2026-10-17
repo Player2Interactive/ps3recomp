@@ -39,6 +39,13 @@ extern uint32_t g_spu_interp_until;
 extern uint64_t g_spu_interp_steps;
 uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa);
 
+/* CollNarrow extra-PIC bisl: interpret live DMA'd bytes until `until` (the
+ * planted link), then restore r0/r1/r2 and r80-r127. A nested helper that
+ * returns to that link skips the PIC trampoline epilogue and leaves r1 ~416
+ * bytes low, so the caller's stack reload of r91 (mailbox EA for the 0xF5E8
+ * PUT of 16 bytes to +0x10) reads the wrong slot. LS writes still stand. */
+uint32_t spu_interp_run_keep_nv(spu_context* ctx, uint32_t start_lsa, uint32_t until);
+
 /* The single dispatch point every computed branch routes through. If `target`
  * is a registered lifted entry, runs it; otherwise interprets from `target`.
  * The lifter emits `bi $reg` / unresolved indirect branches as a call here. */

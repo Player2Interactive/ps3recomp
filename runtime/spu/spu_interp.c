@@ -318,6 +318,44 @@ uint32_t g_spu_interp_last_pc = 0;
 uint64_t g_spu_interp_steps   = 0;
 uint32_t g_spu_interp_until   = 0;  /* 0 = disabled; else return when pc matches */
 
+uint32_t spu_interp_run_keep_nv(spu_context* ctx, uint32_t start_lsa, uint32_t until)
+{
+    u128 save_r0 = ctx->gpr[0];
+    u128 save_r1 = ctx->gpr[1];
+    u128 save_r2 = ctx->gpr[2];
+    u128 save_nv[48];
+    uint32_t r1_before = ctx->gpr[1]._u32[0];
+    uint32_t r91_before = ctx->gpr[91]._u32[0];
+    uint32_t rc;
+    int i;
+    for (i = 0; i < 48; i++)
+        save_nv[i] = ctx->gpr[80 + i];
+    g_spu_interp_until = until;
+    rc = spu_interp_run(ctx, start_lsa);
+    g_spu_interp_until = 0;
+    {
+        static unsigned n;
+        if (n < 16u) {
+            fprintf(stderr,
+                    "[spu-interp-nv] n=%u start=0x%05X until=0x%05X pc=0x%05X "
+                    "steps=%llu r1 %08X->%08X r91 %08X->%08X rc=%u\n",
+                    n, start_lsa, until, ctx->pc & 0x3FFFFu,
+                    (unsigned long long)g_spu_interp_steps,
+                    r1_before, ctx->gpr[1]._u32[0],
+                    r91_before, ctx->gpr[91]._u32[0], rc);
+            fflush(stderr);
+            n++;
+        }
+    }
+    ctx->gpr[0] = save_r0;
+    ctx->gpr[1] = save_r1;
+    ctx->gpr[2] = save_r2;
+    for (i = 0; i < 48; i++)
+        ctx->gpr[80 + i] = save_nv[i];
+    ctx->status = SPU_STATUS_RUNNING;
+    return rc;
+}
+
 /* Call-trace ring buffer for diagnosing SPU asserts (env SPU_CALLTRACE). */
 #define SPU_TRACE_N 32
 static struct { uint32_t from, to; } s_trace[SPU_TRACE_N];

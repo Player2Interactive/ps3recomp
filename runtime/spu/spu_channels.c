@@ -2527,13 +2527,10 @@ void spu_indirect_branch(spu_context* ctx)
                 }
                 g_spu_trampoline_fn = 0;
                 {
-                    extern uint32_t g_spu_interp_until;
                     uint32_t lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
                     int32_t _si = ctx->image_id;
                     ctx->image_id = -1;
-                    g_spu_interp_until = lr ? lr : 0xC314u;
-                    spu_interp_run(ctx, p0);
-                    g_spu_interp_until = 0;
+                    spu_interp_run_keep_nv(ctx, p0, lr ? lr : 0xC314u);
                     ctx->image_id = _si;
                     ctx->status = SPU_STATUS_RUNNING;
                 }
