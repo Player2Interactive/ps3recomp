@@ -1113,6 +1113,7 @@ static void vm_hotmap(uint32_t ea, int width)
 }
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;  /* fwd decl (defined below) */
 extern "C" void acit_ovl_enq_hang_dump(void);
+extern "C" __attribute__((weak)) void acit_wlist_hang_dump(void) {}
 /* Tracks the most recent vm_read32 {addr,value} on this thread, so PPU_WVAL can
  * report the SOURCE a copied value came from (poison propagation vs true origin). */
 static PPU_THREAD_LOCAL uint32_t g_last_rd_addr = 0;
@@ -1312,6 +1313,49 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch
                             be32(0x00EF83E0u), be32(0x00EF83E4u),
                             be32(0x00EF8400u), be32(0x00EF8404u),
                             be32(0x00EF8408u));
+                    /* 00555EAC heap-ring: slot = mgr+0xB0 + i*0xA0, wait +0x18. */
+                    {
+                        uint32_t toc = be32(0x00D0FF50u + 4u);
+                        uint32_t sda = toc ? be32(toc - 0x51D4u) : 0u;
+                        uint32_t mgr = sda ? be32(sda - 0x8000u) : 0u;
+                        uint32_t ring = mgr ? be32(mgr + 0xB0u) : 0u;
+                        uint32_t r3 = (uint32_t)g_active_ctx->gpr[3];
+                        int si, pend = 0;
+                        fprintf(stderr,
+                                "[ice-heap] hot16 r3=0x%08X guest=0x%08X "
+                                "toc=0x%08X sda=0x%08X mgr=0x%08X +F4=0x%08X "
+                                "ring=0x%08X door=0x%08X "
+                                "CF14=0x%08X CF1C=0x%08X "
+                                "CF40=0x%08X CF44=0x%08X CF48=0x%08X CF4C=0x%08X "
+                                "slot+00=0x%08X +10=0x%08X +14=0x%08X +18=0x%04X "
+                                "+1C=0x%08X\n",
+                                r3, ppu_prof_resolve_host(__builtin_return_address(0)),
+                                toc, sda, mgr, mgr ? be32(mgr + 0xF4u) : 0u,
+                                ring, be32(0x00F3CF30u),
+                                be32(0x00F3CF14u), be32(0x00F3CF1Cu),
+                                be32(0x00F3CF40u), be32(0x00F3CF44u),
+                                be32(0x00F3CF48u), be32(0x00F3CF4Cu),
+                                r3 ? be32(r3) : 0u,
+                                r3 ? be32(r3 + 0x10u) : 0u,
+                                r3 ? be32(r3 + 0x14u) : 0u,
+                                r3 ? (uint16_t)(be32(r3 + 0x18u) >> 16) : 0u,
+                                r3 ? be32(r3 + 0x1Cu) : 0u);
+                        if (ring >= 0x10000u) {
+                            for (si = 0; si < 16 && pend < 6; si++) {
+                                uint32_t slot = ring + (uint32_t)si * 0xA0u;
+                                int16_t kind = (int16_t)(be32(slot + 0x18u) >> 16);
+                                if (kind <= 0)
+                                    continue;
+                                pend++;
+                                fprintf(stderr,
+                                        "[ice-heap]   slot[%d]=0x%08X +0=0x%08X "
+                                        "+10=0x%08X +14=0x%08X +18=0x%04X +1C=0x%08X\n",
+                                        si, slot, be32(slot),
+                                        be32(slot + 0x10u), be32(slot + 0x14u),
+                                        (uint16_t)kind, be32(slot + 0x1Cu));
+                            }
+                        }
+                    }
                     /* 00555A18 skip is *(SDA-0x7F60)=00F38D80. Dump only. */
                     {
                         uint32_t req = (uint32_t)g_active_ctx->gpr[31];
@@ -2878,10 +2922,19 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
             uint32_t opd = (uint32_t)ctx->gpr[12];
             uint32_t o0 = (opd && vm_base) ? __builtin_bswap32(*(volatile uint32_t*)(vm_base+opd)) : 0;
             fprintf(stderr, "[ppu] bctr to NULL from %s r12(opd)=0x%08X opd[0]=0x%08X "
-                    "(r3=0x%08X r4=0x%08X "
-                    "tid=%llu) -- returning with r3 untouched\n", who, opd, o0,
+                    "(r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X r31=0x%08X "
+                    "cia=0x%08X lr=0x%08X tid=%llu) -- returning with r3 untouched\n",
+                    who, opd, o0,
                     (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
-                    (unsigned long long)ctx->thread_id); } }
+                    (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6],
+                    (uint32_t)ctx->gpr[31],
+                    (uint32_t)ctx->cia, (uint32_t)ctx->lr,
+                    (unsigned long long)ctx->thread_id);
+            /* 002A4B90 / 002A2FE4 one-shot: r3=0x1AC0 is a node src id, not
+             * a pointer. Dump the wlist; do not plant a vtable. */
+            if ((uint32_t)ctx->gpr[3] < 0x10000u && n <= 8)
+                acit_wlist_hang_dump();
+          } }
         return;
         }
     }
