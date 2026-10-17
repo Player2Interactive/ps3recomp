@@ -466,11 +466,11 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             if ((return_pc & SPU_LS_MASK) == 0x3F940u) {
                 int wrap = 0;
                 unsigned sw;
-                /* Leftover 189 (00AFA200) stop-0 at 0x15CC is the empty
-                 * qword path after the 256-byte GET. stop returns with no
-                 * trampoline, so drain would restart_dispatch(0x15CC) and
-                 * overlay 3F940 never PUTLLCs the slot persist waits on.
-                 * Resume the bisl link; do not plant occupancy. */
+                /* Leftover 189 (00AFA200) stop-0 at 0x15CC: 0xCC8 saw a
+                 * zero qword at LS 0x2C380 (descriptor, not GET dest
+                 * 0x2C180). Resuming overlay 3F940 while 189 still occupies
+                 * LS 0x100..0x3DC0 BRANCH-TO-0s at 0x1F4 (draw3n). Dump the
+                 * empty descriptor and GET regs; do not skip the stop. */
                 if ((ctx->status & SPU_STATUS_STOPPED_BY_STOP) &&
                     ctx->stop_code == 0u && jpc == 0x15CCu) {
                     int has189 = 0;
@@ -484,14 +484,30 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                         if (++n189 <= 16u) {
                             fprintf(stderr,
                                     "[ovl-189] leftover stop-0 pc=0x%05X "
-                                    "resume 3F940 img=%d\n",
-                                    jpc, ctx->image_id);
+                                    "img=%d lr=0x%05X r83=0x%08X r95=0x%08X "
+                                    "r96=0x%08X 2C100=%08X %08X %08X %08X "
+                                    "2C180=%08X %08X %08X %08X "
+                                    "2C380=%08X %08X %08X %08X "
+                                    "(no 3F940 resume)\n",
+                                    jpc, ctx->image_id,
+                                    ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                                    ctx->gpr[83]._u32[0],
+                                    ctx->gpr[95]._u32[0],
+                                    ctx->gpr[96]._u32[0],
+                                    spu_ls_read32(ctx, 0x2C100u),
+                                    spu_ls_read32(ctx, 0x2C104u),
+                                    spu_ls_read32(ctx, 0x2C108u),
+                                    spu_ls_read32(ctx, 0x2C10Cu),
+                                    spu_ls_read32(ctx, 0x2C180u),
+                                    spu_ls_read32(ctx, 0x2C184u),
+                                    spu_ls_read32(ctx, 0x2C188u),
+                                    spu_ls_read32(ctx, 0x2C18Cu),
+                                    spu_ls_read32(ctx, 0x2C380u),
+                                    spu_ls_read32(ctx, 0x2C384u),
+                                    spu_ls_read32(ctx, 0x2C388u),
+                                    spu_ls_read32(ctx, 0x2C38Cu));
                             fflush(stderr);
                         }
-                        ctx->pc = 0x3F940u;
-                        ctx->status = SPU_STATUS_RUNNING;
-                        g_spu_trampoline_fn = 0;
-                        return;
                     }
                 }
                 for (sw = 0; sw < 4; ++sw) {
@@ -557,6 +573,20 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             || ((pc == 0x2CF0u || pc == 0x2CF8u)
                 && (ret == 0x3048u || ret == 0x3078u))
             || planted;
+        /* Leftover 189 empty-descriptor stop at 0x15CC: intentional yield
+         * while overlay bisl link is 0x3F940. restart_dispatch longjmps out
+         * of the wrap with LS 0x100..0x3DC0 still image 189; planting pc at
+         * 3F940 BRANCH-TO-0s through clobbered low overlay (draw3n). Return
+         * to the bisl caller and leave stop status for SPURS wake. */
+        if (ret == 0x3F940u && pc == 0x15CCu &&
+            (ctx->status & SPU_STATUS_STOPPED_BY_STOP) && ctx->stop_code == 0u) {
+            unsigned s189;
+            for (s189 = 0; s189 < 4; ++s189)
+                if (ctx->resident_code[s189].image_id == 189) {
+                    resume_caller = 1;
+                    break;
+                }
+        }
         if (ret == 0x3F940u) {
             int has183d = (ctx->resident_ovl == 183);
             unsigned s183d;
