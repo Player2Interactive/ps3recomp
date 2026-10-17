@@ -75,6 +75,27 @@ static spu_context* s_coh_ctxs[SPU_COH_MAX_CTX];
 unsigned long g_spu_lr_raise = 0;
 
 extern uint8_t* vm_base;
+static unsigned char s_leftover_179[8];
+
+static uint32_t ovl12_load_be32(uint32_t ea)
+{
+    const uint8_t* p;
+    if (!vm_base) return 0;
+    p = vm_base + ea;
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+         | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static void ovl12_store_be32(uint32_t ea, uint32_t v)
+{
+    uint8_t* p;
+    if (!vm_base) return;
+    p = vm_base + ea;
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
 
 /* liveA 00FC7B00+lane<<7, liveB 00FC7D80+lane<<7. slot 0=A, 1=B. */
 static int ovl12_occupancy_lane(uint32_t ram, uint32_t* line_off, int* slot)
@@ -127,6 +148,71 @@ void ovl12_occupancy_sync_liveA(spu_context* ctx, uint32_t liveB_ram)
     if (slot != 1 || lane < 0 || lane > 3) return;
     liveA = 0x00FC7B00u + ((uint32_t)lane << 7);
     memcpy(&ctx->ls[0x3FE00], vm_base + liveA, 128);
+}
+
+void ovl12_note_leftover_wrap(spu_context* ctx)
+{
+    unsigned id;
+    if (!ctx) return;
+    id = ctx->spu_id;
+    if (id < 8u)
+        s_leftover_179[id] = 1;
+}
+
+void ovl12_complete_after_leftover(spu_context* ctx)
+{
+    unsigned id;
+    uint32_t handle, idx, field, liveA, liveB, a, b;
+    if (!ctx || !vm_base) return;
+    id = ctx->spu_id;
+    if (id >= 8u || !s_leftover_179[id]) return;
+    s_leftover_179[id] = 0;
+    handle = ovl12_load_be32(0x00F7B48Cu);
+    if (!handle) {
+        s_leftover_179[id] = 1;
+        return;
+    }
+    idx = handle & 0x3FFu;
+    field = (handle >> 10) & 7u;
+    liveA = 0x00FC7B00u + (field << 7);
+    liveB = 0x00FC7D80u + (field << 7);
+    a = ovl12_load_be32(liveA);
+    b = ovl12_load_be32(liveB);
+    {
+        static unsigned n;
+        if (++n <= 16u)
+            fprintf(stderr,
+                    "[ovl-179] ret n=%u spu=%u handle=0x%08X field=%u idx=0x%03X "
+                    "A@%08X=0x%08X B@%08X=0x%08X lane0 A=0x%08X B=0x%08X "
+                    "lane3 A=0x%08X B=0x%08X\n",
+                    n, id, handle, field, idx, liveA, a, liveB, b,
+                    ovl12_load_be32(0x00FC7B00u), ovl12_load_be32(0x00FC7D80u),
+                    ovl12_load_be32(0x00FC7C80u), ovl12_load_be32(0x00FC7F00u));
+        fflush(stderr);
+    }
+    /* 00696614 decodes 00F7B488 as packed occupancy. field 4 is the gap
+     * 00FC7D00/00FC7F80, not CollBroad lane 0. Overlay 3F940 only PUTLLCs
+     * the running SPU's lane 0-3, so leftover 179 on SPU3 never publishes
+     * that wait. Complete liveA=liveB there after the wrap actually
+     * returned. Do not touch lanes 0-3 (CollBroad/CollNarrow Ice waits). */
+    if (field < 4u)
+        return;
+    if (b > 0xFFu || a == b || (b == 0u && a > 0xFFu)) {
+        fprintf(stderr,
+                "[ovl-179] skip-complete field=%u A=0x%08X B=0x%08X "
+                "(no posted 8-bit liveB)\n",
+                field, a, b);
+        fflush(stderr);
+        return;
+    }
+    spu_lockline_lock();
+    ovl12_store_be32(liveA, b);
+    spu_coh_notify_write(liveA);
+    spu_lockline_unlock();
+    fprintf(stderr,
+            "[ovl-179] complete field=%u A 0x%08X -> 0x%08X (was 0x%08X)\n",
+            field, liveA, b, a);
+    fflush(stderr);
 }
 
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)

@@ -2404,9 +2404,12 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
          a == 0x00F23558u || a == 0x00F2355Cu ||
          a == 0x00F7B488u || a == 0x00F7B48Cu)) {
         static unsigned _n;
-        if (_n++ < 48u) {
+        int keep = (_n < 48u)
+                 || ((a == 0x00F7B488u || a == 0x00F7B48Cu) && v != 0u && _n < 96u);
+        if (keep) {
             extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
             ppu_context* c = g_active_ctx;
+            _n++;
             fprintf(stderr,
                     "[ovl-cell] n=%u 0x%08X <- 0x%08X w%d guest-fn=0x%08X "
                     "cia=0x%08X lr=0x%08X r3=0x%08X walk+4=0x%08X%s\n",
@@ -2416,7 +2419,8 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
                     vm_read32(0x00EB3980u + 4u),
                     v ? "" : "  <<< ZERO");
             fflush(stderr);
-        } else if (_n == 49u) {
+        } else if (_n == 48u) {
+            _n++;
             fprintf(stderr, "[ovl-cell] --- print cap 48 reached ---\n");
             fflush(stderr);
         }

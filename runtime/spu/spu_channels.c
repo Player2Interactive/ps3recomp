@@ -2411,6 +2411,8 @@ void spu_indirect_branch(spu_context* ctx)
     /* Dump-only: image-178 CRT / ctor bisl / main / GETLLAR helper. */
     {
         uint32_t p = (uint32_t)ctx->pc & SPU_LS_MASK;
+        if (p == 0x3F940u)
+            ovl12_complete_after_leftover(ctx);
         if (p == 0x17A8u || p == 0x1830u || p == 0x1834u || p == 0x158u ||
             p == 0x14A0u || p == 0x1AB0u || p == 0x230u ||
             p == 0x810u || p == 0x89Cu || p == 0x1628u || p == 0x900u || p == 0x30D0u ||
@@ -2434,17 +2436,26 @@ void spu_indirect_branch(spu_context* ctx)
                            | ((uint32_t)vm_base[0x00F7B48D] << 16)
                            | ((uint32_t)vm_base[0x00F7B48E] << 8)
                            | vm_base[0x00F7B48F];
-                if (h) {
-                    static unsigned n179;
-                    if (++n179 <= 16u)
-                        fprintf(stderr,
-                                "[ovl-179] leftover n=%u spu=%u lr=0x%05X "
-                                "r3=%08X handle=0x%08X\n",
-                                n179, ctx->spu_id,
-                                ctx->gpr[0]._u32[0] & SPU_LS_MASK,
-                                ctx->gpr[3]._u32[0], h);
-                    fflush(stderr);
-                }
+                static unsigned n179;
+                ovl12_note_leftover_wrap(ctx);
+                if (++n179 <= 16u)
+                    fprintf(stderr,
+                            "[ovl-179] leftover n=%u spu=%u lr=0x%05X "
+                            "r3=%08X handle=0x%08X field=%u idx=0x%03X "
+                            "F4A=0x%08X F4B=0x%08X\n",
+                            n179, ctx->spu_id,
+                            ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                            ctx->gpr[3]._u32[0], h,
+                            (h >> 10) & 7u, h & 0x3FFu,
+                            ((uint32_t)vm_base[0x00FC7D00] << 24)
+                          | ((uint32_t)vm_base[0x00FC7D01] << 16)
+                          | ((uint32_t)vm_base[0x00FC7D02] << 8)
+                          | vm_base[0x00FC7D03],
+                            ((uint32_t)vm_base[0x00FC7F80] << 24)
+                          | ((uint32_t)vm_base[0x00FC7F81] << 16)
+                          | ((uint32_t)vm_base[0x00FC7F82] << 8)
+                          | vm_base[0x00FC7F83]);
+                fflush(stderr);
             }
         }
         if (p == 0x598u || p == 0x59Cu || p == 0x620u || p == 0x638u || p == 0x508u

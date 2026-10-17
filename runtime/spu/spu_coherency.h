@@ -61,12 +61,16 @@ static inline uint32_t ovl12_ram_to_io(uint32_t ea)
  * while packer 00695E84 posts occupancy on that lane. Occupancy remap is
  * IO→RAM only — a peer-lane steal acked liveA without running 00B5D900.
  * Do not yield Ice→3F6C8: 00B5D900 already runs on idle SPU3; yield
- * aborts CollBroad Ice-waits. Does not poke Ice / doorbell. */
+ * aborts CollBroad Ice-waits. After leftover 179 returns to 3F940,
+ * complete occupancy at 00696614's handle cells (field 4 is 00FC7D00,
+ * not lane 0). Does not poke Ice / doorbell. */
 uint32_t ovl12_occupancy_remap(const spu_context* ctx, uint32_t ea);
 int ovl12_should_yield_ice(const spu_context* ctx, uint32_t ea);
 /* After a GET of liveB into LS 3FE80, copy that lane's liveA into 3FE00
  * so 3F750 compares a coherent pair (the wait loop does not re-GET liveA). */
 void ovl12_occupancy_sync_liveA(spu_context* ctx, uint32_t liveB_ram);
+void ovl12_note_leftover_wrap(spu_context* ctx);
+void ovl12_complete_after_leftover(spu_context* ctx);
 
 /* The lock-line lock. One process-wide spinlock serializing every lock-line
  * transaction, SPU and PPU alike: the SPU's GETLLAR snapshot and PUTLLC
