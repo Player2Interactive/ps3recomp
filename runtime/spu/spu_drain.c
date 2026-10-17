@@ -466,6 +466,34 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             if ((return_pc & SPU_LS_MASK) == 0x3F940u) {
                 int wrap = 0;
                 unsigned sw;
+                /* Leftover 189 (00AFA200) stop-0 at 0x15CC is the empty
+                 * qword path after the 256-byte GET. stop returns with no
+                 * trampoline, so drain would restart_dispatch(0x15CC) and
+                 * overlay 3F940 never PUTLLCs the slot persist waits on.
+                 * Resume the bisl link; do not plant occupancy. */
+                if ((ctx->status & SPU_STATUS_STOPPED_BY_STOP) &&
+                    ctx->stop_code == 0u && jpc == 0x15CCu) {
+                    int has189 = 0;
+                    for (sw = 0; sw < 4; ++sw)
+                        if (ctx->resident_code[sw].image_id == 189) {
+                            has189 = 1;
+                            break;
+                        }
+                    if (has189) {
+                        static unsigned n189;
+                        if (++n189 <= 16u) {
+                            fprintf(stderr,
+                                    "[ovl-189] leftover stop-0 pc=0x%05X "
+                                    "resume 3F940 img=%d\n",
+                                    jpc, ctx->image_id);
+                            fflush(stderr);
+                        }
+                        ctx->pc = 0x3F940u;
+                        ctx->status = SPU_STATUS_RUNNING;
+                        g_spu_trampoline_fn = 0;
+                        return;
+                    }
+                }
                 for (sw = 0; sw < 4; ++sw) {
                     int id = ctx->resident_code[sw].image_id;
                     if (id == 184 &&
