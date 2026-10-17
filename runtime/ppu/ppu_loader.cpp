@@ -3023,6 +3023,28 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * unwound to the initial frame (or a not-yet-populated function pointer).
      * Don't treat it as an unresolved call -- just return to the caller. */
     if (addr == 0) {
+        /* ctr==0 while r12 names an unlinked .lib.stub (`li r12,0` =
+         * 0x39800000). Import trampolines load the stub VA into r12 and
+         * bctr; a lift that omitted mtctr, or a caller whose CTR was left
+         * 0 by a finished bdnz, then hits this NULL path and never reaches
+         * the 0x39800000 catcher in acit_hle_stubs. That is SCREAM mixer's
+         * 00992418 / 00981858 stall (r12=0x00A49D9C = sys_ppu_thread_get_id
+         * stub). Dispatch the catcher; a genuine NULL whose leftover r12 is
+         * not a stub is unchanged. */
+        {   uint32_t _opd = (uint32_t)ctx->gpr[12];
+            uint32_t _c = 0;
+            if (_opd && vm_base && !vm_oob(_opd, 4u))
+                _c = __builtin_bswap32(*(volatile uint32_t*)(vm_base + _opd));
+            if (_c == 0x39800000u) {
+                static int _nstub;
+                if (_nstub++ < 16)
+                    fprintf(stderr,
+                            "[ppu] stub-recover: ctr=0 r12=0x%08X -> 0x39800000 catcher\n",
+                            _opd);
+                addr = 0x39800000u;
+                ctx->ctr = addr;
+            }
+        }
         /* PPU_OPD_RECOVER=1: ctr==0 while r12 still points at a VALID OPD means
          * the lifted thunk failed to load the code word -- not that the function
          * pointer is genuinely null. We already read opd[0] for the diagnostic
@@ -3032,6 +3054,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
          * engine never establishes a screen render-target config.
          *
          * Off by default: a genuinely-null pointer must still return quietly. */
+        if (addr == 0) {
         {   static int _rec = -1;
             if (_rec < 0) { const char* e = getenv("PPU_OPD_RECOVER"); _rec = e ? 1 : 0; }
             uint32_t _opd = (uint32_t)ctx->gpr[12];
@@ -3044,6 +3067,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
                     addr = _c;
                 }
             }
+        }
         }
         if (addr == 0) {
         /* Returning silently leaves r3 HOLDING THE FIRST ARGUMENT, so the guest
