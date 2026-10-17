@@ -457,6 +457,35 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
          * link. boot_31c8.err [wws-attach] RESTART pc=0x0412C. */
         {
             uint32_t jpc = (uint32_t)ctx->pc & SPU_LS_MASK;
+            /* Overlay-12 bisl return 0x3F940: leftover wraps 183/184 tail
+             * through CRT (C8E8→C988→0x4B58→C9C8) with image_id still 11.
+             * SPU_RET at host_depth>0 clears the trampoline; without a keep
+             * the drain treats that as a non-local return and HALTs, so
+             * wrap-184 never finishes the heap-ring +0x18 write. */
+            extern int spu_context_owns_pc(const spu_context* ctx, uint32_t pc);
+            if ((return_pc & SPU_LS_MASK) == 0x3F940u) {
+                int wrap = 0;
+                unsigned sw;
+                for (sw = 0; sw < 4; ++sw) {
+                    int id = ctx->resident_code[sw].image_id;
+                    if (id == 184 &&
+                        jpc >= ctx->resident_code[sw].lsa &&
+                        jpc - ctx->resident_code[sw].lsa <
+                            ctx->resident_code[sw].size) {
+                        wrap = id;
+                        break;
+                    }
+                }
+                if (wrap && spu_context_owns_pc(ctx, jpc)) {
+                    static int _w184;
+                    if (_w184++ < 24)
+                        fprintf(stderr, "[ovl-184] keep job pc=0x%05X ret=0x3F940 "
+                                "img=%d wrap=%d\n",
+                                jpc, ctx->image_id, wrap);
+                    g_spu_trampoline_fn = spu_indirect_branch;
+                    continue;
+                }
+            }
             if ((return_pc & SPU_LS_MASK) == 0x3258u &&
                 (ctx->image_id == 10 || ctx->image_id == 2) &&
                 jpc >= 0x4000u && jpc < 0x3E000u) {

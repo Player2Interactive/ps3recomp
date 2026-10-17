@@ -1694,10 +1694,39 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                 for (unsigned slot = 0; slot < 4; ++slot) {
                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != claim_lsa)
                         continue;
+                    { int prev_img = ctx->resident_code[slot].image_id;
+                      uint32_t prev_src = ctx->resident_code[slot].source_ea;
                     ctx->resident_code[slot].lsa = claim_lsa;
                     ctx->resident_code[slot].size = o->span;
                     ctx->resident_code[slot].source_ea = claim_ea;
                     ctx->resident_code[slot].image_id = o->image_id;
+                    /* Only when a DIFFERENT body overwrites the span: wrap-184
+                     * replacing CollBroad left a parked list at 0x1518 that
+                     * then read wrap-184 .text as empty RESUME-ELEMS dest=0.
+                     * Continuation GETs of the same image must keep their
+                     * own in-flight lists. */
+                    if (o->image_id == 184 &&
+                        (prev_img != 184 || prev_src != claim_ea)) {
+                      int t;
+                      for (t = 0; t < 32; t++) {
+                          uint32_t el;
+                          if (!(ctx->list_stall_mask & (1u << t))) continue;
+                          el = ctx->list_stall_elem_lsa[t];
+                          if (el >= claim_lsa &&
+                              el < claim_lsa + o->span) {
+                              ctx->list_stall_mask &= ~(1u << t);
+                              ctx->list_stall_stat &= ~(1u << t);
+                              ctx->list_stall_dest_lsa[t] = 0;
+                              ctx->list_stall_remaining[t] = 0;
+                              { static int _st;
+                                if (_st++ < 8)
+                                    fprintf(stderr, "[ovl-184] drop stale list "
+                                            "tag=%d elem@0x%05X prev_img=%d\n",
+                                            t, el, prev_img); }
+                          }
+                      }
+                    }
+                    }
                     { static int _n = 0;
                       int log183 = (o->image_id == 183);
                       int log184 = (o->image_id == 184);
@@ -2297,13 +2326,34 @@ void spu_indirect_branch(spu_context* ctx)
      * bytes that GET just wrote. */
     if (!fn && ((uint32_t)ctx->pc & SPU_LS_MASK) == 0xC8E8u)
         fn = spu_lookup(ctx->pc, 184);
+    /* Wrap-184 work PCs share LS 0x100 with CollBroad (173), which is
+     * dual-registered on image 11/12. If the span owns 184 but lookup
+     * missed (mid-function PC) do not fall through to 173's .word stub. */
+    if (!fn) {
+        uint32_t pw = (uint32_t)ctx->pc & SPU_LS_MASK;
+        unsigned sw;
+        for (sw = 0; sw < 4; ++sw) {
+            if (ctx->resident_code[sw].image_id == 184 &&
+                pw >= ctx->resident_code[sw].lsa &&
+                pw - ctx->resident_code[sw].lsa <
+                    ctx->resident_code[sw].size) {
+                fn = spu_lookup(pw, 184);
+                if (fn) code_owner = 184;
+                break;
+            }
+        }
+    }
     {
         uint32_t p184 = (uint32_t)ctx->pc & SPU_LS_MASK;
-        if (p184 == 0xC8E8u) {
+        if (p184 == 0xC8E8u || p184 == 0xC988u || p184 == 0x4B48u ||
+            p184 == 0x4B58u || p184 == 0x6E28u || p184 == 0xC9C8u) {
             static int _n184b;
-            if (_n184b++ < 12)
-                fprintf(stderr, "[ovl-184] ibranch pc=0x0C8E8 img=%d ovl=%d owner=%d fn=%p\n",
-                        ctx->image_id, ctx->resident_ovl, code_owner, (void*)fn);
+            if (_n184b++ < 24)
+                fprintf(stderr, "[ovl-184] ibranch pc=0x%05X img=%d ovl=%d "
+                        "owner=%d fn=%p r1=0x%05X r3=0x%08X\n",
+                        p184, ctx->image_id, ctx->resident_ovl, code_owner,
+                        (void*)fn, ctx->gpr[1]._u32[0] & SPU_LS_MASK,
+                        ctx->gpr[3]._u32[0]);
         }
     }
     /* Dump-only: image-178 CRT / ctor bisl / main / GETLLAR helper. */
