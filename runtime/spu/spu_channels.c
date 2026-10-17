@@ -584,6 +584,36 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * 0 here made job_00b9b580's `rdch; brz` at LS 0x12E0 spin forever. */
         ctx->atomic_stat = MFC_GETLLAR_SUCCESS;
         spu_lockline_unlock();
+        /* Leftover wrap 00B5D900 is posted on this lane while CollBroad parks
+         * on Ice GETLLAR. Occupancy steal acked A without running the wrap.
+         * Return to overlay 3F6C8 so the owner SPU dispatches it. */
+        if (ovl12_should_yield_ice(ctx, ea)) {
+            uint32_t from = (uint32_t)ctx->pc & SPU_LS_MASK;
+            ctx->resv_valid = 0;
+            ctx->pc = 0x3F6C8;
+            {
+                static unsigned n;
+                if (++n <= 16u || (n % 64u) == 0u)
+                    fprintf(stderr,
+                            "[ovl12-yield] n=%u spu=%u Ice GETLLAR pc=0x%05X "
+                            "-> 3F6C8 A=0x%08X B=0x%08X handle=0x%08X\n",
+                            n, ctx->spu_id, from,
+                            vm_base ? ((uint32_t)vm_base[0x00FC7B00] << 24)
+                                      | ((uint32_t)vm_base[0x00FC7B01] << 16)
+                                      | ((uint32_t)vm_base[0x00FC7B02] << 8)
+                                      | vm_base[0x00FC7B03] : 0u,
+                            vm_base ? ((uint32_t)vm_base[0x00FC7D80] << 24)
+                                      | ((uint32_t)vm_base[0x00FC7D81] << 16)
+                                      | ((uint32_t)vm_base[0x00FC7D82] << 8)
+                                      | vm_base[0x00FC7D83] : 0u,
+                            vm_base ? ((uint32_t)vm_base[0x00F7B48C] << 24)
+                                      | ((uint32_t)vm_base[0x00F7B48D] << 16)
+                                      | ((uint32_t)vm_base[0x00F7B48E] << 8)
+                                      | vm_base[0x00F7B48F] : 0u);
+                fflush(stderr);
+            }
+            spu_restart_dispatch(ctx);
+        }
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *
@@ -927,9 +957,32 @@ static int spu_ch_wait_enabled(spu_context* ctx, uint32_t channel)
     return 0;
 }
 
+static void ovl12_yield_waiting_ice(spu_context* ctx)
+{
+    uint32_t from;
+    if (!ctx || !ctx->resv_valid) return;
+    if (!ovl12_should_yield_ice(ctx, ctx->resv_ea)) return;
+    from = (uint32_t)ctx->pc & SPU_LS_MASK;
+    ctx->resv_valid = 0;
+    ctx->pc = 0x3F6C8;
+    {
+        static unsigned n;
+        if (++n <= 16u || (n % 64u) == 0u)
+            fprintf(stderr,
+                    "[ovl12-yield] wait n=%u spu=%u pc=0x%05X -> 3F6C8 "
+                    "resv=0x%08X\n",
+                    n, ctx->spu_id, from, ctx->resv_ea);
+        fflush(stderr);
+    }
+    ctx->status = SPU_STATUS_RUNNING;
+    spu_restart_dispatch(ctx);
+}
+
 /* Block the calling SPU host thread until `channel` is readable. */
 static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 {
+    if (channel == SPU_RdEventStat)
+        ovl12_yield_waiting_ice(ctx);
     if (!spu_ch_wait_enabled(ctx, channel) || spu_ch_ready(ctx, channel)) return;
 
     { static unsigned long bn = 0; unsigned long n = ++bn;
@@ -949,6 +1002,11 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
                                           (SRWLOCK*)&ctx->ch_wait_lock, 10, 0);
             ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             unsigned long long waited = GetTickCount64() - start;
+            if (channel == SPU_RdEventStat &&
+                ovl12_should_yield_ice(ctx, ctx->resv_ea)) {
+                yz_lockstep_block_end(ctx);
+                ovl12_yield_waiting_ice(ctx);
+            }
             if (waited >= next_hb) {
                 fprintf(stderr, "[ch-wait] spu=%X pc=0x%05X ch=%u waited=%llums evstat=0x%X evmask=0x%X resv[valid=%d ea=0x%08X]\n",
                         ctx->spu_id, ctx->pc & SPU_LS_MASK, channel, waited,
@@ -2370,6 +2428,23 @@ void spu_indirect_branch(spu_context* ctx)
                         t[0],t[1],t[2],t[3], t[4],t[5],t[6],t[7],
                         t[8],t[9],t[10],t[11], t[12],t[13],t[14],t[15]);
                 fflush(stderr);
+            }
+            if (p == 0x810u && code_owner == 179 && vm_base) {
+                uint32_t h = ((uint32_t)vm_base[0x00F7B48C] << 24)
+                           | ((uint32_t)vm_base[0x00F7B48D] << 16)
+                           | ((uint32_t)vm_base[0x00F7B48E] << 8)
+                           | vm_base[0x00F7B48F];
+                if (h) {
+                    static unsigned n179;
+                    if (++n179 <= 16u)
+                        fprintf(stderr,
+                                "[ovl-179] leftover n=%u spu=%u lr=0x%05X "
+                                "r3=%08X handle=0x%08X\n",
+                                n179, ctx->spu_id,
+                                ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                                ctx->gpr[3]._u32[0], h);
+                    fflush(stderr);
+                }
             }
         }
         if (p == 0x598u || p == 0x59Cu || p == 0x620u || p == 0x638u || p == 0x508u

@@ -514,8 +514,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     }
 
     /* Overlay-12 occupancy IO is a GCM poison window, not a hardware alias.
-     * Idle SPU2/3 also steal a pending Ice-parked lane's RAM cells so a
-     * leftover wrap posted while CollBroad sits on 00F3CF00 still runs. */
+     * IO→RAM only. A leftover wrap posted while CollBroad sits on 00F3CF00
+     * is dispatched by yielding that Ice-parked SPU back to overlay 3F6C8. */
     {
         uint32_t remap = ovl12_occupancy_remap(spu, (uint32_t)ea);
         if (remap != (uint32_t)ea) {

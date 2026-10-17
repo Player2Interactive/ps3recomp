@@ -58,11 +58,12 @@ static inline uint32_t ovl12_ram_to_io(uint32_t ea)
 }
 
 /* Overlay-12 leftover wrap: Ice-parked lanes 0/1 hold GETLLAR 00F3CF00
- * while packer 00695E84 posts occupancy on that lane. Overlay-idle SPU2/3
- * wait on their own matching line, so the wrap never runs. Remap the idle
- * SPU's occupancy EA onto the pending Ice-parked peer (RPCS3 kernel2/3).
- * Does not poke Ice / doorbell / mailbox. */
+ * while packer 00695E84 posts occupancy on that lane. Occupancy remap is
+ * IO→RAM only — a peer-lane steal acked liveA without running 00B5D900.
+ * Do not yield Ice→3F6C8: 00B5D900 already runs on idle SPU3; yield
+ * aborts CollBroad Ice-waits. Does not poke Ice / doorbell. */
 uint32_t ovl12_occupancy_remap(const spu_context* ctx, uint32_t ea);
+int ovl12_should_yield_ice(const spu_context* ctx, uint32_t ea);
 /* After a GET of liveB into LS 3FE80, copy that lane's liveA into 3FE00
  * so 3F750 compares a coherent pair (the wait loop does not re-GET liveA). */
 void ovl12_occupancy_sync_liveA(spu_context* ctx, uint32_t liveB_ram);
