@@ -1389,6 +1389,56 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch
                                                 be32(rec + 16u), be32(rec + 20u),
                                                 be32(rec + 24u), be32(rec + 28u));
                                     }
+                                    uint32_t src = be32(a0 + 0x14u);
+                                    if (src >= 0x10000u && !vm_oob(src, 64u)) {
+                                        uint32_t si2, snz = 0;
+                                        for (si2 = 0; si2 < 256u && !vm_oob(src, si2 + 1u); si2++)
+                                            if (vm_base[src + si2]) snz++;
+                                        fprintf(stderr,
+                                                "[ice-heap]   src@0x%08X nz256=%u "
+                                                "%08X %08X %08X %08X "
+                                                "%08X %08X %08X %08X "
+                                                "%08X %08X %08X %08X "
+                                                "%08X %08X %08X %08X\n",
+                                                src, snz,
+                                                be32(src), be32(src + 4u),
+                                                be32(src + 8u), be32(src + 12u),
+                                                be32(src + 16u), be32(src + 20u),
+                                                be32(src + 24u), be32(src + 28u),
+                                                be32(src + 32u), be32(src + 36u),
+                                                be32(src + 40u), be32(src + 44u),
+                                                be32(src + 48u), be32(src + 52u),
+                                                be32(src + 56u), be32(src + 60u));
+                                    }
+                                    /* 00327CA8 SDA: lwz r30,-0x6FAC(r2) then mgr=*(r30-0x7FFC). */
+                                    {
+                                        uint32_t sda327 = be32(0x00D349C8u - 0x6FACu);
+                                        uint32_t mgr327 = sda327 ? be32(sda327 - 0x7FFCu) : 0u;
+                                        uint32_t nent = mgr327 ? be32(mgr327 + 0x18u) : 0u;
+                                        uint32_t tab = mgr327 ? be32(mgr327) : 0u;
+                                        fprintf(stderr,
+                                                "[ice-heap]   327CA8 sda=0x%08X mgr=0x%08X "
+                                                "count=%u tab=0x%08X +4=0x%08X +8=0x%08X "
+                                                "+10=0x%08X +14=0x%08X +1C=0x%08X "
+                                                "e0+40=0x%08X +44=0x%08X +10E=0x%04X "
+                                                "+2F0=0x%02X world+54=0x%08X +94=0x%08X "
+                                                "F27D10=0x%08X +40=0x%08X +A0=0x%08X\n",
+                                                sda327, mgr327, nent, tab,
+                                                mgr327 ? be32(mgr327 + 4u) : 0u,
+                                                mgr327 ? be32(mgr327 + 8u) : 0u,
+                                                mgr327 ? be32(mgr327 + 0x10u) : 0u,
+                                                mgr327 ? be32(mgr327 + 0x14u) : 0u,
+                                                mgr327 ? be32(mgr327 + 0x1Cu) : 0u,
+                                                (tab && nent) ? be32(tab + 0x40u) : 0u,
+                                                (tab && nent) ? be32(tab + 0x44u) : 0u,
+                                                (tab && nent) ? (uint16_t)(be32(tab + 0x10Cu) & 0xFFFFu) : 0u,
+                                                (tab && nent) ? vm_base[tab + 0x2F0u] : 0u,
+                                                be32(0x00E898A0u + 0x54u),
+                                                be32(0x00E898A0u + 0x94u),
+                                                be32(0x00F27D10u),
+                                                be32(0x00F27D10u + 0x40u),
+                                                be32(0x00F27D10u + 0xA0u));
+                                    }
                                 }
                             }
                         }
@@ -2007,6 +2057,9 @@ extern "C" uint32_t g_ovl_clear_watch = 0;
 extern "C" uint32_t g_world54_watch = 0;
 /* Overlay job cells / work flags. Dump-only. Do not plant a cell. */
 extern "C" uint32_t g_ovl_cell_watch = 0;
+/* Wrap-184 CollNarrow job args at 00F66C00. Dump-only: who writes
+ * +0x14 / +0x30 / +0x70 / +0x10E. Do not plant occupancy. */
+extern "C" uint32_t g_f66c_watch = 0;
 /* Live main-thread ctx (ppu_run stack). Table slot 0 does not track cia/lr. */
 extern "C" ppu_context* g_main_ppu_ctx = nullptr;
 
@@ -2365,6 +2418,30 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
             fflush(stderr);
         } else if (_n == 49u) {
             fprintf(stderr, "[ovl-cell] --- print cap 48 reached ---\n");
+            fflush(stderr);
+        }
+    }
+    /* Wrap-184 job args 00F66C00. Dump-only. Do not plant +0x30/+0x70/+0x10E. */
+    if (g_f66c_watch && a >= 0x00F66C00u && a < 0x00F66C00u + 0x130u) {
+        static unsigned _n;
+        uint32_t off = a - 0x00F66C00u;
+        if (_n++ < 80u) {
+            extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+            extern void ppu_dump_guest_stack(ppu_context*, const char*);
+            ppu_context* c = g_active_ctx;
+            fprintf(stderr,
+                    "[f66c-ww] n=%u +0x%02X 0x%08X <- 0x%08X w%d guest-fn=0x%08X "
+                    "cia=0x%08X lr=0x%08X r3=0x%08X r4=0x%08X r31=0x%08X%s\n",
+                    _n, off, a, v, width, ppu_prof_resolve_host(ra),
+                    c ? (uint32_t)c->cia : 0u, c ? (uint32_t)c->lr : 0u,
+                    c ? (uint32_t)c->gpr[3] : 0u, c ? (uint32_t)c->gpr[4] : 0u,
+                    c ? (uint32_t)c->gpr[31] : 0u,
+                    v ? "" : "  <<< ZERO");
+            if (_n <= 3u && c)
+                ppu_dump_guest_stack(c, "f66c-ww");
+            fflush(stderr);
+        } else if (_n == 81u) {
+            fprintf(stderr, "[f66c-ww] --- print cap 80 reached ---\n");
             fflush(stderr);
         }
     }
