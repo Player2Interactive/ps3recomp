@@ -2797,6 +2797,41 @@ void spu_indirect_branch(spu_context* ctx)
                       fprintf(stderr, "[jobexec] dumped LS at job entry -> %s\n", dp); }
                   s_dumped = 1; } } }
     }
+    /* CollNarrow 0x10980..0x10D00 is shufb control + kind-handler tables
+     * (0x00010203 / 0x0A0B0C0D …), not code. Leftover extra-func 0x109C8 was
+     * a PIC2 split into that pool; wrap-185 bisl from 0x1174 executed it as
+     * lifted .word / stop 0 and never returned, so kind-4 never reached the
+     * pair PUTF. Resume the planted link (empty-helper) instead. */
+    {
+        uint32_t psh = (uint32_t)ctx->pc & SPU_LS_MASK;
+        if (fn && psh >= 0x10980u && psh < 0x10D00u) {
+            int cn = (ctx->image_id == 11 || ctx->image_id == 12 ||
+                      ctx->image_id == 174 || ctx->image_id == 185);
+            unsigned sl;
+            for (sl = 0; sl < 4; ++sl) {
+                int id = ctx->resident_code[sl].image_id;
+                if (id == 174 || id == 185) cn = 1;
+            }
+            if (cn) {
+                uint32_t lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+                static int _nsh;
+                if (_nsh++ < 16) {
+                    fprintf(stderr,
+                            "[collnarrow-shufb] skip-data n=%d pc=0x%05X lr=0x%05X "
+                            "owner=%d img=%d\n",
+                            _nsh, psh, lr, code_owner, ctx->image_id);
+                    fflush(stderr);
+                }
+                if (lr && lr != psh && (lr < 0x10980u || lr >= 0x10D00u)) {
+                    ctx->pc = lr;
+                    g_spu_trampoline_fn = 0;
+                    ctx->status = SPU_STATUS_RUNNING;
+                    return;
+                }
+                fn = NULL;
+            }
+        }
+    }
     if (fn) {
         spu_check_stack_reset(ctx, fn);
         /* MUSTTAIL: a guest loop that iterates through an indirect branch (the
