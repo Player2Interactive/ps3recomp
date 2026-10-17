@@ -35,6 +35,45 @@ sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 char            g_sys_fs_root[512] = ".";
 
+/* cellFs HLE (ppu_fs.cpp) and lv2 sys_fs keep separate fd tables. FIOS opens
+ * cache.dat through cellFs imports but libfs read/fcntl paths hit lv2 on the
+ * same fd — without this bridge those reads are EBADF and persist never fills
+ * guest RAM before overlay DMA (draw3q: lseek fd=4, no [fs] read). */
+extern FILE* ppu_fs_stdio_file(int fd);
+extern const char* ppu_fs_stdio_guest_path(int fd);
+
+static FILE* sys_fs_stdio_for_fd(int fd, const sys_fs_fd_info** out_info)
+{
+    int slot = fd - 3;
+    if (slot >= 0 && slot < SYS_FS_FD_MAX) {
+        sys_fs_fd_info* f = &g_sys_fs_fds[slot];
+        if (f->active && f->fp) {
+            if (out_info)
+                *out_info = f;
+            return f->fp;
+        }
+    }
+    FILE* pf = ppu_fs_stdio_file(fd);
+    if (pf) {
+        if (out_info)
+            *out_info = NULL;
+        return pf;
+    }
+    if (out_info)
+        *out_info = NULL;
+    return NULL;
+}
+
+static void sys_fs_log_ppu_bridge_read(int fd, long pos, uint64_t want, size_t got)
+{
+    const char* gp = ppu_fs_stdio_guest_path(fd);
+    if (!gp || !gp[0] || !strstr(gp, "cache.dat"))
+        return;
+    fprintf(stderr,
+            "[fs] lv2-read fd=%d '%s' off=%ld want=%llu -> %zu\n",
+            fd, gp, pos, (unsigned long long)want, got);
+}
+
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
@@ -709,17 +748,16 @@ int64_t sys_fs_read(ppu_context* ctx)
     uint64_t size       = LV2_ARG_U64(ctx, 2);
     uint32_t nread_addr = LV2_ARG_PTR(ctx, 3);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
+    const sys_fs_fd_info* finfo = NULL;
+    FILE* fp = sys_fs_stdio_for_fd(fd, &finfo);
+    if (!fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
     void* buf = vm_to_host(buf_addr);
-    long pos_before = ftell(f->fp);
-    size_t nread = fread(buf, 1, (size_t)size, f->fp);
+    long pos_before = ftell(fp);
+    size_t nread = fread(buf, 1, (size_t)size, fp);
+    if (!finfo)
+        sys_fs_log_ppu_bridge_read(fd, pos_before, size, nread);
 
     /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
      *
@@ -749,7 +787,8 @@ int64_t sys_fs_read(ppu_context* ctx)
         const unsigned char* b = (const unsigned char*)buf;
         fprintf(stderr, "[FSDBG] read fd=%d '%s' pos=%ld want=%llu got=%zu"
                         " head=%02X%02X%02X%02X lr=0x%08X\n",
-                fd, f->path, pos_before, (unsigned long long)size, nread,
+                fd, finfo ? finfo->path : ppu_fs_stdio_guest_path(fd), pos_before,
+                (unsigned long long)size, nread,
                 nread > 0 ? b[0] : 0, nread > 1 ? b[1] : 0,
                 nread > 2 ? b[2] : 0, nread > 3 ? b[3] : 0,
                 (uint32_t)ctx->lr);
@@ -840,17 +879,11 @@ int64_t sys_fs_lseek(ppu_context* ctx)
     int32_t  whence    = LV2_ARG_S32(ctx, 2);
     uint32_t pos_addr  = LV2_ARG_PTR(ctx, 3);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX) {
+    const sys_fs_fd_info* finfo = NULL;
+    FILE* fp = sys_fs_stdio_for_fd(fd, &finfo);
+    if (!fp) {
         /* Invalid fd — return position 0 instead of EBADF.
          * The CRT may call lseek on uninitialized FILE structures. */
-        if (pos_addr)
-            write_be64(pos_addr, 0);
-        return 0;
-    }
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp) {
         if (pos_addr)
             write_be64(pos_addr, 0);
         return 0;
@@ -865,12 +898,18 @@ int64_t sys_fs_lseek(ppu_context* ctx)
     }
 
 #ifdef _WIN32
-    _fseeki64(f->fp, offset, origin);
-    int64_t pos = _ftelli64(f->fp);
+    _fseeki64(fp, offset, origin);
+    int64_t pos = _ftelli64(fp);
 #else
-    fseeko(f->fp, (off_t)offset, origin);
-    int64_t pos = (int64_t)ftello(f->fp);
+    fseeko(fp, (off_t)offset, origin);
+    int64_t pos = (int64_t)ftello(fp);
 #endif
+    if (!finfo) {
+        const char* gp = ppu_fs_stdio_guest_path(fd);
+        if (gp && gp[0] && strstr(gp, "cache.dat"))
+            fprintf(stderr, "[fs] lv2-lseek fd=%d '%s' off=%lld whence=%d -> %lld\n",
+                    fd, gp, (long long)offset, whence, (long long)pos);
+    }
 
     if (pos_addr != 0) {
         write_be64(pos_addr, (uint64_t)pos);
@@ -1345,8 +1384,9 @@ static int64_t sys_fs_fcntl_rw_offset(int32_t fd, uint32_t op, uint32_t arg, uin
     if (size < 0x38 || arg == 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 
-    sys_fs_fd_info* f = sys_fs_file_from_fd(fd);
-    if (!f)
+    const sys_fs_fd_info* finfo = NULL;
+    FILE* fp = sys_fs_stdio_for_fd(fd, &finfo);
+    if (!fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
     uint32_t buf_addr = read_be32(arg + 0x14);
@@ -1357,28 +1397,31 @@ static int64_t sys_fs_fcntl_rw_offset(int32_t fd, uint32_t op, uint32_t arg, uin
         return (int64_t)(int32_t)CELL_EFAULT;
 
 #ifdef _WIN32
-    int64_t old_pos = _ftelli64(f->fp);
-    if (_fseeki64(f->fp, (int64_t)offset, SEEK_SET) != 0)
+    int64_t old_pos = _ftelli64(fp);
+    if (_fseeki64(fp, (int64_t)offset, SEEK_SET) != 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 #else
-    int64_t old_pos = (int64_t)ftello(f->fp);
-    if (fseeko(f->fp, (off_t)offset, SEEK_SET) != 0)
+    int64_t old_pos = (int64_t)ftello(fp);
+    if (fseeko(fp, (off_t)offset, SEEK_SET) != 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 #endif
 
     size_t done = 0;
     if (nbytes && buf) {
         if (op == 0x8000000au)
-            done = fread(buf, 1, (size_t)nbytes, f->fp);
+            done = fread(buf, 1, (size_t)nbytes, fp);
         else
-            done = fwrite(buf, 1, (size_t)nbytes, f->fp);
+            done = fwrite(buf, 1, (size_t)nbytes, fp);
     }
 
 #ifdef _WIN32
-    _fseeki64(f->fp, old_pos, SEEK_SET);
+    _fseeki64(fp, old_pos, SEEK_SET);
 #else
-    fseeko(f->fp, (off_t)old_pos, SEEK_SET);
+    fseeko(fp, (off_t)old_pos, SEEK_SET);
 #endif
+
+    if (!finfo && op == 0x8000000au)
+        sys_fs_log_ppu_bridge_read(fd, (long)offset, nbytes, done);
 
     write_be32(arg + 0x28, CELL_OK);
     write_be64(arg + 0x30, (uint64_t)done);

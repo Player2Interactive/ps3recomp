@@ -518,7 +518,8 @@ static void cellFsRead(ppu_context* ctx)
       tot+=n;
       if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }
       int first_for_fd = (fd>=0 && fd<64 && cnt_fd[fd]==1);
-      if(_n++<50 || first_for_fd || getenv("FS_READ_ALL"))
+      int log_cache = (fd >= 0 && fd < FS_MAX && strstr(g_fd_path[fd], "cache.dat"));
+      if(_n++<50 || first_for_fd || getenv("FS_READ_ALL") || log_cache)
         fprintf(stderr,"[fs] read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu)%s\n",
                 fd,(unsigned long long)nbytes,n,vm_base[buf],vm_base[buf+1],vm_base[buf+2],vm_base[buf+3],
                 (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
@@ -1586,6 +1587,22 @@ static void cellFsAioWrite(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
     if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
                                  (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
+}
+
+/* lv2 sys_fs shares fd numbers with this table (FIOS opens via cellFs HLE,
+ * libfs reads via syscall). */
+extern "C" FILE* ppu_fs_stdio_file(int fd)
+{
+    if (fd < 0 || fd >= FS_MAX || !g_files[fd])
+        return nullptr;
+    return g_files[fd];
+}
+
+extern "C" const char* ppu_fs_stdio_guest_path(int fd)
+{
+    if (fd < 0 || fd >= FS_MAX || !g_fd_path[fd][0])
+        return "";
+    return g_fd_path[fd];
 }
 
 extern "C" void ppu_fs_register(void)
