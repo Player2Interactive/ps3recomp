@@ -1517,6 +1517,53 @@ static void cellFsAioFinish(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
  * done", which is exactly true here. */
 static void cellFsAioCancel(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
 
+struct FsAioCompletion {
+    uint32_t cb_opd;
+    uint32_t aio;
+    int32_t  err;
+    int32_t  id;
+    uint64_t n;
+};
+static FsAioCompletion s_aio_pending[64];
+static unsigned        s_aio_pending_n;
+static int             s_aio_draining;
+
+extern "C" void ppu_fs_drain_aio_completions(void)
+{
+    if (s_aio_draining)
+        return;
+    s_aio_draining = 1;
+    while (s_aio_pending_n > 0) {
+        FsAioCompletion c = s_aio_pending[0];
+        memmove(s_aio_pending, s_aio_pending + 1,
+                (s_aio_pending_n - 1) * sizeof(FsAioCompletion));
+        s_aio_pending_n--;
+        if (c.cb_opd)
+            ps3_invoke_guest(c.cb_opd, c.aio, (uint64_t)(int64_t)c.err,
+                             (uint64_t)(int64_t)c.id, c.n, 0, 0, 0, 0);
+    }
+    s_aio_draining = 0;
+}
+
+static void cellFsAioEnqueueCompletion(uint32_t cb_opd, uint32_t aio,
+                                       int32_t err, int32_t id, uint64_t n)
+{
+    if (!cb_opd)
+        return;
+    if (s_aio_pending_n < sizeof(s_aio_pending) / sizeof(s_aio_pending[0])) {
+        FsAioCompletion* q = &s_aio_pending[s_aio_pending_n++];
+        q->cb_opd = cb_opd;
+        q->aio    = aio;
+        q->err    = err;
+        q->id     = id;
+        q->n      = n;
+        return;
+    }
+    /* Queue full — last resort synchronous delivery. */
+    ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
+                     (uint64_t)(int64_t)id, n, 0, 0, 0, 0);
+}
+
 static void cellFsAioRead(ppu_context* ctx)
 {
     uint32_t aio    = (uint32_t)ctx->gpr[3];
@@ -1545,13 +1592,19 @@ static void cellFsAioRead(ppu_context* ctx)
         HOST_FSEEK64(g_files[fd], saved, SEEK_SET);
         err = CELL_OK;
     }
-    if (getenv("PS3_FSLOG"))
-        fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu\n",
-                id, fd, (unsigned long long)offset, (unsigned long long)size, n);
+    {
+        int log_cache = (fd >= 0 && fd < FS_MAX && strstr(g_fd_path[fd], "cache.dat"));
+        if (getenv("PS3_FSLOG") || log_cache)
+            fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu%s\n",
+                    id, fd, (unsigned long long)offset, (unsigned long long)size, n,
+                    log_cache ? " (cache.dat)" : "");
+    }
 
     ctx->gpr[3] = CELL_OK;
-    if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
-                                 (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
+    /* FIOS arms the completion path after cellFsAioRead returns. Deliver the
+     * callback on the next pump (ppu_gcm_pump / HOTREAD16 yield), not inside
+     * this HLE frame. */
+    cellFsAioEnqueueCompletion(cb_opd, aio, err, id, (uint64_t)n);
 }
 
 static void cellFsAioWrite(ppu_context* ctx)
@@ -1585,8 +1638,7 @@ static void cellFsAioWrite(ppu_context* ctx)
             id, fd, (unsigned long long)offset, (unsigned long long)size, n);
 
     ctx->gpr[3] = CELL_OK;
-    if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
-                                 (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
+    cellFsAioEnqueueCompletion(cb_opd, aio, err, id, (uint64_t)n);
 }
 
 /* lv2 sys_fs shares fd numbers with this table (FIOS opens via cellFs HLE,

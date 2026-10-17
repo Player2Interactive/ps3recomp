@@ -721,15 +721,38 @@ static void sys_lwcond_destroy(ppu_context* ctx)
     lwc_reset(lwc_slot((uint32_t)ctx->gpr[3]));
     ctx->gpr[3] = 0;
 }
+/* Signal one waiter. Decrement-before-post races with a waiter that has not
+ * incremented yet (FIOS scheduler @00714348 / Ice @00714260): signal sees
+ * waiters==0 and posts nothing, then the waiter blocks forever. CAS-loop until
+ * we atomically claim a positive waiter count, then post one token. */
+static void lwc_signal_one(struct LwcSlot* sl)
+{
+    if (!lwc_has_sem(sl))
+        return;
+    for (;;) {
+#ifdef _WIN32
+        long w = sl->waiters;
+        if (w <= 0)
+            break;
+        if (InterlockedCompareExchange(&sl->waiters, w - 1, w) == w) {
+            lwc_post_n(sl, 1);
+            break;
+        }
+#else
+        long w = __atomic_load_n(&sl->waiters, __ATOMIC_ACQUIRE);
+        if (w <= 0)
+            break;
+        if (__atomic_compare_exchange_n(&sl->waiters, &w, w - 1, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            lwc_post_n(sl, 1);
+            break;
+        }
+#endif
+    }
+}
 static void sys_lwcond_signal(ppu_context* ctx)
 {
-    struct LwcSlot* sl = lwc_slot((uint32_t)ctx->gpr[3]);
-    if (lwc_has_sem(sl)) {
-        if (InterlockedDecrement(&sl->waiters) >= 0)
-            lwc_post_n(sl, 1);
-        else
-            InterlockedIncrement(&sl->waiters);
-    }
+    lwc_signal_one(lwc_slot((uint32_t)ctx->gpr[3]));
     ctx->gpr[3] = 0;
 }
 static void sys_lwcond_signal_all(ppu_context* ctx)
@@ -814,13 +837,7 @@ static int64_t lwc_signal_id(uint32_t id)
         return 0;
     if (!lwm_guest_ea(id))
         return (int64_t)(int32_t)0x80010005;
-    struct LwcSlot* sl = lwc_slot(id);
-    if (lwc_has_sem(sl)) {
-        if (InterlockedDecrement(&sl->waiters) >= 0)
-            lwc_post_n(sl, 1);
-        else
-            InterlockedIncrement(&sl->waiters);
-    }
+    lwc_signal_one(lwc_slot(id));
     return 0;
 }
 static int64_t lwc_signal_all_id(uint32_t id)

@@ -776,6 +776,9 @@ void ppu_gcm_pump(void)
             }
         }
     }
+    /* Deferred cellFsAioRead completions (FIOS async / Ice heap-ring). */
+    { extern void ppu_fs_drain_aio_completions(void);
+      ppu_fs_drain_aio_completions(); }
     GCM_PUMP_LEAVE();
 }
 
