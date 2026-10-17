@@ -34,6 +34,8 @@
 /* Guest-resolving host backtrace (ppu_loader.cpp). Must be declared at file scope:
  * `extern "C"` inside a function body is ill-formed in C++. */
 extern "C" void ydkj_host_bt(const char* tag);
+extern "C" void ppu_gcm_pump(void);
+extern "C" void ppu_fs_drain_aio_completions(void);
 #include <fcntl.h>
 #include <errno.h>
 #ifdef _WIN32
@@ -495,6 +497,16 @@ static void cellFsRead(ppu_context* ctx)
           if (!once++) fprintf(stderr, "[fs] PS3_FSLOG_EOF: fd=%d truncated at %ld bytes\n", fd, elim);
           n = 0;
       } }
+    /* ACIT_SKIP_FMV: dev bik EOF (game/acit_fmv_dev.cpp). Same demuxer-EOF trick as
+     * PS3_FSLOG_EOF above — not a flip fake. */
+    { extern long acit_fmv_bik_eof_after_bytes(const char*);
+      const char* gp = (fd >= 0 && fd < FS_MAX) ? g_fd_path[fd] : "";
+      long bik_lim = acit_fmv_bik_eof_after_bytes(gp);
+      if (bik_lim > 0 && fpos_before >= bik_lim) {
+          static int once_bik;
+          if (!once_bik++) fprintf(stderr, "[fs] ACIT_SKIP_FMV: bik EOF at %ld (%s)\n", bik_lim, gp);
+          n = 0;
+      } }
     if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] READ usm fd=%d nbytes=%llu -> %zu magic=%02X%02X%02X%02X pos=%ld lr=0x%08X\n", fd, (unsigned long long)nbytes, n, vm_base[buf], vm_base[buf+1], vm_base[buf+2], vm_base[buf+3], fpos_before, (uint32_t)ctx->lr);
     /* PS3_FSLOG_READS=<fd>: log every read on one descriptor. PS3_FSLOG caps at 20
      * lines and they are all spent before a movie ever opens, so it cannot
@@ -535,6 +547,15 @@ static void cellFsRead(ppu_context* ctx)
             uint32_t a = sp + i*4; uint32_t w = (vm_base[a]<<24)|(vm_base[a+1]<<16)|(vm_base[a+2]<<8)|vm_base[a+3];
             if (w >= 0x10000u && w < 0x600000u) fprintf(stderr, "[TOC]   ra 0x%08X (@sp+0x%X)\n", w, i*4);
         }
+    }
+    /* Great Clock persist: FIOS reads cache.dat synchronously while overlay-189
+     * stop-yields on an empty LS DMA slot (0x2C380). The completer runs on the
+     * FIOS/Ice path (lwcond + deferred aio cb); pump here so a sync read on the
+     * calling thread still advances that producer before the leftover re-GETs. */
+    if (n > 0 && fd >= 0 && fd < FS_MAX && g_fd_path[fd][0] &&
+        strstr(g_fd_path[fd], "cache.dat")) {
+        ppu_fs_drain_aio_completions();
+        ppu_gcm_pump();
     }
     if (nread_ptr) vm_write64(nread_ptr, n);
     ctx->gpr[3] = CELL_OK;
