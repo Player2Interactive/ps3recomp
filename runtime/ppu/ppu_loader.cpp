@@ -1340,6 +1340,58 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch
                                 r3 ? be32(r3 + 0x14u) : 0u,
                                 r3 ? (uint16_t)(be32(r3 + 0x18u) >> 16) : 0u,
                                 r3 ? be32(r3 + 0x1Cu) : 0u);
+                        /* Wrap-184 4B58 job-args block. Dump-only. */
+                        {
+                            static int n184args;
+                            uint32_t a0 = 0x00F66C00u;
+                            if (n184args < 4 && vm_base && !vm_oob(a0, 304u)) {
+                                uint32_t i, nz = 0;
+                                n184args++;
+                                for (i = 0; i < 304u; i++)
+                                    if (vm_base[a0 + i]) nz++;
+                                fprintf(stderr,
+                                        "[ice-heap] args@00F66C00 n=%d nz=%u "
+                                        "+00=0x%08X +04=0x%08X +08=0x%08X +0C=0x%08X "
+                                        "+10=0x%08X +14=0x%08X +30=0x%08X +70=0x%08X "
+                                        "+84=0x%08X +88=0x%08X +100=0x%08X +104=0x%08X "
+                                        "+10C=0x%08X +10E=0x%04X +3C=0x%08X\n",
+                                        n184args, nz,
+                                        be32(a0), be32(a0 + 4u), be32(a0 + 8u),
+                                        be32(a0 + 0xCu), be32(a0 + 0x10u),
+                                        be32(a0 + 0x14u), be32(a0 + 0x30u),
+                                        be32(a0 + 0x70u), be32(a0 + 0x84u),
+                                        be32(a0 + 0x88u),
+                                        be32(a0 + 0x100u), be32(a0 + 0x104u),
+                                        be32(a0 + 0x10Cu),
+                                        (uint16_t)(be32(a0 + 0x10Cu) & 0xFFFFu),
+                                        be32(a0 + 0x3Cu));
+                                {
+                                    uint32_t bm = be32(a0 + 0x84u);
+                                    uint32_t rec = be32(a0 + 0x88u);
+                                    if (bm >= 0x10000u && !vm_oob(bm, 32u)) {
+                                        fprintf(stderr,
+                                                "[ice-heap]   bitmap@0x%08X "
+                                                "%08X %08X %08X %08X %08X %08X %08X %08X\n",
+                                                bm,
+                                                be32(bm), be32(bm + 4u),
+                                                be32(bm + 8u), be32(bm + 12u),
+                                                be32(bm + 16u), be32(bm + 20u),
+                                                be32(bm + 24u), be32(bm + 28u));
+                                    }
+                                    if (rec >= 0x10000u && !vm_oob(rec, 32u)) {
+                                        fprintf(stderr,
+                                                "[ice-heap]   rec@0x%08X "
+                                                "%08X %08X %08X %08X "
+                                                "%08X %08X %08X %08X\n",
+                                                rec,
+                                                be32(rec), be32(rec + 4u),
+                                                be32(rec + 8u), be32(rec + 12u),
+                                                be32(rec + 16u), be32(rec + 20u),
+                                                be32(rec + 24u), be32(rec + 28u));
+                                    }
+                                }
+                            }
+                        }
                         if (ring >= 0x10000u) {
                             for (si = 0; si < 16 && pend < 6; si++) {
                                 uint32_t slot = ring + (uint32_t)si * 0xA0u;
@@ -1353,6 +1405,15 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch
                                         si, slot, be32(slot),
                                         be32(slot + 0x10u), be32(slot + 0x14u),
                                         (uint16_t)kind, be32(slot + 0x1Cu));
+                                {
+                                    uint32_t pay = be32(slot + 0x1Cu);
+                                    if (pend == 1 && pay >= 0x10000u && !vm_oob(pay, 16u))
+                                        fprintf(stderr,
+                                                "[ice-heap]   payload@0x%08X "
+                                                "%08X %08X %08X %08X\n",
+                                                pay, be32(pay), be32(pay + 4u),
+                                                be32(pay + 8u), be32(pay + 12u));
+                                }
                             }
                         }
                     }

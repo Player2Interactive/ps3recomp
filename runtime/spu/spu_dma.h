@@ -200,6 +200,25 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     spu->gpr[3]._u32[0], spu->gpr[4]._u32[0],
                     spu->resident_ovl, spu->resident_code[0].image_id);
     }
+    /* Wrap-184 CollNarrow leftover: 4B58 GETs 304B args from 0x00F66C00;
+     * 55C0 PUTs 16B slot windows that should complete heap-ring +0x18. */
+    if (spu_context_has_image(spu, 184)) {
+        static unsigned n184dma;
+        uint32_t e184 = (uint32_t)ea;
+        int hot184 = (size == 0x130u || size == 16u || e184 == 0x00F66C00u
+                      || (e184 >= 0x205E0000u && e184 < 0x205E2000u)
+                      || mfc_is_list(cmd));
+        if (hot184 || ++n184dma <= 48u || (n184dma % 100u) == 0u)
+            fprintf(stderr,
+                    "[ovl-184] dma n=%u %s cmd=0x%X lsa=0x%05X ea=0x%08X "
+                    "size=0x%X pc=0x%05X r1=0x%05X r3=%08X r4=%08X "
+                    "ovl=%d code0=%d\n",
+                    n184dma, mfc_is_put(cmd) ? "PUT" : (mfc_is_get(cmd) ? "GET" : "OTH"),
+                    cmd, lsa, e184, size, (uint32_t)spu->pc & SPU_LS_MASK,
+                    spu->gpr[1]._u32[0] & SPU_LS_MASK,
+                    spu->gpr[3]._u32[0], spu->gpr[4]._u32[0],
+                    spu->resident_ovl, spu->resident_code[0].image_id);
+    }
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
      * this guest address. A DMA landing in the loaded ELF image is always a
      * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job
@@ -732,6 +751,38 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         }
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        if (spu_context_has_image(spu, 184) &&
+            (size == 0x130u || (uint32_t)ea == 0x00F66C00u)) {
+            static unsigned n184get;
+            if (++n184get <= 8u) {
+                const uint8_t* t = ls_ptr;
+                unsigned nz = 0, i;
+                uint32_t w88, w10e, w100;
+                for (i = 0; i < size && i < 0x130u; i++)
+                    if (t[i]) nz++;
+                w88 = (size >= 0x8Cu)
+                    ? ((uint32_t)t[0x88]<<24)|((uint32_t)t[0x89]<<16)
+                      |((uint32_t)t[0x8A]<<8)|t[0x8B]
+                    : 0;
+                w10e = (size >= 0x110u)
+                    ? ((uint32_t)t[0x10E]<<8)|t[0x10F] : 0;
+                w100 = (size >= 0x104u)
+                    ? ((uint32_t)t[0x100]<<24)|((uint32_t)t[0x101]<<16)
+                      |((uint32_t)t[0x102]<<8)|t[0x103]
+                    : 0;
+                fprintf(stderr,
+                        "[ovl-184] GET-args n=%u lsa=0x%05X ea=0x%08X size=0x%X "
+                        "pc=0x%05X nz=%u +00=%02X%02X%02X%02X +88=0x%08X "
+                        "+100=0x%08X +10E=0x%04X "
+                        "+10=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                        n184get, lsa, (uint32_t)ea, size,
+                        (uint32_t)spu->pc & SPU_LS_MASK, nz,
+                        t[0],t[1],t[2],t[3], w88, w100, w10e,
+                        t[0x10],t[0x11],t[0x12],t[0x13],
+                        t[0x14],t[0x15],t[0x16],t[0x17]);
+                fflush(stderr);
+            }
+        }
         if (spu_context_has_image(spu, 183) &&
             (lsa == 0x18200u || size == 0x200u)) {
             static unsigned n183get;
@@ -867,6 +918,24 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                           lp[8],lp[9],lp[10],lp[11],lp[12],lp[13],lp[14],lp[15]);
               }
           } }
+        /* Wrap-184 16-byte slot-window PUT (55C0) and 304-byte args PUTR (56D0). */
+        if (spu_context_has_image(spu, 184) &&
+            (size == 16u || size == 0x130u ||
+             ((uint32_t)ea >= 0x205E0000u && (uint32_t)ea < 0x205E2000u))) {
+            static unsigned n184put;
+            if (++n184put <= 24u) {
+                const uint8_t* t = ls_ptr;
+                fprintf(stderr,
+                        "[ovl-184] PUT n=%u cmd=0x%X lsa=0x%05X ea=0x%08X size=0x%X "
+                        "pc=0x%05X data=%02X%02X%02X%02X %02X%02X%02X%02X "
+                        "%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                        n184put, cmd, lsa, (uint32_t)ea, size,
+                        (uint32_t)spu->pc & SPU_LS_MASK,
+                        t[0],t[1],t[2],t[3], t[4],t[5],t[6],t[7],
+                        t[8],t[9],t[10],t[11], t[12],t[13],t[14],t[15]);
+                fflush(stderr);
+            }
+        }
         /* Wrap-183 / GCM-local PUT dest: Bink leftover wrap vs display scanout. */
         { uint32_t e = (uint32_t)ea;
           uint32_t pc = (uint32_t)spu->pc & SPU_LS_MASK;
@@ -1575,6 +1644,10 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         static int _post = 0;
         int leftover = ((uint32_t)ea >= 0x00B5D000u && (uint32_t)ea < 0x00B65000u) ||
                        ((uint32_t)ea >= 0x00DBA000u && (uint32_t)ea < 0x00DBC000u) ||
+                       ((uint32_t)ea == 0x00F66C00u) ||
+                       ((uint32_t)ea >= 0x205E0000u && (uint32_t)ea < 0x205E2000u) ||
+                       (spu_context_has_image(spu, 184) &&
+                        (size == 0x130u || size == 16u || mfc_is_list(cmd))) ||
                        (lsa == 0x100u && size >= 0x400u);
         int open = leftover || (_pn < 96) || (g_barrier_sync_watch && _post < 256);
         if (open) {

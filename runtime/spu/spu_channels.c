@@ -527,6 +527,17 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     }
     switch (cmd) {
     case MFC_GETLLAR_CMD:
+        if (spu_context_has_image(ctx, 184)) {
+            static unsigned n184llar;
+            if (++n184llar <= 16u)
+                fprintf(stderr,
+                        "[ovl-184] GETLLAR n=%u ea=0x%08X lsa=0x%05X pc=0x%05X "
+                        "img=%d ovl=%d code0=%d\n",
+                        n184llar, ea, ctx->mfc_lsa,
+                        (uint32_t)ctx->pc & SPU_LS_MASK,
+                        ctx->image_id, ctx->resident_ovl,
+                        ctx->resident_code[0].image_id);
+        }
         /* Lockstep tick: a guest GETLLAR..PUTLLC poll loop is intra-function
          * (all gotos), so it never crosses the SPU_DRAIN tick site -- without a
          * tick here a polling SPU would hold the run token forever while the
@@ -1700,13 +1711,11 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                     ctx->resident_code[slot].size = o->span;
                     ctx->resident_code[slot].source_ea = claim_ea;
                     ctx->resident_code[slot].image_id = o->image_id;
-                    /* Only when a DIFFERENT body overwrites the span: wrap-184
-                     * replacing CollBroad left a parked list at 0x1518 that
-                     * then read wrap-184 .text as empty RESUME-ELEMS dest=0.
-                     * Continuation GETs of the same image must keep their
-                     * own in-flight lists. */
-                    if (o->image_id == 184 &&
-                        (prev_img != 184 || prev_src != claim_ea)) {
+                    /* Drop parked lists when a DIFFERENT body overwrites the
+                     * span (184 over CollBroad, 181 over 184, …). Continuation
+                     * GETs of the same image/EA keep their in-flight lists. */
+                    if (prev_img &&
+                        (prev_img != o->image_id || prev_src != claim_ea)) {
                       int t;
                       for (t = 0; t < 32; t++) {
                           uint32_t el;
@@ -1719,10 +1728,11 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
                               ctx->list_stall_dest_lsa[t] = 0;
                               ctx->list_stall_remaining[t] = 0;
                               { static int _st;
-                                if (_st++ < 8)
-                                    fprintf(stderr, "[ovl-184] drop stale list "
-                                            "tag=%d elem@0x%05X prev_img=%d\n",
-                                            t, el, prev_img); }
+                                if (_st++ < 12)
+                                    fprintf(stderr, "[spu-ovl] drop stale list "
+                                            "tag=%d elem@0x%05X prev_img=%d "
+                                            "new_img=%d\n",
+                                            t, el, prev_img, o->image_id); }
                           }
                       }
                     }
@@ -2346,9 +2356,10 @@ void spu_indirect_branch(spu_context* ctx)
     {
         uint32_t p184 = (uint32_t)ctx->pc & SPU_LS_MASK;
         if (p184 == 0xC8E8u || p184 == 0xC988u || p184 == 0x4B48u ||
-            p184 == 0x4B58u || p184 == 0x6E28u || p184 == 0xC9C8u) {
+            p184 == 0x4B58u || p184 == 0x6E28u || p184 == 0xC9C8u ||
+            p184 == 0x30D0u) {
             static int _n184b;
-            if (_n184b++ < 24)
+            if (_n184b++ < 32)
                 fprintf(stderr, "[ovl-184] ibranch pc=0x%05X img=%d ovl=%d "
                         "owner=%d fn=%p r1=0x%05X r3=0x%08X\n",
                         p184, ctx->image_id, ctx->resident_ovl, code_owner,
