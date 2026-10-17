@@ -2002,8 +2002,13 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
 /* Ice wrap-183 FMV: SET_VERTEX_DATA2S writes window pixels in attrib0 and
  * matching texel UVs in attrib1. Guest VPs for that blit have been seen
  * writing o[0].w = -1 (clip-discard) or leaving pixels in clip with the
- * identity XY epilogue. One VS maps pixels -> NDC using vp_posscale
- * (filled as 2/w,-2/h,-1,1 for this path) and forwards attrib1 as TEX0. */
+ * identity XY epilogue. One VS maps pixels -> NDC using vp_posscale.
+ *
+ * HWND / DXGI backbuffer (not a GCM destile) is the oracle: 9f6955e's
+ * y' = 1-2y/h presented Ice FMV upside-down. Matching pos/UV means a
+ * texel V flip is the same full-screen invert; a 0..1 `1-v` on 0..720
+ * UVs was a no-op/wrong. Flip NDC Y here only (y' = 2y/h - 1) so RSX
+ * window y=0 lands at the bottom of the D3D RT. Do not flip 3D/menu VPs. */
 static ID3DBlob* ice_blit_vs_blob(void)
 {
     if (s_d3d.ice_blit_vs) return s_d3d.ice_blit_vs;
@@ -2081,7 +2086,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     if (ice_blit) {
         vsb = ice_blit_vs_blob();
         if (vsb) {
-            vs_hash = 0x49434543u; /* 'ICEC' */
+            vs_hash = 0x49434559u; /* 'ICEY' NDC Y vs ICEC */
             vs_idx = -2;
         }
     }
@@ -3316,8 +3321,11 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
     /* Ice FMV (wrap-183): SET_VERTEX_DATA2S positions are window pixels
      * (0,0)..(1280,720) and the VP passes them through. Identity XY + a
      * 640/-360 GCM viewport left those coords in D3D clip, so the quad
-     * clipped to a sliver (present dumps nz~27/14400). Map pixels -> NDC:
-     * x' = 2*x/w - 1, y' = 1 - 2*y/h (RSX origin top-left, D3D Y-up). */
+     * clipped to a sliver. Map pixels -> NDC on this blit only:
+     * x' = 2*x/w - 1, y' = 2*y/h - 1.
+     * 9f6955e used y' = 1-2y/h (RSX top-left -> D3D clip top). HWND and
+     * the DXGI backbuffer showed that Ice YUV upside-down; menus (guest
+     * VP) stay upright. */
     if (dr && dr->tex[0].set &&
         (dr->tex[0].fmt & 0x9Fu) == 0x81u &&
         dr->tex[0].w == 1280u && dr->tex[0].h == 720u &&
@@ -3326,14 +3334,14 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
         float vh = dr->vp_h ? (float)dr->vp_h : 720.0f;
         if (vw >= 16.0f && vh >= 16.0f) {
             vpx[0] =  2.0f / vw;
-            vpx[1] = -2.0f / vh;
+            vpx[1] =  2.0f / vh;
             vpx[4] = -1.0f;
-            vpx[5] =  1.0f;
+            vpx[5] = -1.0f;
             { static unsigned n = 0;
               if (n++ < 8u)
                   fprintf(stderr,
                           "[bink-quad] pixel-ndc scale=%.5f,%.5f off=%.1f,%.1f "
-                          "vp_scale=%.1f,%.1f%c",
+                          "vp_scale=%.1f,%.1f ysign=+%c",
                           vpx[0], vpx[1], vpx[4], vpx[5], vs_[0], vs_[1], 10); }
         }
     }
